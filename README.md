@@ -20,29 +20,37 @@ cargo install --path . --locked
 the path in `WORKTABLE_CONFIG`):
 
 ```toml
-[jira]
-host = "https://jira.example.com"
-project = "DEMO"            # where wt start --new-ticket creates tickets
-issue_type = "Задача"       # their type as the project names it (default Task)
-
-[gitlab]
-host = "gitlab.example.com"
-project = "demo/service"
-
 [vault]
 path = "~/demo-vault"
-task_dirs = ["30-work/tasks"]
-new_task_dir = "30-work/tasks"
 
-[[repo]]
-path = "~/projects/demoapp"
-gitlab_project = "demo/service"
-
-[workflow]
+[workflow]                  # defaults for every project
 branch_prefix = "demo/"
 # review_model = "claude-fable-5-1"
 # ide = "IntelliJ IDEA"
+
+[[project]]                 # a tab in the TUI, `wt -p demoapp`
+name = "demoapp"
+task_dirs = ["30-work/tasks"]
+# new_task_dir = "30-work/tasks"   # default: the first of task_dirs
+jira = { host = "https://jira.example.com", project = "DEMO", issue_type = "Задача" }
+gitlab = { host = "gitlab.example.com", project = "demo/service" }
+
+[[project.repo]]
+path = "~/projects/demoapp"
+gitlab_project = "demo/service"
+
+[[project]]                 # no Jira, no GitLab: notes, worktrees, agents
+name = "vpn"
+task_dirs = ["10-ah-fuck-life/projects/vpn"]
+branch_prefix = ""
+
+[[project.repo]]
+path = "~/code/pet-projects/vpn-bot"
 ```
+
+Commands work on one project: `-p <name>`, else the one whose repo the current
+directory is in, else the first. The TUI opens on the last one shown; `[` `]`,
+Tab or a click on its tab switch.
 
 Tokens come from `JIRA_TOKEN` and `GITLAB_TOKEN`. `WT_TRACE=1` prints how long
 each fetch, the matching and the rendering took to stderr.
