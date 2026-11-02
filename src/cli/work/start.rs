@@ -15,7 +15,7 @@ use crate::vault::task::{Task, ticket_keys};
 use serde_yaml::Value;
 
 /// `wt start <task name | KEY>`: a new task (note, herdr workspace, worktree tab
-/// with claude), or work on a ticket without a note.
+/// with an agent), or work on a ticket without a note.
 pub(in crate::cli) fn cli_start(config: &Config, args: StartArgs) -> Result<(), String> {
     start(config, args, &mut Terminal)
 }
@@ -164,7 +164,7 @@ fn start_with(
     let issue = keys.first().map(|k| fetch_issue(config, k)).transpose()?;
     let main = choose_repo(config, ui)?;
     if no_worktree {
-        // claude in the main checkout, its brief in worktable's cache
+        // The agent in the main checkout, its brief in worktable's cache
         let label = tree_name
             .or_else(|| issue.as_ref().map(name_from_issue))
             .or_else(|| name_from_text(&target))
@@ -186,6 +186,7 @@ fn start_with(
         }
         std::fs::write(&brief, text).map_err(err)?;
         return launch(
+            config.workflow.agent,
             &task.name,
             &main,
             &label,
@@ -215,6 +216,7 @@ fn start_with(
         description.as_deref().or(message.as_deref()),
     );
     let open = Open {
+        kind: config.workflow.agent,
         agent: !no_agent,
         focus: !bg,
         description,
@@ -309,6 +311,7 @@ fn add_with(
         description.as_deref().or(message.as_deref()),
     );
     let open = Open {
+        kind: config.workflow.agent,
         agent: true,
         focus: !bg,
         description,

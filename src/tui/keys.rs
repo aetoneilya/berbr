@@ -7,6 +7,7 @@ use super::{
 };
 use crate::cli::work;
 use crate::cli::{AddArgs, SelectArgs, StartArgs};
+use crate::client::agent::AgentKind;
 use crate::client::herdr;
 use crate::table::look::clean;
 use ratatui::DefaultTerminal;
@@ -104,6 +105,7 @@ impl App {
             KeyCode::Char('o') => self.open_note_in_obsidian(),
             KeyCode::Char('e') => self.edit_note(terminal),
             KeyCode::Char('s') => self.start(),
+            KeyCode::Char('n') => self.new_agent(),
             KeyCode::Char('c') => {
                 if let Some(target) = self.target() {
                     self.select_work(SelectArgs {
@@ -292,7 +294,7 @@ impl App {
     }
 
     /// ⏎: to the agent of the selection — focus a live one, otherwise `wt select`
-    /// resumes or starts claude there; an MR opens in the browser.
+    /// resumes or starts an agent there; an MR opens in the browser.
     pub(super) fn go(&mut self) {
         let Some(row) = self.current() else { return };
         match row.kind.clone() {
@@ -351,6 +353,43 @@ impl App {
         let title = format!("select {}", args.target.as_deref().unwrap_or(""));
         self.run_command(title, Then::Navigate, move |config, ui| {
             work::select(config, args, ui)
+        });
+    }
+
+    pub(super) fn new_agent_args(&self) -> Option<SelectArgs> {
+        let row = self.current()?;
+        if !matches!(
+            row.kind,
+            Kind::Task(_) | Kind::Tree(_) | Kind::Agent(..) | Kind::Ticket(_) | Kind::Loose(_)
+        ) {
+            return None;
+        }
+        let target = match &row.kind {
+            Kind::Ticket(key) => key.clone(),
+            _ => self.target()?,
+        };
+        Some(SelectArgs {
+            target: Some(target),
+            tree: self.tree().map(|t| self.table.tree(t).wt.name()),
+            new_session: true,
+            ..SelectArgs::default()
+        })
+    }
+
+    /// `n`: choose a CLI and open a fresh conversation in the selected worktree.
+    fn new_agent(&mut self) {
+        let Some(args) = self.new_agent_args() else {
+            self.say("n works on a task, ticket or its worktree");
+            return;
+        };
+        self.run_command("new agent".into(), Then::Navigate, move |config, ui| {
+            let kinds = [AgentKind::Codex, AgentKind::Claude];
+            let labels = kinds.iter().map(ToString::to_string).collect::<Vec<_>>();
+            let kind = kinds[ui.pick("New agent", &labels)?];
+            let mut config = config.clone();
+            config.workflow.agent = kind;
+            config.workflow.agent_override = Some(kind);
+            work::select(&config, args, ui)
         });
     }
 

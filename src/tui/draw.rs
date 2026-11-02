@@ -159,7 +159,7 @@ impl App {
                     if !tree.agents.is_empty() {
                         keys.push(("⏎", "agent".into()));
                     } else if self.target().is_some() {
-                        keys.push(("⏎", "resume claude".into()));
+                        keys.push(("⏎", "resume session".into()));
                     }
                     if has_url {
                         keys.push(("b", if tree.mr.is_some() { "MR" } else { "jira" }.into()));
@@ -177,6 +177,9 @@ impl App {
                         keys.push(("d", "done".into()));
                     }
                 }
+            }
+            if self.new_agent_args().is_some() {
+                keys.push(("n", "new agent".into()));
             }
             if self.ide_tree().is_some() {
                 keys.push(("i", "idea".into()));
@@ -318,11 +321,12 @@ impl App {
             "↑↓ j k     move             ← h  fold / to parent        → l  unfold        space  fold",
             "z          fold all / unfold all",
             "↑ at top   project dropdown: ⏎ opens it, ⏎ on \"+ new project\" adds one   Tab ] [  next / previous project",
-            "⏎          agent: focus; worktree: its agent or claude --resume; task: wt select",
+            "⏎          agent: focus; worktree: its agent or a resumed session; task: wt select",
             "b          ticket / MR in the browser   o  note in Obsidian       e  note in $EDITOR",
             "i          worktree in IntelliJ IDEA ([workflow] ide); on a task: its only worktree",
             "s          ticket: wt start KEY; task: add a ticket (wt add)",
             "c          pick a session (wt select --session); ⏎ on \"+ new task\": wt start",
+            "n          new agent: choose Codex or Claude, then a fresh session in this worktree",
             "a          ticket without a task: attach it to a task (wt attach)",
             "N          add a dated line to the task note",
             "R          review worktree (wt review)  d  worktree: remove it; task: close it with its Jira tickets",

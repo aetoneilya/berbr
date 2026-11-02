@@ -2,13 +2,60 @@
 
 worktable joins Jira tickets, GitLab merge requests, git worktrees,
 [herdr](https://herdr.dev) agents and task notes in an Obsidian vault into one
-table. A task is a markdown note; its tickets, MRs, worktrees, agents and claude
+table. A task is a markdown note; its tickets, MRs, worktrees, agents and Claude/Codex
 sessions are found from branch names, herdr workspaces and transcripts. `wt`
 shows the table as a TUI or as plain text and runs the daily workflow: start a
 task, add a ticket to it, go back to it, review, close. `DESIGN.md` has the
 model and the decisions.
 
 ## Install
+
+As a local Herdr plugin:
+
+```sh
+sh scripts/install-plugin.sh
+```
+
+This builds and registers a private copy in
+`${XDG_DATA_HOME:-~/.local/share}/worktable/herdr-plugin`. The plugin stays available
+after the task worktree is removed. Run the installer again to deploy changes;
+the standalone `wt` is unaffected. Optional arguments select the install directory
+and Herdr session: `sh scripts/install-plugin.sh /absolute/plugin/path default`.
+
+The plugin opens the board as a 90% popup via `worktable.open`. Its config lookup
+is `WORKTABLE_CONFIG`, then an existing
+`$HERDR_PLUGIN_CONFIG_DIR/config.toml`, then the standalone config below.
+New task tabs inherit the selected config and plugin binary on `PATH` for `wt note`.
+
+The plugin also publishes task, ticket, MR, CI, review and agent-role tokens to
+Herdr's sidebar, even while the board is closed. Merge
+[`examples/herdr-sidebar.toml`](examples/herdr-sidebar.toml) into Herdr's config
+and reload it to display them. Tokens are `wt_project`, `wt_task`, `wt_state`,
+`wt_ticket`, `wt_mr`, `wt_ci`, `wt_review`, `wt_role`, `wt_fresh`, `wt_workspace`
+and `wt_cli` (prefix with `$` in sidebar rows). `wt_fresh=cached` means remote data came from wt's cache. The example
+uses one row for the agent and CI, with task status, merge blockers and
+unresolved discussions on the second row. Ticket/MR identifiers remain available as tokens but
+are omitted from this compact layout. Review icons require Nerd Fonts
+(`nf-oct-code_review`, U+F4AF; `nf-oct-comment_discussion`, U+F442).
+The agent row shows its name once. A layout icon (`nf-cod-layout`, U+EBEB)
+indicates workspace membership; the workspace and tab names are omitted.
+The CLI label is included only when it differs from the agent name.
+Task status badges read `todo`, `in progress`, `in review` or `done`.
+The spaces layout adds the configured Worktable project name to the first row;
+task status, CI and review attention appear on the second row.
+
+The worker starts on Herdr startup or when the board opens. After installing
+into an already-running session, start it with
+`herdr plugin action invoke metadata --plugin worktable`. It refreshes agents every five
+seconds and tables every minute, without writing task notes. Roles follow wt's
+agent naming convention: names ending in `-review` get a review badge; others
+have no role badge. MR/CI/review tokens summarize open MRs only. The review
+attention message requires GitLab's `not_approved` state, not a zero approval
+count; draft MRs do not request review. Logs and the per-session worker lock live in
+`HERDR_PLUGIN_STATE_DIR`; tokens expire after three minutes without a worker.
+Workers exit when their Herdr socket or installed binary is replaced.
+
+For a standalone CLI:
 
 ```
 cargo install --path . --locked
@@ -25,6 +72,9 @@ path = "~/demo-vault"
 
 [workflow]                  # defaults for every project
 branch_prefix = "demo/"
+# agent = "codex"             # claude (default) or codex, for new conversations
+# review_agent = "claude"     # optional, defaults to agent
+# codex_review_model = "your-codex-model"
 # review_model = "claude-fable-5-1"
 # ide = "IntelliJ IDEA"
 
@@ -43,6 +93,7 @@ gitlab_project = "demo/service"
 name = "vpn"
 task_dirs = ["10-ah-fuck-life/projects/vpn"]
 branch_prefix = ""
+# agent = "claude"            # optional per-project override
 
 [[project.repo]]
 path = "~/code/pet-projects/vpn-bot"
@@ -60,10 +111,10 @@ each fetch, the matching and the rendering took to stderr.
 
 ```
 wt                         the TUI (also `wt tui`)
-wt start [<task|KEY>]      new task: note, herdr workspace, worktree tab with claude
+wt start [<task|KEY>]      new task: note, herdr workspace, worktree tab with an agent
 wt add [<task>] <KEY>      add a ticket to a task, with its own worktree tab
 wt attach <KEY> [<task>]   put a ticket into a task without a worktree
-wt select [<task|KEY>]     go back to a task: its agent, or claude resuming its session; a task with nothing yet gets its first worktree
+wt select [<task|KEY>]     go back to a task: its agent, or the owning CLI resuming its session; a task with nothing yet gets its first worktree
 wt note "<text>"           (for agents) append a finding to the note's "Agent notes"
 wt status                  the table in plain text; updates `state` and `sessions` in notes
 wt review [<worktree>]     start a reviewer agent next to the worktree's agent
@@ -76,6 +127,38 @@ wt completions <shell>     shell completion script
 
 `wt <command> --help` lists the options.
 
+## Claude and Codex
+
+```sh
+wt start "new task" --agent codex
+wt add "existing task" DEMO-123 --agent claude
+wt select "existing task" --agent codex
+wt select "existing task" --new --agent codex
+wt review --agent claude
+wt --agent codex              # TUI: use Codex for new work in this invocation
+```
+
+`--agent` is accepted before or after the subcommand. Without it, new work uses
+`[[project]] agent`, then `[workflow] agent`, then Claude for compatibility.
+Reviews use `review_agent` when configured; `--agent` overrides it too.
+`review_model` applies to Claude reviews and `codex_review_model` to Codex reviews;
+when omitted, each CLI keeps its own configured model.
+
+`wt select` without an override focuses an existing agent or resumes the most
+recently active conversation using its original CLI. With `--agent`, it focuses
+or resumes that CLI only, starting a new conversation when none exists.
+Switching CLIs starts a separate conversation with the task note and brief as
+shared context; it does not translate the other CLI's transcript.
+`--new` always opens a fresh conversation, even when that CLI already has a live
+agent or saved sessions. It cannot be combined with `--session`.
+
+The session picker labels each entry with its CLI. Historical bare session ids
+in task notes remain Claude ids; Codex entries use `codex:<id>`. Both stores are
+discovered (`CLAUDE_CONFIG_DIR/projects` and `CODEX_HOME/sessions`, defaulting to
+`~/.claude` and `~/.codex`). Codex subagents are excluded. The parsed cache is
+`sessions-v3.json`; the previous cache can be left in place. Worktree paths stay
+under `<repo>/.claude/worktrees/` for both tools.
+
 ## TUI
 
 Opening from Herdr selects the task of the calling pane, worktree or workspace.
@@ -87,19 +170,22 @@ window (56 columns), leaving the rest for the preview.
 
 - `↑↓`/`jk` move, `←→`/`hl`/space fold, `z` fold / unfold all, `/` filter, `.` all / active only, `v` hide MRs, worktrees, …
 - `⏎` focus the agent, or resume work (`wt select`)
-- `+ new task` row above the tasks: ⏎ or a click opens a form (name, description, one Jira dropdown: none, new ticket and the open tickets without a task, filtered by typing; checkboxes worktree, agent). Leave the name empty to generate it from the description. In description, ⏎ adds a line and pasting preserves newlines; Tab moves between fields, Ctrl+S starts. The agent reads the context and works on the description; with no description, it waits for your command. A name is required when agent is unchecked. `s` starts a ticket / adds one to a task, `a` attaches a ticket.
+- `n` on a task or worktree: choose Codex or Claude and open a fresh session
+- `c` pick an existing session to resume
+- `+ new task` row above the tasks: ⏎ or a click opens a form (name, description, one Jira dropdown: none, new ticket and the open tickets without a task, filtered by typing; a worktree checkbox and an agent dropdown: claude, codex or none). Leave the name empty to generate it from the description. In description, ⏎ adds a line and pasting preserves newlines; Tab moves between fields, Ctrl+S starts. The agent reads the context and works on the description; with no description, it waits for your command. A name is required when agent is none. `s` starts a ticket / adds one to a task, `a` attaches a ticket.
 - `b` browser, `o` note in Obsidian, `e` note in `$EDITOR`, `i` worktree in the IDE
 - `R` review, `d` remove a worktree / close a task
 - `w` next agent waiting for you, `p` details pane, `r` refresh, `q` quit
 
 ## herdr popup
 
-In herdr's config, `prefix+t` opens the TUI as a popup; going to some work
-closes it:
+After installing the plugin, bind `prefix+t` in Herdr's config and reload the
+config. Going to some work closes the popup:
 
 ```toml
 [[keys.command]]
 key = "prefix+t"
-type = "popup"
-command = "zsh -ic 'WT_POPUP=1 exec wt'"
+type = "plugin_action"
+command = "worktable.open"
+description = "worktable"
 ```
