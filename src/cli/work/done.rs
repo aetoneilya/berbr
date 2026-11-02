@@ -12,7 +12,7 @@ use crate::client::herdr;
 use crate::client::jira::{JiraClient, Transition};
 use crate::client::worktree;
 use crate::config::Config;
-use crate::table::{self, Fresh, Table, Tree, branch_finished};
+use crate::table::{self, Fresh, Table, TaskRow, Tree, branch_finished};
 use crate::vault::note::Note;
 use crate::vault::task::Task;
 use serde_yaml::Value;
@@ -206,14 +206,26 @@ pub(crate) fn finish_task(
     };
 
     let mut problems = Vec::new();
+    let mut removal_errors = Vec::new();
     for &t in &row.trees {
         let tree = table.tree(t);
         let discard = dirty.iter().any(|&(d, _)| d == t);
         match remove_tree(tree, mr_of(&table, tree), force, discard, say) {
             Ok(kept) => problems.extend(kept),
-            Err(e) => problems.push(format!("{}: {e}", tree.wt.name())),
+            Err(e) => removal_errors.push(format!("{}: {e}", tree.wt.name())),
         }
     }
+    if !removal_errors.is_empty() {
+        removal_errors.extend(problems);
+        return Err(format!(
+            "task \"{}\" remains open:\n  {}",
+            row.task.name,
+            removal_errors.join("\n  ")
+        ));
+    }
+    // Do not close Jira, the note or its workspace on a failed removal, or on
+    // a stale plan that missed a worktree. Force does not bypass this check.
+    ensure_no_task_worktrees(config, &table, row)?;
 
     if let Some(jira) = &jira {
         for key in &to_close {
@@ -244,6 +256,7 @@ pub(crate) fn finish_task(
     {
         let _lock = crate::vault::lock().map_err(err)?;
         let mut note = Note::read(&row.task.note.path).map_err(err)?;
+        ensure_no_task_worktrees(config, &table, row)?;
         note.set("done", Value::Bool(true));
         note.set(
             "closed",
@@ -274,6 +287,60 @@ pub(crate) fn finish_task(
         Ok(())
     } else {
         Err(format!("done, but:\n  {}", problems.join("\n  ")))
+    }
+}
+
+/// Re-read git's inventory rather than trusting the plan or the live agents.
+/// Include the planned paths even if git no longer lists them: an incomplete
+/// removal must not leave files behind while the task is marked done.
+fn ensure_no_task_worktrees(config: &Config, table: &Table, row: &TaskRow) -> Result<(), String> {
+    let mut remaining = std::collections::BTreeSet::new();
+    let planned: Vec<_> = row.trees.iter().map(|&t| &table.tree(t).wt.path).collect();
+    for path in &planned {
+        if path.exists() {
+            remaining.insert((*path).clone());
+        }
+    }
+    for repo in &config.repos {
+        let inspect = || {
+            let main = worktree::main_checkout(&repo.path)?;
+            worktree::linked_worktrees(&main)
+        };
+        let trees = inspect().map_err(|e| {
+            format!(
+                "task \"{}\" remains open: can't verify worktrees in {}: {e}",
+                row.task.name,
+                repo.path.display()
+            )
+        })?;
+        for tree in trees {
+            let linked_note = worktree::task_note(&tree.path);
+            let keys = tree
+                .branch
+                .as_deref()
+                .map(crate::vault::task::ticket_keys)
+                .unwrap_or_default();
+            if planned.contains(&&tree.path)
+                || linked_note.as_ref() == Some(&row.task.note.path)
+                || row.task.sessions.iter().any(|s| s.worktree == tree.name())
+                || row.tickets().any(|key| keys.contains(key))
+            {
+                remaining.insert(tree.path);
+            }
+        }
+    }
+    if remaining.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "task \"{}\" remains open: worktrees still exist:\n  {}",
+            row.task.name,
+            remaining
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        ))
     }
 }
 
@@ -563,9 +630,178 @@ pub(crate) fn attach(
 
 #[cfg(test)]
 mod tests {
-    use super::{TaskPlan, closing_transition, nothing_to_lose, tree_blockers};
+    use super::super::brief::{brief_text, write_brief};
+    use super::{TaskPlan, closing_transition, finish_task, nothing_to_lose, tree_blockers};
     use crate::client::jira::Transition;
-    use crate::table::fixtures::{mr, table, task, tree};
+    use crate::client::worktree;
+    use crate::config::{Config, RepoConfig, VaultConfig, WorkflowConfig};
+    use crate::table::fixtures::{GitRepo, mr, table, task, tree};
+    use crate::vault::note::Note;
+    use crate::vault::task::Task;
+    use std::path::{Path, PathBuf};
+
+    fn config(repo: &GitRepo, task: &Task) -> Config {
+        Config {
+            name: "test".into(),
+            jira: None,
+            gitlab: None,
+            workflow: WorkflowConfig::default(),
+            vault: VaultConfig {
+                path: task.note.path.parent().unwrap().into(),
+                task_dirs: vec![PathBuf::new()],
+                new_task_dir: PathBuf::new(),
+            },
+            repos: vec![RepoConfig {
+                path: repo.path.clone(),
+                gitlab_project: None,
+            }],
+        }
+    }
+
+    fn link_task(path: &Path, task: &Task) {
+        let brief = brief_text(path, "fix", Some(task), None, &[], None);
+        write_brief(path, &brief).unwrap();
+        assert_eq!(worktree::task_note(path).as_ref(), Some(&task.note.path));
+    }
+
+    fn plan(repo: &GitRepo, task: Task, paths: &[PathBuf]) -> TaskPlan {
+        let trees = paths
+            .iter()
+            .map(|path| {
+                let name = path.file_name().unwrap().to_str().unwrap();
+                let mut tree = tree(name, name);
+                tree.repo = repo.path.clone();
+                tree.wt.path = path.clone();
+                tree.task_note = worktree::task_note(path);
+                tree
+            })
+            .collect();
+        let table = table(vec![task], vec![], vec![], trees);
+        assert_eq!(table.tasks[0].trees.len(), paths.len());
+        TaskPlan {
+            table,
+            row: 0,
+            blockers: vec![],
+            dirty: vec![],
+            to_close: vec![],
+            left_open: vec![],
+        }
+    }
+
+    #[test]
+    fn failed_removal_keeps_task_open_even_with_force() {
+        for force in [false, true] {
+            let repo = GitRepo::new();
+            let task = task("video", &[]);
+            let config = config(&repo, &task);
+            let note_path = task.note.path.clone();
+            let before = std::fs::read_to_string(&note_path).unwrap();
+            let path = repo.add_worktree("fix");
+            link_task(&path, &task);
+            repo.git(&["worktree", "lock", path.to_str().unwrap()]);
+            let mut plan = plan(&repo, task, &[path.clone()]);
+            plan.table.tasks[0].space = Some("must-stay-open".into());
+            let mut messages = vec![];
+            let error = finish_task(&config, plan, force, &mut |s| messages.push(s)).unwrap_err();
+            assert!(error.contains("remains open"), "{error}");
+            assert!(path.exists());
+            assert_eq!(std::fs::read_to_string(note_path).unwrap(), before);
+            assert!(!messages.iter().any(|s| s.contains("is done")));
+        }
+    }
+
+    #[test]
+    fn partial_removal_does_not_close_the_task() {
+        let repo = GitRepo::new();
+        let task = task("video", &[]);
+        let config = config(&repo, &task);
+        let note_path = task.note.path.clone();
+        let removed = repo.add_worktree("removed");
+        let kept = repo.add_worktree("kept");
+        link_task(&removed, &task);
+        link_task(&kept, &task);
+        repo.git(&["worktree", "lock", kept.to_str().unwrap()]);
+        let plan = plan(&repo, task, &[removed.clone(), kept.clone()]);
+        assert!(finish_task(&config, plan, false, &mut |_| {}).is_err());
+        assert!(!removed.exists());
+        assert!(kept.exists());
+        assert!(!Note::read(&note_path).unwrap().flag("done"));
+        assert!(Note::read(&note_path).unwrap().string("closed").is_none());
+    }
+
+    #[test]
+    fn worktree_missing_from_the_plan_prevents_closing() {
+        for force in [false, true] {
+            let repo = GitRepo::new();
+            let task = task("video", &[]);
+            let config = config(&repo, &task);
+            let note_path = task.note.path.clone();
+            let path = repo.add_worktree("unplanned");
+            link_task(&path, &task);
+            let plan = plan(&repo, task, &[]);
+            let error = finish_task(&config, plan, force, &mut |_| {}).unwrap_err();
+            assert!(error.contains("worktrees still exist"), "{error}");
+            assert!(path.exists());
+            assert!(!Note::read(&note_path).unwrap().flag("done"));
+        }
+    }
+
+    #[test]
+    fn unavailable_repository_prevents_closing() {
+        let repo = GitRepo::new();
+        let task = task("video", &[]);
+        let mut config = config(&repo, &task);
+        config.repos[0].path = repo.path.join("unavailable");
+        let note_path = task.note.path.clone();
+        let plan = plan(&repo, task, &[]);
+        let error = finish_task(&config, plan, true, &mut |_| {}).unwrap_err();
+        assert!(error.contains("can't verify worktrees"), "{error}");
+        assert!(!Note::read(&note_path).unwrap().flag("done"));
+    }
+
+    #[test]
+    fn worktree_created_during_removal_keeps_task_open() {
+        let repo = GitRepo::new();
+        let task = task("video", &[]);
+        let config = config(&repo, &task);
+        let note_path = task.note.path.clone();
+        let path = repo.add_worktree("fix");
+        link_task(&path, &task);
+        let plan = plan(&repo, task, &[path.clone()]);
+        let task = Task::from_note(Note::read(&note_path).unwrap());
+        let mut added = None;
+        let error = finish_task(&config, plan, false, &mut |message| {
+            if message == "removed fix" {
+                let path = repo.add_worktree("new-work");
+                link_task(&path, &task);
+                added = Some(path);
+            }
+        })
+        .unwrap_err();
+        assert!(error.contains("worktrees still exist"), "{error}");
+        assert!(!path.exists());
+        assert!(added.unwrap().exists());
+        assert!(!Note::read(&note_path).unwrap().flag("done"));
+    }
+
+    #[test]
+    fn successful_removal_closes_task_and_keeps_unrelated_worktrees() {
+        let repo = GitRepo::new();
+        let task = task("video", &[]);
+        let config = config(&repo, &task);
+        let note_path = task.note.path.clone();
+        let path = repo.add_worktree("fix");
+        let unrelated = repo.add_worktree("unrelated");
+        link_task(&path, &task);
+        let plan = plan(&repo, task, &[path.clone()]);
+        finish_task(&config, plan, false, &mut |_| {}).unwrap();
+        assert!(!path.exists());
+        assert!(unrelated.exists());
+        let note = Note::read(&note_path).unwrap();
+        assert!(note.flag("done"));
+        assert!(note.string("closed").is_some());
+        assert_eq!(note.strings("branches"), vec!["fix"]);
+    }
 
     #[test]
     fn closing_a_task_closes_its_workspace_last() {

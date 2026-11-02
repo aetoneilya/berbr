@@ -219,8 +219,8 @@ pub fn assemble(inputs: Inputs) -> Table {
 }
 
 /// The task with its worktrees and MRs. A worktree belongs to the task by its
-/// branch's ticket key, or because an agent in the task's herdr workspace works
-/// in it; an MR by a ticket key, or by the branch of one of those worktrees.
+/// generated brief, saved sessions, branch's ticket key, or an agent in the
+/// task's herdr workspace; an MR by a ticket key or one of those branches.
 fn task_row(
     task: Task,
     trees: &[Tree],
@@ -239,7 +239,13 @@ fn task_row(
             .is_some_and(|s| tree.agents.iter().any(|a| &a.workspace == s))
     };
     let row_trees: Vec<usize> = (0..trees.len())
-        .filter(|&i| has_key(&trees[i].keys) || in_space(&trees[i]))
+        .filter(|&i| {
+            let tree = &trees[i];
+            tree.task_note.as_ref() == Some(&task.note.path)
+                || task.sessions.iter().any(|s| s.worktree == tree.wt.name())
+                || has_key(&tree.keys)
+                || in_space(tree)
+        })
         .collect();
     let branches: Vec<&str> = row_trees
         .iter()
@@ -477,6 +483,39 @@ mod tests {
         assert_eq!(row.trees, vec![table.tree_index("a2i-config")]);
         assert!(table.task_row("other").trees.is_empty());
         assert_eq!(table.other_trees, vec![table.tree_index("misc")]);
+    }
+
+    #[test]
+    fn brief_keeps_worktree_with_its_task_without_agents_or_sessions() {
+        for done in [false, true] {
+            let grammar_task =
+                task_note("grammar question", &format!("done: {done}"), "2026-10-30");
+            let mut grammar = tree("grammar-question", "grammar-question");
+            grammar.task_note = Some(grammar_task.note.path.clone());
+            let table = table(
+                vec![grammar_task, task("other", &[])],
+                vec![],
+                vec![],
+                vec![grammar, tree("unrelated", "unrelated")],
+            );
+            assert_eq!(table.task_row("grammar question").trees, vec![0]);
+            assert!(table.task_row("other").trees.is_empty());
+            assert_eq!(table.other_trees, vec![1]);
+        }
+    }
+
+    #[test]
+    fn saved_session_keeps_legacy_worktree_without_a_brief() {
+        for id in ["claude-session", "codex:codex-session"] {
+            let task = task_note(
+                "video",
+                &format!("sessions: [\"{id} fix 2026-10-30\"]"),
+                "2026-10-30",
+            );
+            let table = table(vec![task], vec![], vec![], vec![tree("fix", "fix")]);
+            assert_eq!(table.task_row("video").trees, vec![0]);
+            assert!(table.other_trees.is_empty());
+        }
     }
 
     #[test]

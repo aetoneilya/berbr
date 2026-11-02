@@ -12,6 +12,58 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// A disposable real repository for worktree lifecycle regressions.
+pub struct GitRepo {
+    pub path: PathBuf,
+}
+
+impl GitRepo {
+    pub fn new() -> Self {
+        let repo = Self {
+            path: temp_dir().canonicalize().unwrap(),
+        };
+        repo.git(&["init", "-b", "main"]);
+        repo.git(&["commit", "--allow-empty", "-m", "initial"]);
+        repo
+    }
+
+    pub fn git(&self, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.path)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    pub fn add_worktree(&self, name: &str) -> PathBuf {
+        let path = self.path.join(".claude/worktrees").join(name);
+        self.git(&["worktree", "add", "-b", name, path.to_str().unwrap()]);
+        path
+    }
+}
+
+impl Drop for GitRepo {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 pub const ROOT: &str = "/r/.claude/worktrees";
 
 /// A fresh empty directory for one test's notes.
@@ -78,6 +130,7 @@ pub fn tree(name: &str, branch: &str) -> Tree {
             path: PathBuf::from(ROOT).join(name),
             branch: Some(branch.to_string()),
         },
+        task_note: None,
         keys: ticket_keys(branch),
         changes: Some(0),
         unpushed: Some(0),

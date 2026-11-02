@@ -436,10 +436,12 @@ fn inspect_tree(repo: PathBuf, wt: Worktree, with_status: bool) -> Tree {
     let last_commit = with_status
         .then(|| worktree::last_commit_time(&wt.path).ok())
         .flatten();
+    let task_note = worktree::task_note(&wt.path);
     Tree {
         repo,
         project: None,
         wt,
+        task_note,
         keys,
         changes,
         unpushed,
@@ -468,6 +470,31 @@ mod tests {
     use crate::table::Category;
     use crate::table::fixtures::ticket;
     use reqwest::StatusCode;
+
+    #[test]
+    fn offline_inspection_reads_the_legacy_brief_task_link() {
+        let repo = crate::table::fixtures::GitRepo::new();
+        let path = repo.add_worktree("grammar");
+        let wt = Worktree {
+            path: path.clone(),
+            branch: Some("grammar".into()),
+        };
+        assert!(
+            inspect_tree(repo.path.clone(), wt.clone(), false)
+                .task_note
+                .is_none()
+        );
+        let note = repo.path.join("задача с пробелами?.md");
+        let brief = worktree::git_dir(&path).unwrap().join("task.md");
+        std::fs::write(&brief, format!(
+            "# grammar\n\nThe task note is the shared context for all of the task's tickets — read it in full: {}\nYou work in the worktree {}\n",
+            note.display(), path.display(),
+        )).unwrap();
+        assert_eq!(
+            inspect_tree(repo.path.clone(), wt, false).task_note,
+            Some(note)
+        );
+    }
 
     fn tickets(keys: &[&str]) -> Tickets {
         Ok(keys

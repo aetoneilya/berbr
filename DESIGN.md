@@ -31,9 +31,9 @@ task  (note: shared context; any size — a "project" is just a big task)
   context: goal, decisions, constraints, plan, findings.
 - **One task = one herdr workspace** (decided 2026-10-09), labelled with the
   task name; each worktree of the task is a tab in it, with its agent. A
-  worktree belongs to a task by its branch's ticket key, or because an agent in
-  the task's workspace works in it — so a branch without a key (a quick fix
-  spun off during the task) still lands in the task.
+  worktree belongs to a task by the note path in its generated `task.md`, a
+  saved session, its branch's ticket key, or an agent in the task's workspace.
+  The brief keeps a branch without a key attached after its agent stops.
 - **Ticket → task** is set explicitly (`wt add`, `wt attach`, `wt start <name> -k`, or by
   editing `tickets:`), and by sync: a key on a worktree or MR that belongs to the
   task (through its herdr workspace or a worktree's branch) and that no note
@@ -55,7 +55,7 @@ task  (note: shared context; any size — a "project" is just a big task)
 | branch | worktree | `git worktree list --porcelain` |
 | worktree | agent | herdr `agent list`: the last `cwd` in the agent's claude transcript (agents started in the main checkout move into worktrees), else the pane cwd |
 | agent | name | the TUI names an agent herdr knows by pane id only (herdr drops names when an agent restarts): after its tab's label, else the worktree's or task's name |
-| worktree | task | an agent working in it runs in the task's herdr workspace (label == task name) |
+| worktree | task | note path in its git-dir `task.md`, saved session, branch ticket key, or an agent in the task's herdr workspace (label == task name) |
 | MR | MR (no key) | worktree's branch == MR source branch (MRs without a key still land in their worktree's task) |
 
 A ticket listed in two tasks is a conflict: shown in both, flagged in loose ends.
@@ -273,6 +273,10 @@ wt done [<task | worktree>] [--merged] [--force] [-y]
                     transition like Closed, never Cancelled; others' tickets are
                     left open), writes done: true, closed, mrs, branches, and
                     last closes the task's herdr workspace.
+                    The task stays open and its workspace stays intact if any
+                    worktree cannot be removed or still exists after removal,
+                    including with --force. Git's inventory is checked again
+                    before Jira and before writing done: true.
                     --merged: sweep all finished worktrees
 wt attach <KEY> [<task>]   put a ticket into a task, no worktree or agent
 wt note "<text>"    (agents) append to the task's `## Agent notes`

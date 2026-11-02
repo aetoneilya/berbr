@@ -174,6 +174,8 @@ pub struct Tree {
     /// are this worktree's.
     pub project: Option<String>,
     pub wt: Worktree,
+    /// Task note linked from the worktree's generated brief in its git dir.
+    pub task_note: Option<PathBuf>,
     pub keys: Vec<String>,
     pub changes: Option<usize>,
     pub unpushed: Option<usize>,

@@ -313,6 +313,18 @@ pub fn git_dir(path: &Path) -> Result<PathBuf> {
     git_output(path, &["rev-parse", "--absolute-git-dir"]).map(PathBuf::from)
 }
 
+/// The durable task link in wt's generated brief, including briefs written
+/// before worktrees were matched without live agents or saved sessions.
+pub fn task_note(path: &Path) -> Option<PathBuf> {
+    let brief = std::fs::read_to_string(git_dir(path).ok()?.join("task.md")).ok()?;
+    brief.lines().find_map(|line| {
+        let path = line.strip_prefix(
+            "The task note is the shared context for all of the task's tickets — read it in full: ",
+        )?;
+        (!path.is_empty()).then(|| PathBuf::from(path))
+    })
+}
+
 /// Local and remote branch names (without `origin/`), deduplicated.
 pub fn all_branches(repo: &Path) -> Result<Vec<String>> {
     let output = git_output(
