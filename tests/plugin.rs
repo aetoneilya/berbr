@@ -142,6 +142,85 @@ fn popup_starts_bundled_binary_with_popup_mode() {
 }
 
 #[test]
+fn metadata_publishes_and_clears_owned_tokens_without_editing_the_task() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.path("vault/tasks")).unwrap();
+    let note = "---\ndone: false\nstate: active\ntickets: [DEMO-123]\n---\nMy own wording.\n";
+    fs::write(f.path("vault/tasks/sidebar.md"), note).unwrap();
+    fs::write(
+        f.path("config.toml"),
+        format!(
+            "[vault]\npath = '{}'\n[[project]]\nname = 'test'\ntask_dirs = ['tasks']\n",
+            f.path("vault").display(),
+        ),
+    )
+    .unwrap();
+    let host = f.path("herdr");
+    script(
+        &host,
+        r#"#!/bin/sh
+case "$1 $2" in
+  'workspace list') printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w1","label":"sidebar","worktree":null}]}}' ;;
+  'agent list') printf '%s\n' '{"result":{"agents":[]}}' ;;
+  'workspace report-metadata') printf '%s\n' "$@" >> "$WT_TEST_ARGS" ;;
+  *) exit 1 ;;
+esac
+"#,
+    );
+    let output = f
+        .wt()
+        .args(["plugin-metadata", "--once", "--cached"])
+        .env("WORKTABLE_CONFIG", f.path("config.toml"))
+        .env("HERDR_ENV", "1")
+        .env("HERDR_BIN_PATH", &host)
+        .env("CODEX_HOME", f.path("codex"))
+        .env("CLAUDE_CONFIG_DIR", f.path("claude"))
+        .env("WT_TEST_ARGS", f.path("args"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let args = fs::read_to_string(f.path("args")).unwrap();
+    assert!(args.contains("--source\nworktable\n"));
+    assert!(args.contains("--ttl-ms\n180000\n"));
+    assert!(args.contains("--token\nwt_project=test\n"));
+    assert!(args.contains("--token\nwt_task=sidebar\n"));
+    assert!(args.contains("--token\nwt_state=in progress\n"));
+    assert!(args.contains("--token\nwt_ticket=DEMO-123\n"));
+    assert!(args.contains("--clear-token\nwt_ci\n"));
+    assert!(args.contains("--clear-token\nwt_mr\n"));
+    assert_eq!(
+        fs::read_to_string(f.path("vault/tasks/sidebar.md")).unwrap(),
+        note
+    );
+}
+
+#[test]
+fn metadata_startup_uses_the_bundled_binary() {
+    let f = Fixture::new();
+    script(
+        &f.path("target/release/wt"),
+        "#!/bin/sh\nprintf '%s\\n' \"$1\"\n",
+    );
+    let output = Command::new("sh")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/metadata.sh"))
+        .env("SHELL", "/bin/sh")
+        .env("HERDR_PLUGIN_ROOT", &f.0)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"plugin-metadata-start\n");
+}
+
+#[test]
 fn local_installation_survives_removal_of_the_task_worktree() {
     let f = Fixture::new();
     let checkout = f.path("repo/.claude/worktrees/task");
@@ -158,6 +237,7 @@ fn local_installation_survives_removal_of_the_task_worktree() {
         "herdr-plugin.toml",
         "src/main.rs",
         "scripts/popup.sh",
+        "scripts/metadata.sh",
     ] {
         fs::write(checkout.join(name), "fixture").unwrap();
     }

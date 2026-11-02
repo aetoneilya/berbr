@@ -27,6 +27,34 @@ is `WORKTABLE_CONFIG`, then an existing
 `$HERDR_PLUGIN_CONFIG_DIR/config.toml`, then the standalone config below.
 New task tabs inherit the selected config and plugin binary on `PATH` for `wt note`.
 
+The plugin also publishes task, ticket, MR, CI, review and agent-role tokens to
+Herdr's sidebar, even while the board is closed. Merge
+[`examples/herdr-sidebar.toml`](examples/herdr-sidebar.toml) into Herdr's config
+and reload it to display them. Tokens are `wt_project`, `wt_task`, `wt_state`,
+`wt_ticket`, `wt_mr`, `wt_ci`, `wt_review`, `wt_role`, `wt_fresh`, `wt_workspace`
+and `wt_cli` (prefix with `$` in sidebar rows). `wt_fresh=cached` means remote data came from wt's cache. The example
+uses one row for the agent and CI, with task status, merge blockers and
+unresolved discussions on the second row. Ticket/MR identifiers remain available as tokens but
+are omitted from this compact layout. Review icons require Nerd Fonts
+(`nf-oct-code_review`, U+F4AF; `nf-oct-comment_discussion`, U+F442).
+The agent row shows its name once. A layout icon (`nf-cod-layout`, U+EBEB)
+indicates workspace membership; the workspace and tab names are omitted.
+The CLI label is included only when it differs from the agent name.
+Task status badges read `todo`, `in progress`, `in review` or `done`.
+The spaces layout adds the configured Worktable project name to the first row;
+task status, CI and review attention appear on the second row.
+
+The worker starts on Herdr startup or when the board opens. After installing
+into an already-running session, start it with
+`herdr plugin action invoke metadata --plugin worktable`. It refreshes agents every five
+seconds and tables every minute, without writing task notes. Roles follow wt's
+agent naming convention: names ending in `-review` get a review badge; others
+have no role badge. MR/CI/review tokens summarize open MRs only. The review
+attention message requires GitLab's `not_approved` state, not a zero approval
+count; draft MRs do not request review. Logs and the per-session worker lock live in
+`HERDR_PLUGIN_STATE_DIR`; tokens expire after three minutes without a worker.
+Workers exit when their Herdr socket or installed binary is replaced.
+
 For a standalone CLI:
 
 ```

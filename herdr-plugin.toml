@@ -1,7 +1,7 @@
 id = "worktable"
 name = "Worktable"
 version = "0.1.0"
-min_herdr_version = "0.7.4"
+min_herdr_version = "0.9.5"
 description = "Tasks, tickets, merge requests, worktrees and agents in one table"
 platforms = ["linux", "macos"]
 
@@ -13,6 +13,15 @@ id = "open"
 title = "Open worktable"
 contexts = ["workspace"]
 command = ["./target/release/wt", "plugin-open"]
+
+[[startup]]
+command = ["sh", "scripts/metadata.sh"]
+
+[[actions]]
+id = "metadata"
+title = "Update sidebar metadata"
+contexts = ["workspace"]
+command = ["sh", "scripts/metadata.sh"]
 
 [[panes]]
 id = "board"

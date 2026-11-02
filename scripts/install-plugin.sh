@@ -17,7 +17,7 @@ esac
 mkdir -p "$install_dir/src" "$install_dir/scripts"
 cp "$source_dir/Cargo.toml" "$source_dir/Cargo.lock" "$source_dir/herdr-plugin.toml" "$install_dir/"
 cp -R "$source_dir/src/." "$install_dir/src/"
-cp "$source_dir/scripts/popup.sh" "$install_dir/scripts/popup.sh"
+cp "$source_dir/scripts/popup.sh" "$source_dir/scripts/metadata.sh" "$install_dir/scripts/"
 cargo build --manifest-path "$install_dir/Cargo.toml" --target-dir "$install_dir/target" --release --locked
 
 if [ -n "$session" ]; then

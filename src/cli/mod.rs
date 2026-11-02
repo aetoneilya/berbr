@@ -30,6 +30,17 @@ enum CliCommands {
     /// (internal) Open the Herdr plugin's board without loading project config.
     #[command(hide = true)]
     PluginOpen,
+    /// (internal) Start the sidebar metadata worker for this Herdr session.
+    #[command(hide = true)]
+    PluginMetadataStart,
+    /// (internal) Publish sidebar metadata without writing task notes.
+    #[command(hide = true)]
+    PluginMetadata {
+        #[arg(long)]
+        once: bool,
+        #[arg(long)]
+        cached: bool,
+    },
     /// The TUI, as `wt` without a command
     Tui {},
 
@@ -173,7 +184,16 @@ struct DoneArgs {
 pub fn run() -> Result<(), String> {
     let cli = Cli::parse();
     if matches!(cli.command, Some(CliCommands::PluginOpen)) {
+        if let Err(err) = crate::metadata::start() {
+            eprintln!("sidebar metadata: {err}");
+        }
         return crate::client::herdr::open_board().map_err(|e| e.to_string());
+    }
+    if matches!(cli.command, Some(CliCommands::PluginMetadataStart)) {
+        return crate::metadata::start();
+    }
+    if let Some(CliCommands::PluginMetadata { once, cached }) = cli.command {
+        return crate::metadata::run(once, cached);
     }
     if let Some(dir) = crate::client::herdr::caller_dir() {
         std::env::set_current_dir(&dir)
@@ -216,6 +236,7 @@ pub fn run() -> Result<(), String> {
         }
         CliCommands::Tui {} => unreachable!(),
         CliCommands::PluginOpen => unreachable!(),
+        CliCommands::PluginMetadataStart | CliCommands::PluginMetadata { .. } => unreachable!(),
     }
 }
 

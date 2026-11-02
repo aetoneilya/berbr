@@ -185,6 +185,32 @@ pub fn list_workspaces() -> Result<Vec<Workspace>> {
     result_field(run_herdr(&["workspace", "list"])?, "/result/workspaces")
 }
 
+/// Only wt-owned tokens; empty values remove an old token instead of retaining it.
+pub fn report_metadata(
+    scope: &str,
+    target: &str,
+    tokens: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let mut args = vec![
+        scope.to_string(),
+        "report-metadata".into(),
+        target.into(),
+        "--source".into(),
+        "worktable".into(),
+        "--ttl-ms".into(),
+        "180000".into(),
+    ];
+    for (key, value) in tokens {
+        if value.is_empty() {
+            args.extend(["--clear-token".into(), key.clone()]);
+        } else {
+            args.extend(["--token".into(), format!("{key}={value}")]);
+        }
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    herdr_output(&args).map(|_| ())
+}
+
 pub fn close_workspace(workspace_id: &str) -> Result<()> {
     run_herdr(&["workspace", "close", workspace_id]).map(|_| ())
 }
