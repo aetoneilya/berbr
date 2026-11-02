@@ -78,11 +78,16 @@ wt completions <shell>     shell completion script
 
 ## TUI
 
+Opening from Herdr selects the task of the calling pane, worktree or workspace.
+If no task matches, the usual first task stays selected. Refreshes keep your selection.
+Tasks start collapsed; space or → expands them. The list uses at most 40% of the
+window (56 columns), leaving the rest for the preview.
+
 `?` shows all keys. The main ones:
 
 - `↑↓`/`jk` move, `←→`/`hl`/space fold, `z` fold / unfold all, `/` filter, `.` all / active only, `v` hide MRs, worktrees, …
 - `⏎` focus the agent, or resume work (`wt select`)
-- `+ new task` row above the tasks: ⏎ or a click opens a form (name, one Jira dropdown: none, new ticket and the open tickets without a task, filtered by typing; checkboxes worktree, agent); `s` start a ticket / add one to a task, `a` attach a ticket
+- `+ new task` row above the tasks: ⏎ or a click opens a form (name, description, one Jira dropdown: none, new ticket and the open tickets without a task, filtered by typing; checkboxes worktree, agent). Leave the name empty to generate it from the description. In description, ⏎ adds a line and pasting preserves newlines; Tab moves between fields, Ctrl+S starts. The agent reads the context and works on the description; with no description, it waits for your command. A name is required when agent is unchecked. `s` starts a ticket / adds one to a task, `a` attaches a ticket.
 - `b` browser, `o` note in Obsidian, `e` note in `$EDITOR`, `i` worktree in the IDE
 - `R` review, `d` remove a worktree / close a task
 - `w` next agent waiting for you, `p` details pane, `r` refresh, `q` quit

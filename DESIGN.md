@@ -121,8 +121,15 @@ closed: 2026-11-02
 
 `wt start` / `wt add` write a brief to `.git/worktrees/<name>/task.md`: the note
 path, the Jira description of the ticket, the definition of done. The agent's
-initial prompt only points at the note and the brief and tells it to read them
-and wait (decided 2026-10-13): the work starts with analysis, on my command.
+initial prompt points at the note and the brief. With a description it tells the
+agent to read the context and work on the description; otherwise it reads and
+waits (the default decided 2026-10-13).
+
+The new-task form accepts a multi-line description, saved in the note's body
+and the brief. Its name is optional when a description and agent are supplied:
+a separate tool-free `claude --print` request generates a title and a Latin
+worktree slug before any note, ticket, workspace or worktree is created. A failed
+request creates nothing. An explicitly entered name does not make this request.
 
 Agents write their findings into the note, but only under the `## Agent notes`
 heading (decided 2026-10-09); everything above it is the user's. They do it via
@@ -192,7 +199,7 @@ wt select [<task | KEY>]    go back to existing work
 wt status                   the table in plain text
 ```
 
-### `wt start <task name | KEY> [-k KEY]... [-t tag]... [-m text] [-n name] [-b branch] [--bg] [--new-ticket] [--no-worktree] [--no-agent]`
+### `wt start [<task name | KEY>] [-k KEY]... [-t tag]... [-m text] [--description text] [-n name] [-b branch] [--bg] [--new-ticket] [--no-worktree] [--no-agent]`
 
 - **A ticket key** (`DEMO-12345`) — a new task named after the ticket's summary
   (characters a file name can't hold dropped), with that ticket: the same as
@@ -210,7 +217,11 @@ wt status                   the table in plain text
 - **`--no-worktree`** — claude runs in the main checkout, in a tab of the task's
   workspace, its brief in worktable's cache. **`--no-agent`** — the worktree tab
   gets a shell, no claude. Both: only the note.
-- **No argument** — fuzzy picker over my open Jira tickets not in any task, plus
+- **`--description text`** — saves the text in the note and brief and starts the
+  agent on it after reading the context. With no task name, first generates the
+  title and worktree slug from the description; `--no-agent` requires a name.
+  `-m` keeps its existing meaning: context, with the agent waiting for a command.
+- **No argument or description** — fuzzy picker over my open Jira tickets not in any task, plus
   "new task…".
 
 `wt start` and `wt add` return at once: fetch and checkout of demoapp take ~30 s, so
@@ -293,6 +304,10 @@ minute. A service that does not answer keeps its cached data, with a warning.
 Agent states are polled from herdr every 2 s; the header counts agents waiting
 for me (blocked, or done and unseen) and `w` jumps to the next one.
 
+On opening, select the caller's task from Herdr's invocation context: pane/tab,
+then worktree cwd, then workspace. Apply this once; later refreshes keep the
+user's selection. If no task matches, keep the default first task.
+
 In herdr, `prefix+t` opens it as a popup (`[[keys.command]]`, `type = "popup"`,
 `WT_POPUP=1`): going to some work — focusing an agent, select, start — closes it.
 
@@ -333,7 +348,7 @@ threads and conflicts. Ticket descriptions are Jira markup rendered as text.
 | `w` | — | next agent waiting for me |
 | `v` | — | what kinds of rows to show |
 | `p` | — | details pane on/off (hidden under 110 columns) |
-| `⏎`, click | "+ new task" row above the tasks | a form for `wt start`: name; one Jira dropdown (⏎ or space opens it): none, new ticket, then the open tickets without a task — assigned to me or worked on — in progress first; typing filters, a typed key is taken as is; checkboxes worktree and agent (neither: only the note); no Jira field in a project without Jira |
+| `⏎`, click | "+ new task" row above the tasks | a form for `wt start`: optional name, multi-line description (⏎ newline, Ctrl+S start, Tab next field); an empty name is generated from description when agent is checked; one Jira dropdown (⏎ or space opens it): none, new ticket, then the open tickets without a task — assigned to me or worked on — in progress first; typing filters, a typed key is taken as is; checkboxes worktree and agent (neither: only the note); no Jira field in a project without Jira |
 | `c` | task, ticket | `wt select --session` |
 | `R`, `d` | worktree | `wt review`, `wt done` |
 | `d` | task | `wt done "<task>"`: close it with its Jira tickets |

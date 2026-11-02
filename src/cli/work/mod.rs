@@ -4,6 +4,7 @@ mod brief;
 mod common;
 pub(crate) mod done;
 mod launch;
+mod naming;
 mod review;
 mod select;
 mod start;

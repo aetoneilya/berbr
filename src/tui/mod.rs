@@ -5,6 +5,7 @@
 //! and ask in a dialog.
 
 mod anim;
+mod context;
 mod details;
 mod dialog;
 mod draw;
@@ -24,8 +25,8 @@ use details::Detail;
 use dialog::{Action, Dialog};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEvent,
-    MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Position, Rect};
@@ -36,6 +37,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
+
+pub(crate) use context::caller_dir;
 
 const REFRESH_EVERY: Duration = Duration::from_secs(60);
 /// herdr is local and quick: agent states are polled this often.
@@ -56,12 +59,16 @@ pub fn run(projects: Vec<Config>, start: Option<usize>) -> Result<(), String> {
 /// The full-screen terminal, with the mouse reported to the TUI.
 fn init_terminal() -> DefaultTerminal {
     let terminal = ratatui::init();
-    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    let _ = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
     terminal
 }
 
 fn restore_terminal() {
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     ratatui::restore();
 }
 
@@ -109,7 +116,11 @@ struct App {
     rows: Vec<Row>,
     list: ListState,
     selected: Option<String>,
+    /// Apply the caller's task once, including when it appears on refresh.
+    opening: Option<context::Opening>,
     folded: HashSet<String>,
+    /// Tasks already given their initial collapsed state in this project.
+    known_tasks: HashSet<String>,
     all: bool,
     /// Kinds of rows left out, `v`; kept between runs.
     hide: Hide,
@@ -172,7 +183,9 @@ impl App {
             rows: Vec::new(),
             list: ListState::default(),
             selected: None,
+            opening: Some(context::Opening::capture()),
             folded: HashSet::new(),
+            known_tasks: HashSet::new(),
             all: false,
             hide: saved.hide,
             filter: String::new(),
@@ -220,9 +233,22 @@ impl App {
             if event::poll(wait).map_err(|e| e.to_string())? {
                 match event::read().map_err(|e| e.to_string())? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        self.opening = None;
                         self.on_key(key, terminal)
                     }
                     Event::Mouse(mouse) => self.on_mouse(mouse),
+                    Event::Paste(text) => {
+                        if let Some(Dialog::NewTask(form)) = &mut self.dialog {
+                            form.paste(&text);
+                        } else {
+                            for c in text.chars().filter(|c| !c.is_control()) {
+                                self.on_key(
+                                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                                    terminal,
+                                );
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -280,9 +306,12 @@ impl App {
         self.project = index;
         self.config = config;
         self.table = table;
+        self.folded.clear();
+        self.known_tasks.clear();
         self.online = false;
         self.synced = None;
         self.selected = None;
+        self.opening = None;
         self.list.select(None);
         self.filter.clear();
         self.details.clear();
@@ -423,6 +452,23 @@ impl App {
 
     /// Rows from the table, keeping the selection on the same item.
     fn rebuild(&mut self) {
+        for row in &self.table.tasks {
+            let id = format!("task:{}", row.task.name);
+            if self.known_tasks.insert(id.clone()) {
+                self.folded.insert(id);
+            }
+        }
+        if let Some(task) = self.opening.as_ref().and_then(|c| c.task(&self.table)) {
+            self.opening = None;
+            self.all |= self.table.tasks[task].task.done;
+            self.selected = Some(format!("task:{}", self.table.tasks[task].task.name));
+            let mut parent = self.table.tasks[task].parent;
+            while let Some(i) = parent {
+                self.folded
+                    .remove(&format!("task:{}", self.table.tasks[i].task.name));
+                parent = self.table.tasks[i].parent;
+            }
+        }
         self.rows = rows::build(&self.table, self.all, self.hide, &self.filter, &self.folded);
         let index = self
             .selected
@@ -444,6 +490,12 @@ impl App {
     /// row, a click on the selected one folds or unfolds it. Not while a dialog,
     /// the help or a prompt is up.
     fn on_mouse(&mut self, mouse: MouseEvent) {
+        if matches!(
+            mouse.kind,
+            MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            self.opening = None;
+        }
         if self.dialog.is_some() || self.help || self.prompt.is_some() {
             return;
         }

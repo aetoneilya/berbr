@@ -5,7 +5,7 @@ use super::common::{
     Terminal, Ui, branch_name, choose_repo, err, fetch_issue, find_task, is_ticket_key, list,
     name_from_issue, name_from_text, resolve_task,
 };
-use super::launch::{Open, launch, open_work};
+use super::launch::{Context, Open, launch, open_work};
 use crate::cli::{AddArgs, StartArgs, load};
 use crate::client::jira::JiraIssue;
 use crate::client::worktree;
@@ -30,8 +30,26 @@ fn start_with(
     mut args: StartArgs,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
-    let target = match args.target.take() {
+    args.description = args.description.filter(|d| !d.trim().is_empty());
+    let target = match args
+        .target
+        .take()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
         Some(target) => target,
+        None if args.description.is_some() => {
+            if args.no_agent {
+                return Err("a task name is required without an agent".into());
+            }
+            ui.say("generating a task name from the description…".into());
+            let names = super::naming::from_description(args.description.as_deref().unwrap())?;
+            if args.name.is_none() {
+                args.name = Some(names.worktree);
+            }
+            ui.say(format!("task name: {}", names.title));
+            names.title
+        }
         None => pick_start_target(config, &tasks, ui)?,
     };
     let existing = find_task(&tasks, &target, false)?;
@@ -48,6 +66,7 @@ fn start_with(
                 in_tree: None,
                 name: args.name,
                 message: args.message,
+                description: args.description,
                 bg: args.bg,
             };
             return add_with(config, tasks, add_args, ui);
@@ -79,6 +98,7 @@ fn start_with(
         tickets,
         tags,
         message,
+        description,
         name,
         branch,
         bg,
@@ -124,10 +144,16 @@ fn start_with(
         frontmatter.push(("tags", list(&tags)));
     }
     frontmatter.push(("done", Value::Bool(false)));
-    let body = message
-        .as_deref()
-        .map(|m| format!("{m}\n"))
-        .unwrap_or_default();
+    let body = [message.as_deref(), description.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let body = if body.is_empty() {
+        body
+    } else {
+        format!("{body}\n")
+    };
     let note = Note::create(&path, &frontmatter, &body).map_err(err)?;
     let task = Task::from_note(note);
     ui.say(format!("note: {}", path.display()));
@@ -150,7 +176,7 @@ fn start_with(
             Some(&task),
             issue.as_ref(),
             &keys,
-            message.as_deref(),
+            description.as_deref().or(message.as_deref()),
         );
         let brief = crate::config::cache_dir()
             .join("briefs")
@@ -163,8 +189,11 @@ fn start_with(
             &task.name,
             &main,
             &label,
-            Some(&task.note.path),
-            &brief,
+            Context {
+                note: Some(&task.note.path),
+                brief: &brief,
+                description: description.as_deref(),
+            },
             !bg,
             ui,
         );
@@ -183,11 +212,12 @@ fn start_with(
         Some(&task),
         issue.as_ref(),
         &keys,
-        message.as_deref(),
+        description.as_deref().or(message.as_deref()),
     );
     let open = Open {
         agent: !no_agent,
         focus: !bg,
+        description,
     };
     open_work(&task, &main, &wt_name, &branch, brief, open, ui)
 }
@@ -226,6 +256,7 @@ fn add_with(
         in_tree,
         name,
         message,
+        description,
         bg,
     } = args;
     let (task_arg, key) = match args.as_slice() {
@@ -275,11 +306,12 @@ fn add_with(
         Some(&task),
         Some(&issue),
         &task.tickets,
-        message.as_deref(),
+        description.as_deref().or(message.as_deref()),
     );
     let open = Open {
         agent: true,
         focus: !bg,
+        description,
     };
     open_work(&task, &main, &wt_name, &branch, brief, open, ui)
 }
@@ -329,7 +361,7 @@ fn similar_tasks(tasks: &[Task], name: &str, tags: &[String]) -> Vec<String> {
 
 /// A ticket summary as a note file name: without the characters Obsidian and
 /// file systems refuse, one line, of reasonable length.
-fn note_title(summary: &str) -> String {
+pub(super) fn note_title(summary: &str) -> String {
     let cleaned: String = summary
         .chars()
         .map(|c| {

@@ -10,19 +10,23 @@ use crate::vault::task::Task;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// A fresh claude in a tab of the herdr workspace `space`, pointed at the task
-/// note and the brief: it reads them and waits — the work starts with analysis,
-/// on my command.
+pub(super) struct Context<'a> {
+    pub note: Option<&'a Path>,
+    pub brief: &'a Path,
+    pub description: Option<&'a str>,
+}
+
+/// A fresh claude in the task's workspace: reads its context, then works on
+/// a supplied description, or waits for a command.
 pub(super) fn launch(
     space: &str,
     cwd: &Path,
     label: &str,
-    note: Option<&Path>,
-    brief: &Path,
+    context: Context<'_>,
     focus: bool,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
-    let prompt = agent_prompt(note, brief);
+    let prompt = agent_prompt(context.note, context.brief, context.description);
     let args: Vec<&str> = prompt.as_deref().into_iter().collect();
     open_agent(space, cwd, label, &args, focus, ui)
 }
@@ -32,6 +36,7 @@ pub(super) fn launch(
 pub(super) struct Open {
     pub(super) agent: bool,
     pub(super) focus: bool,
+    pub(super) description: Option<String>,
 }
 
 /// What `wt prepare` does in the new tab, handed over in a file.
@@ -45,6 +50,8 @@ struct PrepareSpec {
     pane: String,
     /// The claude to start once the worktree is ready; none, a shell only.
     agent: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 /// A tab for the worktree `name` in the task's herdr workspace. Fetch and
@@ -61,7 +68,11 @@ pub(super) fn open_work(
     open: Open,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
-    let Open { agent, focus } = open;
+    let Open {
+        agent,
+        focus,
+        description,
+    } = open;
     let (space, note) = (task.name.as_str(), Some(task.note.path.as_path()));
     let dir = worktree::worktree_dir(main, name);
     if !herdr::available() {
@@ -69,7 +80,7 @@ pub(super) fn open_work(
         ui.say(format!("worktree: {} ({branch})", dir.display()));
         let brief = write_brief(&dir, &brief)?;
         if agent {
-            let prompt = agent_prompt(note, &brief).unwrap_or_default();
+            let prompt = agent_prompt(note, &brief, description.as_deref()).unwrap_or_default();
             ui.say(format!(
                 "not in herdr — run it yourself: cd {} && claude '{prompt}'",
                 dir.display()
@@ -89,6 +100,7 @@ pub(super) fn open_work(
         note: note.map(Path::to_path_buf),
         pane: pane.clone(),
         agent: agent.clone(),
+        description,
     };
     let spec_path =
         crate::config::cache_dir().join(format!("prepare-{pane}.json").replace(':', "-"));
@@ -167,7 +179,8 @@ pub(in crate::cli) fn cli_prepare(spec_path: &Path) -> Result<(), String> {
 
     // the shell starts claude from the worktree itself: herdr shows the branch
     // of the pane's shell, which would otherwise stay in the main checkout
-    let prompt = agent_prompt(spec.note.as_deref(), &brief).unwrap_or_default();
+    let prompt =
+        agent_prompt(spec.note.as_deref(), &brief, spec.description.as_deref()).unwrap_or_default();
     std::fs::write(prompt_path(spec_path), prompt).map_err(err)?;
     let _ = herdr::name_agent_when_up(&spec.pane, agent);
     Ok(())

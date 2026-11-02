@@ -79,6 +79,10 @@ pub(crate) struct StartArgs {
     /// The goal: first line of the note and the agent's brief
     #[arg(long, short = 'm')]
     pub(crate) message: Option<String>,
+    /// Task description: saved in the note and given to the agent to work on.
+    /// With no task name, the agent generates a name from this text first
+    #[arg(long)]
+    pub(crate) description: Option<String>,
     /// Worktree, tab and agent name; default: from the ticket summary
     #[arg(long, short = 'n')]
     pub(crate) name: Option<String>,
@@ -113,6 +117,9 @@ pub(crate) struct AddArgs {
     pub(crate) name: Option<String>,
     #[arg(long, short = 'm')]
     pub(crate) message: Option<String>,
+    /// A description for the agent to work on immediately
+    #[arg(long)]
+    pub(crate) description: Option<String>,
     #[arg(long)]
     pub(crate) bg: bool,
 }
@@ -163,7 +170,7 @@ struct DoneArgs {
 pub fn run() -> Result<(), String> {
     let cli = Cli::parse();
     let mut projects = load_projects().map_err(|err| err.to_string())?;
-    let cwd = std::env::current_dir().ok();
+    let cwd = crate::tui::caller_dir();
     let command = match cli.command {
         None | Some(CliCommands::Tui {}) => {
             // the TUI opens on the last project it showed, unless told or in one

@@ -23,7 +23,8 @@ impl App {
         .areas(frame.area());
         self.preview_shown = self.preview.unwrap_or(body.width >= PREVIEW_MIN_WIDTH);
         let [left, right] = if self.preview_shown {
-            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(body)
+            let list_width = ((u32::from(body.width) * 40 / 100) as u16).min(56);
+            Layout::horizontal([Constraint::Length(list_width), Constraint::Min(0)]).areas(body)
         } else {
             Layout::horizontal([Constraint::Percentage(100), Constraint::Length(0)]).areas(body)
         };

@@ -5,7 +5,7 @@ use super::common::{
     Terminal, Ui, branch_name, choose_repo, err, fetch_issue, find_task, is_ticket_key,
     name_from_issue, name_from_text, repo_with_worktree,
 };
-use super::launch::{Open, launch, open_agent, open_work};
+use super::launch::{Context, Open, launch, open_agent, open_work};
 use crate::cli::SelectArgs;
 use crate::cli::load;
 use crate::client::sessions::Session;
@@ -58,6 +58,7 @@ fn first_worktree(
     let open = Open {
         agent: true,
         focus: !bg,
+        description: None,
     };
     open_work(task, &main, &name, &branch, brief, open, ui)
 }
@@ -179,8 +180,11 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
         &space,
         &tree.wt.path,
         &tree.wt.name(),
-        note,
-        &brief,
+        Context {
+            note,
+            brief: &brief,
+            description: None,
+        },
         !bg,
         ui,
     )
@@ -229,7 +233,18 @@ fn resume(
             session.id
         ));
         let brief = brief_path(tree)?;
-        return launch(space, tree, &session.worktree, note, &brief, !bg, ui);
+        return launch(
+            space,
+            tree,
+            &session.worktree,
+            Context {
+                note,
+                brief: &brief,
+                description: None,
+            },
+            !bg,
+            ui,
+        );
     };
     let launch_dir = transcript
         .first_cwd

@@ -1,4 +1,4 @@
-//! "+ new task": a form for `wt start` — the name, a Jira ticket (none, a new
+//! "+ new task": a form for `wt start` — the name, description, a Jira ticket (none, a new
 //! one, or an existing one, all in one dropdown), whether to make a worktree
 //! and an agent.
 
@@ -23,6 +23,7 @@ enum Jira {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field {
     Name,
+    Description,
     Jira,
     Worktree,
     Agent,
@@ -63,6 +64,7 @@ const SHOWN: usize = 10;
 
 pub(super) struct Form {
     name: String,
+    description: String,
     jira: Jira,
     worktree: bool,
     agent: bool,
@@ -82,6 +84,7 @@ impl Form {
     fn new(has_jira: bool, tickets: Vec<Ticket>) -> Form {
         Form {
             name: String::new(),
+            description: String::new(),
             jira: Jira::None,
             worktree: true,
             agent: true,
@@ -96,7 +99,7 @@ impl Form {
 
     /// The fields shown: no ticket without Jira.
     fn fields(&self) -> Vec<Field> {
-        let mut fields = vec![Field::Name];
+        let mut fields = vec![Field::Name, Field::Description];
         if self.has_jira {
             fields.push(Field::Jira);
         }
@@ -120,7 +123,7 @@ impl Form {
             }
             Field::Worktree => self.worktree = !self.worktree,
             Field::Agent => self.agent = !self.agent,
-            Field::Name => {}
+            Field::Name | Field::Description => {}
         }
     }
 
@@ -193,21 +196,47 @@ impl Form {
     }
 
     fn is_toggle(&self) -> bool {
-        self.field != Field::Name
+        matches!(self.field, Field::Jira | Field::Worktree | Field::Agent)
+    }
+
+    /// Pasting text never submits the form, including multi-line descriptions.
+    pub(super) fn paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.menu.is_some() {
+            self.filter.extend(text.chars().filter(|c| !c.is_control()));
+            self.menu = Some(0);
+        } else if self.field == Field::Description {
+            self.description.extend(
+                text.chars()
+                    .filter(|c| !c.is_control() || matches!(*c, '\n' | '\t')),
+            );
+        } else if self.field == Field::Name {
+            self.name
+                .push_str(&text.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
+        self.error = None;
     }
 
     /// What `wt start` gets. An existing ticket without a name names the task
     /// after its summary.
     fn args(&self) -> Result<StartArgs, String> {
         let name = self.name.trim().to_string();
+        let description = (!self.description.trim().is_empty()).then(|| self.description.clone());
         let (target, tickets) = match &self.jira {
-            Jira::Existing(key) if name.is_empty() => (key.clone(), Vec::new()),
-            Jira::Existing(key) => (name, vec![key.clone()]),
+            Jira::Existing(key) if name.is_empty() && description.is_none() => {
+                (Some(key.clone()), Vec::new())
+            }
+            Jira::Existing(key) => ((!name.is_empty()).then_some(name), vec![key.clone()]),
+            _ if name.is_empty() && description.is_some() => (None, Vec::new()),
             _ if name.is_empty() => return Err("a name for the task".to_string()),
-            _ => (name, Vec::new()),
+            _ => (Some(name), Vec::new()),
         };
+        if target.is_none() && !self.agent {
+            return Err("a name is required without an agent".into());
+        }
         Ok(StartArgs {
-            target: Some(target),
+            target,
+            description,
             tickets,
             new_ticket: self.jira == Jira::New,
             no_worktree: !self.worktree,
@@ -241,22 +270,30 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => return,
+            KeyCode::Enter if form.field == Field::Description && !ctrl => {
+                form.description.push('\n');
+            }
             KeyCode::Enter if form.field == Field::Jira => form.flip(),
-            KeyCode::Enter => match form.args() {
-                Ok(args) => {
-                    let target = args.target.clone().unwrap_or_default();
-                    let then = if args.no_worktree && args.no_agent {
-                        Then::Close
-                    } else {
-                        Then::Navigate
-                    };
-                    self.run_command(format!("start {target}"), then, move |config, ui| {
-                        work::start(config, args, ui)
-                    });
-                    return;
+            KeyCode::Enter | KeyCode::Char('s') if key.code == KeyCode::Enter || ctrl => {
+                match form.args() {
+                    Ok(args) => {
+                        let target = args
+                            .target
+                            .clone()
+                            .unwrap_or_else(|| "from description".into());
+                        let then = if args.no_worktree && args.no_agent {
+                            Then::Close
+                        } else {
+                            Then::Navigate
+                        };
+                        self.run_command(format!("start {target}"), then, move |config, ui| {
+                            work::start(config, args, ui)
+                        });
+                        return;
+                    }
+                    Err(e) => form.error = Some(e),
                 }
-                Err(e) => form.error = Some(e),
-            },
+            }
             KeyCode::Up | KeyCode::BackTab => form.move_field(-1),
             KeyCode::Down | KeyCode::Tab => form.move_field(1),
             KeyCode::Left | KeyCode::Right if form.is_toggle() => form.flip(),
@@ -264,7 +301,13 @@ impl App {
             KeyCode::Backspace if form.field == Field::Name => {
                 form.name.pop();
             }
+            KeyCode::Backspace if form.field == Field::Description => {
+                form.description.pop();
+            }
             KeyCode::Char(c) if !ctrl && form.field == Field::Name => form.name.push(c),
+            KeyCode::Char(c) if !ctrl && form.field == Field::Description => {
+                form.description.push(c)
+            }
             _ => {}
         }
         self.dialog = Some(Dialog::NewTask(form));
@@ -274,7 +317,7 @@ impl App {
 /// The open dropdown: the filter, then a window of the options around the one
 /// the cursor is on.
 fn menu(form: &Form, at: usize, lit: Style, dim: Style) -> Vec<Line<'static>> {
-    let pad = format!("{:12}", "");
+    let pad = format!("{:14}", "");
     let mut lines = vec![Line::from(vec![
         Span::raw(format!("{pad}  ")),
         Span::styled("filter ", dim),
@@ -332,6 +375,8 @@ pub(super) fn hint(form: &Form) -> &'static str {
         "type to filter   ↑↓ move   ⏎ pick   Esc back"
     } else if form.field == Field::Jira {
         "↑↓ field   ⏎ space open   Esc cancel"
+    } else if form.field == Field::Description {
+        "Tab field   ⏎ newline   Ctrl+S start   Esc cancel"
     } else if form.is_toggle() {
         "↑↓ field   space check   ⏎ start   Esc cancel"
     } else {
@@ -347,7 +392,7 @@ pub(super) fn lines(form: &Form) -> Vec<Line<'static>> {
     let label = |field: Field, text: &str| {
         let on = form.field == field;
         Span::styled(
-            format!("{}{text:<10}", if on { "› " } else { "  " }),
+            format!("{}{text:<12}", if on { "› " } else { "  " }),
             if on {
                 Style::default().fg(Color::Yellow)
             } else {
@@ -388,10 +433,14 @@ pub(super) fn lines(form: &Form) -> Vec<Line<'static>> {
                 let cursor = if form.field == field { "▏" } else { "" };
                 let mut spans = vec![label(field, "name")];
                 if form.name.is_empty() {
-                    let hint = if matches!(form.jira, Jira::Existing(_)) {
+                    let hint = if matches!(form.jira, Jira::Existing(_))
+                        && form.description.trim().is_empty()
+                    {
                         "the ticket's summary"
-                    } else {
+                    } else if !form.agent {
                         "the task's name"
+                    } else {
+                        "optional; generated from description"
                     };
                     spans.push(Span::raw(cursor));
                     spans.push(Span::styled(hint, dim));
@@ -399,6 +448,46 @@ pub(super) fn lines(form: &Form) -> Vec<Line<'static>> {
                     spans.push(Span::raw(format!("{}{cursor}", form.name)));
                 }
                 lines.push(Line::from(spans));
+            }
+            Field::Description => {
+                let cursor = if form.field == field { "▏" } else { "" };
+                if form.description.is_empty() {
+                    lines.push(Line::from(vec![
+                        label(field, "description"),
+                        Span::raw(cursor),
+                        Span::styled("what the agent should do", dim),
+                    ]));
+                } else {
+                    let mut rows: Vec<_> = form.description.split('\n').collect();
+                    let hidden = rows.len().saturating_sub(4);
+                    rows.drain(..hidden);
+                    if hidden > 0 {
+                        lines.push(Line::styled(format!("{:14}… {hidden} more lines", ""), dim));
+                    }
+                    for (i, row) in rows.iter().enumerate() {
+                        let row = row.replace('\t', "    ");
+                        let mut spans = vec![if i == 0 {
+                            label(field, "description")
+                        } else {
+                            Span::raw(" ".repeat(14))
+                        }];
+                        // Keep the text being edited visible in a small terminal too.
+                        let tail: String = row
+                            .chars()
+                            .rev()
+                            .take(66)
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect();
+                        spans.push(Span::raw(format!(
+                            "{}{tail}{}",
+                            if row.chars().count() > 66 { "…" } else { "" },
+                            if i + 1 == rows.len() { cursor } else { "" }
+                        )));
+                        lines.push(Line::from(spans));
+                    }
+                }
             }
             Field::Jira => {
                 // `[ DEMO-1 ▾ ] summary`, lit while the cursor is on it
@@ -480,6 +569,43 @@ mod tests {
         let args = form.args().unwrap();
         assert_eq!(args.target.as_deref(), Some("video"));
         assert_eq!(args.tickets, vec!["DEMO-1"]);
+    }
+
+    #[test]
+    fn description_can_replace_the_name_and_keeps_ticket_choices() {
+        let mut form = Form::new(true, Vec::new());
+        form.description = "Добавь поле description\nи сохрани текст".into();
+        let args = form.args().unwrap();
+        assert!(args.target.is_none());
+        assert_eq!(args.description.as_deref(), Some(form.description.as_str()));
+        form.jira = Jira::Existing("DEMO-7".into());
+        let args = form.args().unwrap();
+        assert!(args.target.is_none());
+        assert_eq!(args.tickets, ["DEMO-7"]);
+        form.jira = Jira::New;
+        assert!(form.args().unwrap().new_ticket);
+        form.agent = false;
+        assert!(form.args().is_err());
+        form.name = "task".into();
+        assert!(form.args().unwrap().no_agent);
+    }
+
+    #[test]
+    fn pasted_description_preserves_newlines_and_is_not_a_toggle() {
+        let mut form = Form::new(false, Vec::new());
+        form.move_field(1);
+        assert!(form.field == Field::Description);
+        assert!(!form.is_toggle());
+        form.paste("Первая строка\r\n\tsecond 'quoted' line\rthird");
+        assert_eq!(
+            form.description,
+            "Первая строка\n\tsecond 'quoted' line\nthird"
+        );
+        form.flip();
+        assert!(form.worktree && form.agent);
+        let text: Vec<_> = lines(&form).iter().map(|line| line.to_string()).collect();
+        assert!(text.iter().any(|line| line.contains("description")));
+        assert!(text.iter().any(|line| line.contains("third▏")));
     }
 
     #[test]

@@ -13,8 +13,12 @@ If you change code, you are done when:
 - you end with a short summary: what changed, how it was checked, open questions.
 If the task is ambiguous or touches more than a couple of files, start with a plan and agree on it.";
 
-/// Points claude at the task note and the brief; it reads them and waits.
-pub(super) fn agent_prompt(note: Option<&Path>, brief: &Path) -> Option<String> {
+/// Reads the context first, then works on a supplied description or waits.
+pub(super) fn agent_prompt(
+    note: Option<&Path>,
+    brief: &Path,
+    description: Option<&str>,
+) -> Option<String> {
     let mut context = Vec::new();
     if let Some(note) = note {
         context.push(format!("task note {}", note.display()));
@@ -22,12 +26,19 @@ pub(super) fn agent_prompt(note: Option<&Path>, brief: &Path) -> Option<String> 
     if brief.exists() {
         context.push(format!("brief with the ticket {}", brief.display()));
     }
-    (!context.is_empty()).then(|| {
-        format!(
-            "Context: {}. Read it and wait for my command.",
-            context.join(", ")
-        )
-    })
+    let description = description.filter(|d| !d.trim().is_empty());
+    if context.is_empty() {
+        return description.map(str::to_string);
+    }
+    let mut prompt = format!("Context: {}. Read it", context.join(", "));
+    if description.is_some() {
+        // Keep the shell command on one line. The full description, including
+        // newlines and quotes, is already in the brief's "What is needed".
+        prompt.push_str(" first, then work on the task description in the brief.");
+    } else {
+        prompt.push_str(" and wait for my command.");
+    }
+    Some(prompt)
 }
 
 /// The agent's brief: task note, ticket text, what to do, definition of done.
@@ -109,4 +120,29 @@ pub(super) fn write_brief(tree: &Path, brief: &str) -> Result<PathBuf, String> {
 /// Where `write_brief` puts the brief of the worktree `tree`.
 pub(super) fn brief_path(tree: &Path) -> Result<PathBuf, String> {
     Ok(worktree::git_dir(tree).map_err(err)?.join("task.md"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn description_starts_work_but_an_empty_description_still_waits() {
+        let dir = crate::table::fixtures::temp_dir();
+        let brief = dir.join("task.md");
+        std::fs::write(&brief, "## What is needed\n\nFix 'quotes'\nand newlines\n").unwrap();
+        let note = dir.join("note.md");
+        let prompt = agent_prompt(Some(&note), &brief, Some("Fix 'quotes'\nand newlines")).unwrap();
+        assert!(prompt.contains("work on the task description in the brief"));
+        assert!(!prompt.contains("wait for my command"));
+        assert!(!prompt.contains('\n'));
+        for description in [None, Some("  \n")] {
+            assert!(
+                agent_prompt(Some(&note), &brief, description)
+                    .unwrap()
+                    .ends_with("wait for my command.")
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
