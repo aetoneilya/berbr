@@ -407,3 +407,35 @@ fetch, the matching and the rendering took to stderr.
 - Do markdown links inside list properties render as links in Bases? (Fable says
   no — then the archive view builds MR URLs with a formula from the iid.) Check.
 - Should `berbr done` on a task also offer to move its tickets in Jira? (Default: no.)
+
+## Native app snapshot and completion plans
+
+`app-snapshot` version 2 preserves the v1 schema and adds `merged` and `mr_state`
+to worktrees. The latest branch MR (highest project-local IID) is selected in
+its own repository, whether opened, merged or closed. `merged` means a merged MR
+is known or berbr considers the worktree finished; `mr_state` retains the exact
+MR state, including `closed`, or null when unknown. Task subtrees retain `all`
+content; `active_loose` restricts only the no-task and assigned sections, leaving
+the TUI and status defaults unchanged.
+
+GitLab uses the existing open-MR list and a 90-day `updated_after` list with
+`state=all`, both scoped to `created_by_me`, 100 per page, following pagination
+until the last page. Normally this costs two list requests per project; review
+requests remain limited to open MRs. Recent MRs retain the existing task-matching
+rules. Older terminal MRs are not discovered by a fresh fetch. Failed pages
+fail the source and use the existing remote cache with its freshness warning;
+cached snapshots make no remote requests. A clean tree whose local tip matches
+the terminal MR head is finished even after a squash merge and remote deletion;
+commits beyond that head keep it unfinished.
+
+`done --dry-run [--json]` projects the same task/tree plans used by execution.
+Task plans keep the existing confirmed-discard rule for uncommitted changes;
+individual trees and `--merged` keep dirty trees. A sweep skips unfinished trees
+without blocking removal of finished ones. Steps and candidate removals in a
+blocked task/tree plan describe the operation after resolving its blockers;
+a real invocation refuses before executing any of them. Dry-run exits zero for
+such plans, and never executes a removal, transition, note write or workspace
+close. Planning reads fresh remote data, falling back to caches under the same
+rules as execution, but saves neither remote nor transcript caches. Git status
+uses `--no-optional-locks` so inspection does not refresh the worktree index.
+Unknown counts in forced removals are null rather than fabricated zeroes.

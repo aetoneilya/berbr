@@ -1,0 +1,2065 @@
+{
+  "version": 1,
+  "project": "demo",
+  "projects": [
+    {
+      "name": "demo",
+      "cwd": "/home/dev/demo",
+      "agent": "codex"
+    }
+  ],
+  "rows": [
+    {
+      "id": "task-1",
+      "kind": "task",
+      "state": "active",
+      "done": false,
+      "task": "Demo refactor",
+      "label": "Demo refactor",
+      "title": "Demo refactor",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo refactor.md",
+      "tags": [
+        "demo"
+      ],
+      "space": null,
+      "children": [
+        {
+          "id": "ticket-2",
+          "kind": "ticket",
+          "state": "Закрыт",
+          "task": "Demo refactor",
+          "target": "DEMO-47",
+          "label": "DEMO-47  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-47",
+          "children": [
+            {
+              "id": "mr-3",
+              "kind": "mr",
+              "state": "closed",
+              "task": "Demo refactor",
+              "label": "!133  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/133",
+              "children": []
+            },
+            {
+              "id": "mr-4",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo refactor",
+              "label": "!131  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/131",
+              "children": []
+            },
+            {
+              "id": "mr-5",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo refactor",
+              "label": "!121  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/121",
+              "children": []
+            },
+            {
+              "id": "mr-6",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo refactor",
+              "label": "!120  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/120",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "ticket-7",
+          "kind": "ticket",
+          "state": "Закрыт",
+          "task": "Demo refactor",
+          "target": "DEMO-48",
+          "label": "DEMO-48  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-48",
+          "children": []
+        },
+        {
+          "id": "ticket-8",
+          "kind": "ticket",
+          "state": "ON REVIEW",
+          "task": "Demo refactor",
+          "target": "DEMO-45",
+          "label": "DEMO-45  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-45",
+          "children": []
+        },
+        {
+          "id": "tree-9",
+          "kind": "tree",
+          "state": "active",
+          "task": "Demo refactor",
+          "tree": "demo-checkout-02",
+          "label": "demo-checkout-02",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-02",
+          "body": "/home/dev/demo/worktrees/demo-checkout-02\n",
+          "branch": "dev/DEMO-47",
+          "children": [
+            {
+              "id": "mr-10",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo refactor",
+              "label": "!127  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/127",
+              "children": []
+            }
+          ],
+          "mr_state": "merged",
+          "merged": true
+        },
+        {
+          "id": "tree-11",
+          "kind": "tree",
+          "state": "active",
+          "task": "Demo refactor",
+          "tree": "demo-checkout-03",
+          "label": "demo-checkout-03",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-03",
+          "body": "/home/dev/demo/worktrees/demo-checkout-03\n",
+          "branch": "dev/DEMO-47",
+          "children": [
+            {
+              "id": "mr-12",
+              "kind": "mr",
+              "state": "opened",
+              "task": "Demo refactor",
+              "label": "!122  Demo change",
+              "body": "27d ci…",
+              "url": "https://git.example.com/demo/merge_requests/122",
+              "children": []
+            }
+          ],
+          "mr_state": "opened",
+          "merged": false
+        },
+        {
+          "id": "tree-13",
+          "kind": "tree",
+          "state": "active",
+          "task": "Demo refactor",
+          "tree": "demo-checkout-05",
+          "label": "demo-checkout-05",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-05",
+          "body": "/home/dev/demo/worktrees/demo-checkout-05\n",
+          "branch": "dev/demo-checkout-05",
+          "children": [
+            {
+              "id": "mr-14",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo refactor",
+              "label": "!119  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/119",
+              "children": []
+            }
+          ],
+          "mr_state": "merged",
+          "merged": true
+        },
+        {
+          "id": "tree-15",
+          "kind": "tree",
+          "state": "active",
+          "task": "Demo refactor",
+          "tree": "demo-checkout-06",
+          "label": "demo-checkout-06",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-06",
+          "body": "/home/dev/demo/worktrees/demo-checkout-06\n",
+          "branch": "dev/DEMO-45",
+          "children": [
+            {
+              "id": "mr-16",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo refactor",
+              "label": "!139  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/139",
+              "children": []
+            }
+          ],
+          "mr_state": "merged",
+          "merged": true
+        },
+        {
+          "id": "tree-17",
+          "kind": "tree",
+          "state": "active",
+          "task": "Demo refactor",
+          "tree": "demo-checkout-07",
+          "label": "demo-checkout-07",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-07",
+          "body": "/home/dev/demo/worktrees/demo-checkout-07\n",
+          "branch": "dev/DEMO-47",
+          "children": [],
+          "mr_state": null,
+          "merged": false
+        }
+      ]
+    },
+    {
+      "id": "task-18",
+      "kind": "task",
+      "state": "active",
+      "done": false,
+      "task": "Demo task 02",
+      "label": "Demo task 02",
+      "title": "Demo task 02",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 02.md",
+      "tags": [],
+      "space": null,
+      "children": [
+        {
+          "id": "ticket-19",
+          "kind": "ticket",
+          "state": "Commited",
+          "task": "Demo task 02",
+          "target": "DEMO-46",
+          "label": "DEMO-46  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-46",
+          "children": [
+            {
+              "id": "mr-20",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo task 02",
+              "label": "!129  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/129",
+              "children": []
+            },
+            {
+              "id": "mr-21",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo task 02",
+              "label": "!125  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/125",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "tree-22",
+          "kind": "tree",
+          "state": "active",
+          "task": "Demo task 02",
+          "tree": "demo-checkout-08",
+          "label": "demo-checkout-08",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-08",
+          "body": "/home/dev/demo/worktrees/demo-checkout-08\n +2 ↑1 quiet 9d",
+          "branch": "dev/DEMO-46",
+          "children": [
+            {
+              "id": "mr-23",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo task 02",
+              "label": "!134  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/134",
+              "children": []
+            },
+            {
+              "id": "agent-demo-1",
+              "kind": "agent",
+              "label": "Demo agent",
+              "terminal": "terminal-demo-1",
+              "state": "idle",
+              "task": "Demo task 02",
+              "children": []
+            }
+          ],
+          "mr_state": "merged",
+          "merged": true
+        }
+      ]
+    },
+    {
+      "id": "task-24",
+      "kind": "task",
+      "state": "active",
+      "done": false,
+      "task": "Demo task 03",
+      "label": "Demo task 03",
+      "title": "Demo task 03",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 03.md",
+      "tags": [
+        "demo"
+      ],
+      "space": null,
+      "children": [
+        {
+          "id": "ticket-25",
+          "kind": "ticket",
+          "state": "Новый",
+          "task": "Demo task 03",
+          "target": "DEMO-62",
+          "label": "DEMO-62  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-62",
+          "children": []
+        },
+        {
+          "id": "tree-26",
+          "kind": "tree",
+          "state": "active",
+          "task": "Demo task 03",
+          "tree": "demo-checkout-15",
+          "label": "demo-checkout-15",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-15",
+          "body": "/home/dev/demo/worktrees/demo-checkout-15\n",
+          "branch": "dev/demo-checkout-15",
+          "children": [
+            {
+              "id": "mr-27",
+              "kind": "mr",
+              "state": "opened",
+              "task": "Demo task 03",
+              "label": "!147  Demo change",
+              "body": "ci…",
+              "url": "https://git.example.com/demo/merge_requests/147",
+              "children": []
+            }
+          ],
+          "mr_state": "opened",
+          "merged": false
+        },
+        {
+          "id": "agent-demo-2",
+          "kind": "agent",
+          "label": "Demo agent",
+          "terminal": "terminal-demo-2",
+          "state": "done",
+          "task": "Demo task 03",
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "task-28",
+      "kind": "task",
+      "state": "active",
+      "done": false,
+      "task": "Demo task 04",
+      "label": "Demo task 04",
+      "title": "Demo task 04",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 04.md",
+      "tags": [],
+      "space": null,
+      "children": [
+        {
+          "id": "tree-11",
+          "kind": "tree",
+          "state": "active",
+          "task": "Demo task 04",
+          "tree": "demo-checkout-03",
+          "label": "demo-checkout-03",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-03",
+          "body": "/home/dev/demo/worktrees/demo-checkout-03\n",
+          "branch": "dev/DEMO-47",
+          "children": [
+            {
+              "id": "mr-12",
+              "kind": "mr",
+              "state": "opened",
+              "task": "Demo task 04",
+              "label": "!122  Demo change",
+              "body": "27d ci…",
+              "url": "https://git.example.com/demo/merge_requests/122",
+              "children": []
+            }
+          ],
+          "mr_state": "opened",
+          "merged": false
+        }
+      ]
+    },
+    {
+      "id": "task-29",
+      "kind": "task",
+      "state": "active",
+      "done": false,
+      "task": "Demo task 05",
+      "label": "Demo task 05",
+      "title": "Demo task 05",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 05.md",
+      "tags": [],
+      "space": null,
+      "children": [
+        {
+          "id": "ticket-30",
+          "kind": "ticket",
+          "state": "Commited",
+          "task": "Demo task 05",
+          "target": "DEMO-60",
+          "label": "DEMO-60  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-60",
+          "children": []
+        },
+        {
+          "id": "tree-31",
+          "kind": "tree",
+          "state": "active",
+          "task": "Demo task 05",
+          "tree": "demo-checkout-09",
+          "label": "demo-checkout-09",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-09",
+          "body": "/home/dev/demo/worktrees/demo-checkout-09\n",
+          "branch": "dev/demo-checkout-09",
+          "children": [
+            {
+              "id": "mr-32",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo task 05",
+              "label": "!140  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/140",
+              "children": []
+            }
+          ],
+          "mr_state": "merged",
+          "merged": true
+        }
+      ]
+    },
+    {
+      "id": "task-33",
+      "kind": "task",
+      "state": "active",
+      "done": false,
+      "task": "Demo task 06",
+      "label": "Demo task 06",
+      "title": "Demo task 06",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 06.md",
+      "tags": [],
+      "space": null,
+      "children": [
+        {
+          "id": "ticket-34",
+          "kind": "ticket",
+          "state": "В работе",
+          "task": "Demo task 06",
+          "target": "DEMO-55",
+          "label": "DEMO-55  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-55",
+          "children": [
+            {
+              "id": "mr-35",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo task 06",
+              "label": "!145  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/145",
+              "children": []
+            },
+            {
+              "id": "mr-36",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo task 06",
+              "label": "!144  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/144",
+              "children": []
+            },
+            {
+              "id": "mr-37",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo task 06",
+              "label": "!143  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/143",
+              "children": []
+            },
+            {
+              "id": "mr-38",
+              "kind": "mr",
+              "state": "closed",
+              "task": "Demo task 06",
+              "label": "!142  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/142",
+              "children": []
+            },
+            {
+              "id": "mr-39",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo task 06",
+              "label": "!141  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/141",
+              "children": []
+            },
+            {
+              "id": "mr-40",
+              "kind": "mr",
+              "state": "closed",
+              "task": "Demo task 06",
+              "label": "!130  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/130",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "ticket-41",
+          "kind": "ticket",
+          "state": "Commited",
+          "task": "Demo task 06",
+          "target": "DEMO-60",
+          "label": "DEMO-60  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-60",
+          "children": []
+        },
+        {
+          "id": "tree-31",
+          "kind": "tree",
+          "state": "active",
+          "task": "Demo task 06",
+          "tree": "demo-checkout-09",
+          "label": "demo-checkout-09",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-09",
+          "body": "/home/dev/demo/worktrees/demo-checkout-09\n",
+          "branch": "dev/demo-checkout-09",
+          "children": [
+            {
+              "id": "mr-32",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo task 06",
+              "label": "!140  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/140",
+              "children": []
+            }
+          ],
+          "mr_state": "merged",
+          "merged": true
+        },
+        {
+          "id": "tree-42",
+          "kind": "tree",
+          "state": "active",
+          "task": "Demo task 06",
+          "tree": "demo-checkout-14",
+          "label": "demo-checkout-14",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-14",
+          "body": "/home/dev/demo/worktrees/demo-checkout-14\n",
+          "branch": "dev/DEMO-55",
+          "children": [
+            {
+              "id": "mr-43",
+              "kind": "mr",
+              "state": "opened",
+              "task": "Demo task 06",
+              "label": "!148  Demo change",
+              "body": "ci…",
+              "url": "https://git.example.com/demo/merge_requests/148",
+              "children": []
+            }
+          ],
+          "mr_state": "opened",
+          "merged": false
+        }
+      ]
+    },
+    {
+      "id": "task-44",
+      "kind": "task",
+      "state": "active",
+      "done": false,
+      "task": "Demo task 07",
+      "label": "Demo task 07",
+      "title": "Demo task 07",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 07.md",
+      "tags": [],
+      "space": null,
+      "children": [
+        {
+          "id": "ticket-45",
+          "kind": "ticket",
+          "state": "В работе",
+          "task": "Demo task 07",
+          "target": "DEMO-15",
+          "label": "DEMO-15  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-15",
+          "children": []
+        },
+        {
+          "id": "tree-46",
+          "kind": "tree",
+          "state": "active",
+          "task": "Demo task 07",
+          "tree": "demo-checkout-10",
+          "label": "demo-checkout-10",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-10",
+          "body": "/home/dev/demo/worktrees/demo-checkout-10\n",
+          "branch": "dev/DEMO-15",
+          "children": [
+            {
+              "id": "mr-47",
+              "kind": "mr",
+              "state": "opened",
+              "task": "Demo task 07",
+              "label": "!135  Demo change",
+              "body": "9d ci…",
+              "url": "https://git.example.com/demo/merge_requests/135",
+              "children": []
+            }
+          ],
+          "mr_state": "opened",
+          "merged": false
+        }
+      ]
+    },
+    {
+      "id": "task-48",
+      "kind": "task",
+      "state": "active",
+      "done": false,
+      "task": "Demo task 08",
+      "label": "Demo task 08",
+      "title": "Demo task 08",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 08.md",
+      "tags": [],
+      "space": null,
+      "children": [
+        {
+          "id": "tree-46",
+          "kind": "tree",
+          "state": "active",
+          "task": "Demo task 08",
+          "tree": "demo-checkout-10",
+          "label": "demo-checkout-10",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-10",
+          "body": "/home/dev/demo/worktrees/demo-checkout-10\n",
+          "branch": "dev/DEMO-15",
+          "children": [
+            {
+              "id": "mr-47",
+              "kind": "mr",
+              "state": "opened",
+              "task": "Demo task 08",
+              "label": "!135  Demo change",
+              "body": "9d ci…",
+              "url": "https://git.example.com/demo/merge_requests/135",
+              "children": []
+            }
+          ],
+          "mr_state": "opened",
+          "merged": false
+        }
+      ]
+    },
+    {
+      "id": "task-49",
+      "kind": "task",
+      "state": "active",
+      "done": false,
+      "task": "Demo task 09",
+      "label": "Demo task 09",
+      "title": "Demo task 09",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 09.md",
+      "tags": [
+        "demo"
+      ],
+      "space": null,
+      "children": [
+        {
+          "id": "tree-50",
+          "kind": "tree",
+          "state": "active",
+          "task": "Demo task 09",
+          "tree": "demo-checkout-12",
+          "label": "demo-checkout-12",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-12",
+          "body": "/home/dev/demo/worktrees/demo-checkout-12\n",
+          "branch": "dev/demo-checkout-12",
+          "children": [],
+          "mr_state": null,
+          "merged": false
+        }
+      ]
+    },
+    {
+      "id": "task-51",
+      "kind": "task",
+      "state": "idea",
+      "done": false,
+      "task": "Demo task 10",
+      "label": "Demo task 10",
+      "title": "Demo task 10",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 10.md",
+      "tags": [],
+      "space": null,
+      "children": []
+    },
+    {
+      "id": "task-52",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 11",
+      "label": "Demo task 11",
+      "title": "Demo task 11",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 11.md",
+      "tags": [],
+      "space": null,
+      "children": []
+    },
+    {
+      "id": "task-53",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 12",
+      "label": "Demo task 12",
+      "title": "Demo task 12",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 12.md",
+      "tags": [],
+      "space": null,
+      "children": []
+    },
+    {
+      "id": "task-54",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 13",
+      "label": "Demo task 13",
+      "title": "Demo task 13",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 13.md",
+      "tags": [],
+      "space": null,
+      "children": []
+    },
+    {
+      "id": "task-55",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 14",
+      "label": "Demo task 14",
+      "title": "Demo task 14",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 14.md",
+      "tags": [],
+      "space": null,
+      "children": []
+    },
+    {
+      "id": "task-56",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 15",
+      "label": "Demo task 15",
+      "title": "Demo task 15",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 15.md",
+      "tags": [],
+      "space": null,
+      "children": [
+        {
+          "id": "ticket-57",
+          "kind": "ticket",
+          "state": null,
+          "task": "Demo task 15",
+          "target": "DEMO-50",
+          "label": "DEMO-50  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-50",
+          "children": [
+            {
+              "id": "mr-58",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo task 15",
+              "label": "!138  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/138",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "tree-59",
+          "kind": "tree",
+          "state": "active",
+          "task": "Demo task 15",
+          "tree": "demo-checkout-04",
+          "label": "demo-checkout-04",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-04",
+          "body": "/home/dev/demo/worktrees/demo-checkout-04\n",
+          "branch": "dev/demo-checkout-04",
+          "children": [],
+          "mr_state": null,
+          "merged": false
+        }
+      ]
+    },
+    {
+      "id": "task-60",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 16",
+      "label": "Demo task 16",
+      "title": "Demo task 16",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 16.md",
+      "tags": [
+        "demo"
+      ],
+      "space": null,
+      "children": []
+    },
+    {
+      "id": "task-61",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 17",
+      "label": "Demo task 17",
+      "title": "Demo task 17",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 17.md",
+      "tags": [],
+      "space": null,
+      "children": [
+        {
+          "id": "ticket-62",
+          "kind": "ticket",
+          "state": null,
+          "task": "Demo task 17",
+          "target": "DEMO-59",
+          "label": "DEMO-59  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-59",
+          "children": [
+            {
+              "id": "mr-63",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo task 17",
+              "label": "!137  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/137",
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "task-64",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 18",
+      "label": "Demo task 18",
+      "title": "Demo task 18",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 18.md",
+      "tags": [
+        "demo"
+      ],
+      "space": null,
+      "children": []
+    },
+    {
+      "id": "task-65",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 19",
+      "label": "Demo task 19",
+      "title": "Demo task 19",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 19.md",
+      "tags": [],
+      "space": null,
+      "children": [
+        {
+          "id": "ticket-66",
+          "kind": "ticket",
+          "state": null,
+          "task": "Demo task 19",
+          "target": "DEMO-58",
+          "label": "DEMO-58  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-58",
+          "children": [
+            {
+              "id": "mr-67",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo task 19",
+              "label": "!136  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/136",
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "task-68",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 20",
+      "label": "Demo task 20",
+      "title": "Demo task 20",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 20.md",
+      "tags": [],
+      "space": null,
+      "children": [
+        {
+          "id": "ticket-69",
+          "kind": "ticket",
+          "state": null,
+          "task": "Demo task 20",
+          "target": "DEMO-57",
+          "label": "DEMO-57  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-57",
+          "children": [
+            {
+              "id": "mr-70",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo task 20",
+              "label": "!132  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/132",
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "task-71",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 21",
+      "label": "Demo task 21",
+      "title": "Demo task 21",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 21.md",
+      "tags": [],
+      "space": null,
+      "children": []
+    },
+    {
+      "id": "task-72",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 22",
+      "label": "Demo task 22",
+      "title": "Demo task 22",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 22.md",
+      "tags": [],
+      "space": null,
+      "children": []
+    },
+    {
+      "id": "task-73",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 23",
+      "label": "Demo task 23",
+      "title": "Demo task 23",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 23.md",
+      "tags": [],
+      "space": null,
+      "children": [
+        {
+          "id": "ticket-74",
+          "kind": "ticket",
+          "state": null,
+          "task": "Demo task 23",
+          "target": "DEMO-41",
+          "label": "DEMO-41  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-41",
+          "children": [
+            {
+              "id": "mr-75",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo task 23",
+              "label": "!126  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/126",
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "task-76",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 24",
+      "label": "Demo task 24",
+      "title": "Demo task 24",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 24.md",
+      "tags": [
+        "demo"
+      ],
+      "space": null,
+      "children": []
+    },
+    {
+      "id": "task-77",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 25",
+      "label": "Demo task 25",
+      "title": "Demo task 25",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 25.md",
+      "tags": [
+        "demo"
+      ],
+      "space": null,
+      "children": [
+        {
+          "id": "task-78",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 26",
+          "label": "Demo task 26",
+          "title": "Demo task 26",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 26.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-79",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 26",
+              "target": "DEMO-22",
+              "label": "DEMO-22  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-22",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-80",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 27",
+          "label": "Demo task 27",
+          "title": "Demo task 27",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 27.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-81",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 27",
+              "target": "DEMO-19",
+              "label": "DEMO-19  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-19",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-82",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 28",
+          "label": "Demo task 28",
+          "title": "Demo task 28",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 28.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-83",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 28",
+              "target": "DEMO-16",
+              "label": "DEMO-16  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-16",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-84",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 29",
+          "label": "Demo task 29",
+          "title": "Demo task 29",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 29.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-85",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 29",
+              "target": "DEMO-14",
+              "label": "DEMO-14  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-14",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-86",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 30",
+          "label": "Demo task 30",
+          "title": "Demo task 30",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 30.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-87",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 30",
+              "target": "DEMO-12",
+              "label": "DEMO-12  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-12",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-88",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 31",
+          "label": "Demo task 31",
+          "title": "Demo task 31",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 31.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-89",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 31",
+              "target": "DEMO-11",
+              "label": "DEMO-11  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-11",
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "task-90",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 32",
+      "label": "Demo task 32",
+      "title": "Demo task 32",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 32.md",
+      "tags": [
+        "demo"
+      ],
+      "space": null,
+      "children": [
+        {
+          "id": "task-91",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 33",
+          "label": "Demo task 33",
+          "title": "Demo task 33",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 33.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-92",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 33",
+              "target": "DEMO-31",
+              "label": "DEMO-31  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-31",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-93",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 34",
+          "label": "Demo task 34",
+          "title": "Demo task 34",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 34.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-94",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 34",
+              "target": "DEMO-33",
+              "label": "DEMO-33  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-33",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-95",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 35",
+          "label": "Demo task 35",
+          "title": "Demo task 35",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 35.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-96",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 35",
+              "target": "DEMO-34",
+              "label": "DEMO-34  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-34",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-97",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 36",
+          "label": "Demo task 36",
+          "title": "Demo task 36",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 36.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-98",
+              "kind": "ticket",
+              "state": "Закрыт",
+              "task": "Demo task 36",
+              "target": "DEMO-35",
+              "label": "DEMO-35  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-35",
+              "children": [
+                {
+                  "id": "mr-99",
+                  "kind": "mr",
+                  "state": "opened",
+                  "task": "Demo task 36",
+                  "label": "!102  Demo change",
+                  "body": "163d ci… conflict",
+                  "url": "https://git.example.com/demo/merge_requests/102",
+                  "children": []
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "task-100",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 37",
+          "label": "Demo task 37",
+          "title": "Demo task 37",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 37.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-101",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 37",
+              "target": "DEMO-18",
+              "label": "DEMO-18  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-18",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-102",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 38",
+          "label": "Demo task 38",
+          "title": "Demo task 38",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 38.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-103",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 38",
+              "target": "DEMO-27",
+              "label": "DEMO-27  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-27",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-104",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 39",
+          "label": "Demo task 39",
+          "title": "Demo task 39",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 39.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-105",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 39",
+              "target": "DEMO-29",
+              "label": "DEMO-29  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-29",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-106",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 40",
+          "label": "Demo task 40",
+          "title": "Demo task 40",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 40.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-107",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 40",
+              "target": "DEMO-20",
+              "label": "DEMO-20  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-20",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-108",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 41",
+          "label": "Demo task 41",
+          "title": "Demo task 41",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 41.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-109",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 41",
+              "target": "DEMO-23",
+              "label": "DEMO-23  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-23",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-110",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 42",
+          "label": "Demo task 42",
+          "title": "Demo task 42",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 42.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-111",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 42",
+              "target": "DEMO-21",
+              "label": "DEMO-21  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-21",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-112",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 43",
+          "label": "Demo task 43",
+          "title": "Demo task 43",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 43.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-113",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 43",
+              "target": "DEMO-25",
+              "label": "DEMO-25  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-25",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-114",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 44",
+          "label": "Demo task 44",
+          "title": "Demo task 44",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 44.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-115",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 44",
+              "target": "DEMO-24",
+              "label": "DEMO-24  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-24",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-116",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 45",
+          "label": "Demo task 45",
+          "title": "Demo task 45",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 45.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-117",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 45",
+              "target": "DEMO-26",
+              "label": "DEMO-26  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-26",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "task-118",
+          "kind": "task",
+          "state": "done",
+          "done": true,
+          "task": "Demo task 46",
+          "label": "Demo task 46",
+          "title": "Demo task 46",
+          "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+          "note": "/home/dev/notes/Demo task 46.md",
+          "tags": [],
+          "space": null,
+          "children": [
+            {
+              "id": "ticket-119",
+              "kind": "ticket",
+              "state": null,
+              "task": "Demo task 46",
+              "target": "DEMO-28",
+              "label": "DEMO-28  Demo change",
+              "url": "https://jira.example.com/browse/DEMO-28",
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "task-120",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 47",
+      "label": "Demo task 47",
+      "title": "Demo task 47",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 47.md",
+      "tags": [],
+      "space": null,
+      "children": [
+        {
+          "id": "ticket-121",
+          "kind": "ticket",
+          "state": null,
+          "task": "Demo task 47",
+          "target": "DEMO-51",
+          "label": "DEMO-51  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-51",
+          "children": [
+            {
+              "id": "mr-122",
+              "kind": "mr",
+              "state": "merged",
+              "task": "Demo task 47",
+              "label": "!124  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/124",
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "task-123",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 48",
+      "label": "Demo task 48",
+      "title": "Demo task 48",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 48.md",
+      "tags": [],
+      "space": null,
+      "children": [
+        {
+          "id": "ticket-124",
+          "kind": "ticket",
+          "state": null,
+          "task": "Demo task 48",
+          "target": "DEMO-37",
+          "label": "DEMO-37  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-37",
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "task-125",
+      "kind": "task",
+      "state": "done",
+      "done": true,
+      "task": "Demo task 49",
+      "label": "Demo task 49",
+      "title": "Demo task 49",
+      "body": "A synthetic demo change with **clear** acceptance criteria.\n\nVerify the example.",
+      "note": "/home/dev/notes/Demo task 49.md",
+      "tags": [],
+      "space": null,
+      "children": [
+        {
+          "id": "ticket-126",
+          "kind": "ticket",
+          "state": null,
+          "task": "Demo task 49",
+          "target": "DEMO-32",
+          "label": "DEMO-32  Demo change",
+          "url": "https://jira.example.com/browse/DEMO-32",
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "header-127",
+      "kind": "header",
+      "task": null,
+      "label": "no task",
+      "children": []
+    },
+    {
+      "id": "loose:ticket-128",
+      "kind": "ticket",
+      "state": "В работе",
+      "task": null,
+      "target": "DEMO-61",
+      "label": "DEMO-61  Demo change",
+      "url": "https://jira.example.com/browse/DEMO-61",
+      "children": [
+        {
+          "id": "tree-129",
+          "kind": "tree",
+          "state": "active",
+          "task": null,
+          "tree": "demo-checkout-16",
+          "label": "demo-checkout-16",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-16",
+          "body": "/home/dev/demo/worktrees/demo-checkout-16\n",
+          "branch": "dev/demo-checkout-16",
+          "children": [
+            {
+              "id": "mr-130",
+              "kind": "mr",
+              "state": "merged",
+              "task": null,
+              "label": "!146  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/146",
+              "children": []
+            }
+          ],
+          "mr_state": "merged",
+          "merged": true
+        }
+      ]
+    },
+    {
+      "id": "loose:ticket-131",
+      "kind": "ticket",
+      "state": "Закрыт",
+      "task": null,
+      "target": "DEMO-54",
+      "label": "DEMO-54  Demo change",
+      "url": "https://jira.example.com/browse/DEMO-54",
+      "children": [
+        {
+          "id": "tree-132",
+          "kind": "tree",
+          "state": "active",
+          "task": null,
+          "tree": "demo-checkout-13",
+          "label": "demo-checkout-13",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-13",
+          "body": "/home/dev/demo/worktrees/demo-checkout-13\n",
+          "branch": "dev/DEMO-54",
+          "children": [
+            {
+              "id": "mr-133",
+              "kind": "mr",
+              "state": "merged",
+              "task": null,
+              "label": "!128  Demo change",
+              "body": "",
+              "url": "https://git.example.com/demo/merge_requests/128",
+              "children": []
+            }
+          ],
+          "mr_state": "merged",
+          "merged": true
+        }
+      ]
+    },
+    {
+      "id": "loose:ticket-134",
+      "kind": "ticket",
+      "state": "В работе",
+      "task": null,
+      "target": "DEMO-42",
+      "label": "DEMO-42  Demo change",
+      "url": "https://jira.example.com/browse/DEMO-42",
+      "children": [
+        {
+          "id": "tree-135",
+          "kind": "tree",
+          "state": "active",
+          "task": null,
+          "tree": "demo-checkout-11",
+          "label": "demo-checkout-11",
+          "cwd": "/home/dev/demo/worktrees/demo-checkout-11",
+          "body": "/home/dev/demo/worktrees/demo-checkout-11\n",
+          "branch": "dev/DEMO-42",
+          "children": [],
+          "mr_state": null,
+          "merged": false
+        }
+      ]
+    },
+    {
+      "id": "loose:ticket-136",
+      "kind": "ticket",
+      "state": "В работе",
+      "task": null,
+      "target": "DEMO-10",
+      "label": "DEMO-10  Demo change",
+      "url": "https://jira.example.com/browse/DEMO-10",
+      "children": [
+        {
+          "id": "mr-137",
+          "kind": "mr",
+          "state": "opened",
+          "task": null,
+          "label": "!123  Demo change",
+          "body": "26d ci…",
+          "url": "https://git.example.com/demo/merge_requests/123",
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "loose:ticket-138",
+      "kind": "ticket",
+      "state": "Закрыт",
+      "task": null,
+      "target": "DEMO-38",
+      "label": "DEMO-38  Demo change",
+      "url": "https://jira.example.com/browse/DEMO-38",
+      "children": [
+        {
+          "id": "mr-139",
+          "kind": "mr",
+          "state": "opened",
+          "task": null,
+          "label": "!117  Demo change",
+          "body": "78d ci… conflict",
+          "url": "https://git.example.com/demo/merge_requests/117",
+          "children": []
+        },
+        {
+          "id": "mr-140",
+          "kind": "mr",
+          "state": "opened",
+          "task": null,
+          "label": "!107  Demo change",
+          "body": "96d ci… conflict",
+          "url": "https://git.example.com/demo/merge_requests/107",
+          "children": []
+        },
+        {
+          "id": "mr-141",
+          "kind": "mr",
+          "state": "merged",
+          "task": null,
+          "label": "!118  Demo change",
+          "body": "",
+          "url": "https://git.example.com/demo/merge_requests/118",
+          "children": []
+        },
+        {
+          "id": "mr-142",
+          "kind": "mr",
+          "state": "merged",
+          "task": null,
+          "label": "!116  Demo change",
+          "body": "",
+          "url": "https://git.example.com/demo/merge_requests/116",
+          "children": []
+        },
+        {
+          "id": "mr-143",
+          "kind": "mr",
+          "state": "merged",
+          "task": null,
+          "label": "!115  Demo change",
+          "body": "",
+          "url": "https://git.example.com/demo/merge_requests/115",
+          "children": []
+        },
+        {
+          "id": "mr-144",
+          "kind": "mr",
+          "state": "merged",
+          "task": null,
+          "label": "!114  Demo change",
+          "body": "",
+          "url": "https://git.example.com/demo/merge_requests/114",
+          "children": []
+        },
+        {
+          "id": "mr-145",
+          "kind": "mr",
+          "state": "merged",
+          "task": null,
+          "label": "!113  Demo change",
+          "body": "",
+          "url": "https://git.example.com/demo/merge_requests/113",
+          "children": []
+        },
+        {
+          "id": "mr-146",
+          "kind": "mr",
+          "state": "merged",
+          "task": null,
+          "label": "!112  Demo change",
+          "body": "",
+          "url": "https://git.example.com/demo/merge_requests/112",
+          "children": []
+        },
+        {
+          "id": "mr-147",
+          "kind": "mr",
+          "state": "merged",
+          "task": null,
+          "label": "!111  Demo change",
+          "body": "",
+          "url": "https://git.example.com/demo/merge_requests/111",
+          "children": []
+        },
+        {
+          "id": "mr-148",
+          "kind": "mr",
+          "state": "merged",
+          "task": null,
+          "label": "!110  Demo change",
+          "body": "",
+          "url": "https://git.example.com/demo/merge_requests/110",
+          "children": []
+        },
+        {
+          "id": "mr-149",
+          "kind": "mr",
+          "state": "merged",
+          "task": null,
+          "label": "!108  Demo change",
+          "body": "",
+          "url": "https://git.example.com/demo/merge_requests/108",
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "loose:ticket-150",
+      "kind": "ticket",
+      "state": "Закрыт",
+      "task": null,
+      "target": "DEMO-30",
+      "label": "DEMO-30  Demo change",
+      "url": "https://jira.example.com/browse/DEMO-30",
+      "children": [
+        {
+          "id": "mr-151",
+          "kind": "mr",
+          "state": "opened",
+          "task": null,
+          "label": "!103  Demo change",
+          "body": "163d ci… conflict",
+          "url": "https://git.example.com/demo/merge_requests/103",
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "tree-152",
+      "kind": "tree",
+      "state": "active",
+      "task": null,
+      "tree": "demo-checkout-01",
+      "label": "demo-checkout-01",
+      "cwd": "/home/dev/demo/worktrees/demo-checkout-01",
+      "body": "/home/dev/demo/worktrees/demo-checkout-01\n",
+      "branch": null,
+      "children": []
+    },
+    {
+      "id": "mr-153",
+      "kind": "mr",
+      "state": "opened",
+      "task": null,
+      "label": "!109  Demo change",
+      "body": "draft 90d ci✗",
+      "url": "https://git.example.com/demo/merge_requests/109",
+      "children": []
+    },
+    {
+      "id": "mr-154",
+      "kind": "mr",
+      "state": "opened",
+      "task": null,
+      "label": "!106  Demo change",
+      "body": "100d ci✗",
+      "url": "https://git.example.com/demo/merge_requests/106",
+      "children": []
+    },
+    {
+      "id": "mr-155",
+      "kind": "mr",
+      "state": "opened",
+      "task": null,
+      "label": "!105  Demo change",
+      "body": "122d ci… conflict",
+      "url": "https://git.example.com/demo/merge_requests/105",
+      "children": []
+    },
+    {
+      "id": "mr-156",
+      "kind": "mr",
+      "state": "opened",
+      "task": null,
+      "label": "!104  Demo change",
+      "body": "122d ci… conflict",
+      "url": "https://git.example.com/demo/merge_requests/104",
+      "children": []
+    },
+    {
+      "id": "mr-157",
+      "kind": "mr",
+      "state": "opened",
+      "task": null,
+      "label": "!101  Demo change",
+      "body": "170d ci✗ conflict",
+      "url": "https://git.example.com/demo/merge_requests/101",
+      "children": []
+    },
+    {
+      "id": "mr-158",
+      "kind": "mr",
+      "state": "opened",
+      "task": null,
+      "label": "!100  Demo change",
+      "body": "190d ci… conflict",
+      "url": "https://git.example.com/demo/merge_requests/100",
+      "children": []
+    },
+    {
+      "id": "header-159",
+      "kind": "header",
+      "task": null,
+      "label": "assigned to me in Jira",
+      "children": []
+    },
+    {
+      "id": "loose:ticket-160",
+      "kind": "ticket",
+      "state": "Новый",
+      "task": null,
+      "target": "DEMO-44",
+      "label": "DEMO-44  Demo change",
+      "url": "https://jira.example.com/browse/DEMO-44",
+      "children": []
+    },
+    {
+      "id": "loose:ticket-161",
+      "kind": "ticket",
+      "state": "Новый",
+      "task": null,
+      "target": "DEMO-43",
+      "label": "DEMO-43  Demo change",
+      "url": "https://jira.example.com/browse/DEMO-43",
+      "children": []
+    },
+    {
+      "id": "loose:ticket-162",
+      "kind": "ticket",
+      "state": "Новый",
+      "task": null,
+      "target": "DEMO-36",
+      "label": "DEMO-36  Demo change",
+      "url": "https://jira.example.com/browse/DEMO-36",
+      "children": []
+    }
+  ],
+  "sources": {
+    "jira": "Cached",
+    "gitlab": "Cached"
+  },
+  "warnings": []
+}

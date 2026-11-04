@@ -51,7 +51,7 @@ pub fn assemble(inputs: Inputs) -> Table {
     for tree in &mut trees {
         tree.agents = agents_in(&tree.wt.path, &agents, &sessions);
         let branch = tree.wt.branch.as_deref();
-        // the open MR when there is one, otherwise the newest
+        // The latest MR of this branch, including merged and closed ones.
         tree.mr = mrs
             .iter()
             .enumerate()
@@ -62,7 +62,7 @@ pub fn assemble(inputs: Inputs) -> Table {
                     .as_deref()
                     .is_none_or(|p| m.project.is_empty() || m.project == p)
             })
-            .max_by_key(|(_, m)| (m.opened(), m.mr.iid()))
+            .max_by_key(|(_, m)| m.mr.iid())
             .map(|(i, _)| i);
         // a branch named without a ticket key still carries one in its MR title
         if tree.keys.is_empty()
@@ -650,6 +650,33 @@ mod tests {
             ]
         );
         assert_eq!(table.agent_names(&tabs(&[]))[0].1, "a2i-config-2");
+    }
+
+    #[test]
+    fn latest_terminal_mr_recognizes_squash_merge_but_not_later_commits() {
+        let mut merged = mr(11, "DEMO-1-a", "squashed", "merged");
+        merged.mr = serde_json::from_value(serde_json::json!({
+            "iid": 11, "source_branch": "DEMO-1-a", "title": "squashed", "state": "merged",
+            "web_url": "https://gitlab/mr/11", "sha": "head-at-merge"
+        }))
+        .unwrap();
+        let mut squashed = tree("squashed", "DEMO-1-a");
+        squashed.unpushed = Some(3);
+        squashed.head = Some("head-at-merge".into());
+        let mut ahead = tree("ahead", "DEMO-1-a");
+        ahead.unpushed = Some(4);
+        ahead.head = Some("later-commit".into());
+        let table = table(
+            vec![],
+            vec![],
+            vec![mr(10, "DEMO-1-a", "old", "opened"), merged],
+            vec![squashed, ahead],
+        );
+        for tree in &table.trees {
+            assert_eq!(tree.mr, Some(table.mr_index(11)));
+        }
+        assert!(table.tree(table.tree_index("squashed")).finished);
+        assert!(!table.tree(table.tree_index("ahead")).finished);
     }
 
     #[test]

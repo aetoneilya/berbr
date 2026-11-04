@@ -80,12 +80,19 @@ berbr select [<task|KEY>]     go back to a task: its agent, or claude resuming i
 berbr note "<text>"           (for agents) append a finding to the note's "Agent notes"
 berbr status                  the table in plain text; updates `state` and `sessions` in notes
 berbr review [<worktree>]     start a reviewer agent next to the worktree's agent
-berbr done [<task|worktree>] [--merged] [--force] [-y]
+berbr done [<task|worktree>] [--merged] [--force] [-y] [--dry-run [--json]]
                            close a task (worktrees, my Jira tickets, note marked
                            done, its herdr workspace),
                            or remove one worktree; --merged removes every finished one
 berbr completions <shell>     shell completion script
 ```
+
+`done --dry-run` prints the same plan without changing Jira, notes, worktrees,
+branches, herdr or caches. Add `--json` for one plan object, including blockers,
+removals, kept trees and ticket actions. Blockers still exit 0 in dry-run; the
+listed steps are conditional on resolving them. Without dry-run they refuse the
+operation. This also works with a task ticket, a worktree branch or `--merged`.
+Unknown inspection counts (possible with `--force`) are JSON `null`.
 
 `berbr <command> --help` lists the options.
 
@@ -116,3 +123,8 @@ command = "zsh -ic 'BERBR_POPUP=1 exec berbr'"
 
 The desktop version has a native task list in the right panel, alongside Files
 and Changes. See [Herdr App installation and behavior](herdr-app/README.md).
+
+`berbr app-snapshot [--cached]` emits snapshot version 2, retaining all v1 fields.
+Worktree rows add `merged` and `mr_state`, with the known MR as a child even when
+merged or closed. Task subtrees include done work; loose sections follow the
+TUI's active-only rules. `--cached` uses the last remote data without network.

@@ -38,12 +38,13 @@ export function segmented(t, id, options, value, action, disabled = false) {
       .on_click((_event, cx) => { if (!disabled) action(key, cx); }).child(label)));
 }
 
-export function sectionHeader(t, id, label, count, expanded = true, toggle = null) {
+export function sectionHeader(t, id, label, count, expanded = true, toggle = null, {selected = false} = {}) {
   return h_flex().id(`section-${id}`).h(28).flex_none().px(8).gap(6).items_center().text_size(12)
-    .text_color(t.muted).font_medium()
-    .when(Boolean(toggle), el => el.cursor_pointer().hover(s => s.text_color(t.foreground))
-      .on_click((_event, cx) => toggle(cx)).child(icon(expanded ? "chevron-down" : "chevron-right", 12).text_color(t.dim)))
-    .child(label).child(div().text_color(t.dim).child(String(count)));
+    .text_color(t.muted).font_medium().rounded(6).when(selected, el => el.bg(t.selected))
+    .when(Boolean(toggle), el => el.cursor_pointer().hover(s => s.bg(selected ? t.selected : t.hover).text_color(t.foreground))
+      .on_click((_event, cx) => {cx.stop_propagation(); toggle(cx);})
+      .child(icon(expanded ? "chevron-down" : "chevron-right", 12).text_color(t.dim)))
+    .child(label).child(div().text_color(id === "needs" && !expanded ? t.blocked : t.dim).child(String(count)));
 }
 
 export function statusMark(t, status) {

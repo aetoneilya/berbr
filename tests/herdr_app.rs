@@ -139,7 +139,7 @@ fn native_snapshot_preserves_notes_and_never_queries_remote_machines() {
             .output()
             .unwrap(),
     );
-    assert_eq!(data["version"], 1);
+    assert_eq!(data["version"], 2);
     assert!(data.to_string().contains("задача"));
     assert_eq!(fs::read(path).unwrap(), before);
     assert!(f.calls().iter().any(|c| c[0] == "hc" && c[1][0] == "get"));
@@ -232,4 +232,203 @@ fn app_launch_waits_for_the_new_shell_foreground() {
         .count();
     assert!(gets >= 2);
     assert!(f.calls().iter().any(|c| c[0] == "hc" && c[1][0] == "send"));
+}
+
+#[test]
+fn done_dry_run_preserves_notes_worktrees_branches_and_caches() {
+    let f = Fixture::new();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(f.root.join("repo"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    };
+    git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(&[
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    ]);
+    let wt = f.root.join("repo/.claude/worktrees/test-0");
+    git(&["worktree", "add", "-qb", "DEMO-1-test", wt.to_str().unwrap()]);
+    let note = f.root.join("vault/tasks/test-0.md");
+    fs::write(
+        &note,
+        "---\nid: test-0\ntickets: [DEMO-1]\n---\nkeep this body\n",
+    )
+    .unwrap();
+    // A transcript makes an accidental sessions-cache save observable too.
+    let slug: String = wt
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let transcripts = f.root.join("claude/projects").join(slug);
+    fs::create_dir_all(&transcripts).unwrap();
+    fs::write(
+        transcripts.join("session.jsonl"),
+        format!(
+            "{{\"cwd\":{:?},\"timestamp\":\"2026-11-04T00:00:00Z\"}}\n",
+            wt
+        ),
+    )
+    .unwrap();
+    fn cache_files(
+        path: &std::path::Path,
+    ) -> std::collections::BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
+        let mut files = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(cache_files(&path));
+            } else {
+                files.insert(
+                    path.clone(),
+                    (
+                        fs::read(&path).unwrap(),
+                        fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                );
+            }
+        }
+        files
+    }
+    let caches = [f.root.join("cache"), f.root.join("home/Library/Caches")];
+    for cache in &caches {
+        let dir = cache.join("berbr");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("remote-test.json"), "{\"tickets\":{},\"mrs\":[]}").unwrap();
+        fs::write(dir.join("sessions-v3.json"), "{}").unwrap();
+    }
+    let cached_before: Vec<_> = caches.iter().map(|p| cache_files(p)).collect();
+    let before = fs::read(&note).unwrap();
+    let index_path = PathBuf::from(
+        String::from_utf8(git(&[
+            "-C",
+            wt.to_str().unwrap(),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index",
+        ]))
+        .unwrap()
+        .trim(),
+    );
+    let index_before = fs::read(&index_path).unwrap();
+    for args in [
+        vec!["done", "test-0", "--dry-run", "--json"],
+        vec!["done", "DEMO-1", "--dry-run", "--json"],
+        vec!["done", "DEMO-1-test", "--dry-run", "--json"],
+        vec!["done", "--merged", "--dry-run", "--json"],
+        vec!["done", "DEMO-1-test", "--force", "--dry-run", "--json"],
+    ] {
+        let plan = success(
+            f.command()
+                .env_remove("JIRA_TOKEN")
+                .env_remove("GITLAB_TOKEN")
+                .args(&args)
+                .output()
+                .unwrap(),
+        );
+        assert!(plan["blockers"].as_array().unwrap().is_empty());
+        assert_eq!(plan["note_done"], args[1] == "test-0" || args[1] == "DEMO-1");
+        assert_eq!(fs::read(&note).unwrap(), before);
+        assert!(wt.is_dir());
+        git(&["show-ref", "--verify", "refs/heads/DEMO-1-test"]);
+        assert_eq!(fs::read(&index_path).unwrap(), index_before);
+        for (cache, before) in caches.iter().zip(&cached_before) {
+            assert_eq!(
+                &cache_files(cache),
+                before,
+                "dry-run wrote {}",
+                cache.display()
+            );
+        }
+    }
+    let human = f
+        .command()
+        .args(["done", "test-0", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    assert!(String::from_utf8_lossy(&human.stdout).contains("mark the note done"));
+    assert_eq!(fs::read(&note).unwrap(), before);
+    let invalid = f
+        .command()
+        .args(["done", "test-0", "--json"])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    fs::write(wt.join("dirty"), "uncommitted").unwrap();
+    let plan = success(
+        f.command()
+            .args(["done", "DEMO-1-test", "--dry-run", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert!(!plan["blockers"].as_array().unwrap().is_empty());
+    assert_eq!(plan["keep"][0]["reason"], "uncommitted changes");
+    assert!(wt.join("dirty").exists());
+    // No token means no network request. Partial task data is a plan blocker,
+    // and dry-run still returns one successful JSON response.
+    let config = f.root.join("config.toml");
+    let configured = fs::read_to_string(&config).unwrap().replace(
+        "task_dirs = [\"tasks\"]",
+        "task_dirs = [\"tasks\"]\ngitlab = { host = \"gitlab.invalid\", project = \"ai/test\" }",
+    );
+    fs::write(&config, configured).unwrap();
+    let partial = success(
+        f.command()
+            .env_remove("GITLAB_TOKEN")
+            .args(["done", "test-0", "--dry-run", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert!(!partial["blockers"].as_array().unwrap().is_empty());
+    assert_eq!(fs::read(&note).unwrap(), before);
+    for (cache, before) in caches.iter().zip(&cached_before) {
+        assert_eq!(&cache_files(cache), before);
+    }
+    for cache in &caches {
+        fs::remove_file(cache.join("berbr/remote-test.json")).unwrap();
+    }
+    for args in [
+        ["done", "DEMO-1-test", "--dry-run", "--json"],
+        ["done", "--merged", "--dry-run", "--json"],
+    ] {
+        let missing = success(
+            f.command()
+                .env_remove("GITLAB_TOKEN")
+                .args(args)
+                .output()
+                .unwrap(),
+        );
+        assert!(
+            missing["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b.as_str().unwrap().contains("partial data"))
+        );
+        assert!(wt.exists());
+    }
+    assert!(
+        f.calls()
+            .iter()
+            .all(|c| c[1][0] == "ls" || c[1][0] == "get" || c[1][0] == "status")
+    );
 }

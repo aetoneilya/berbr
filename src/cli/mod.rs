@@ -215,6 +215,12 @@ struct StatusArgs {
 
 #[derive(Args, Debug)]
 struct DoneArgs {
+    /// Show the plan without changing files, Jira or herdr
+    #[arg(long)]
+    dry_run: bool,
+    /// Print the dry-run plan as one JSON object
+    #[arg(long, requires = "dry_run")]
+    json: bool,
     name: Option<String>,
     /// Remove every clean worktree whose MR is merged or closed
     #[arg(long)]

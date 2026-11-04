@@ -110,7 +110,7 @@ pub fn current_branch(path: &Path) -> Result<String> {
 }
 
 pub fn changed_files(path: &Path) -> Result<usize> {
-    let output = git_output(path, &["status", "--porcelain"])?;
+    let output = git_output(path, &["--no-optional-locks", "status", "--porcelain"])?;
     Ok(output.lines().filter(|l| !l.is_empty()).count())
 }
 

@@ -78,6 +78,8 @@ impl Node {
 pub struct Options<'a> {
     /// Adds done tasks, tickets and worktrees without activity, merged MRs.
     pub all: bool,
+    /// Use active-only rules for loose sections even when task subtrees use `all`.
+    pub active_loose: bool,
     /// Keeps the roots whose names, tickets, summaries or branches contain it.
     pub filter: &'a str,
     /// Only tasks with this tag, and none of the sections.
@@ -139,7 +141,7 @@ pub fn build(table: &Table, options: &Options) -> Vec<Node> {
             continue;
         }
         // an MR from a shown worktree's branch hangs under that worktree
-        let (trees, held) = tree_nodes(table, &row.trees, all, hide);
+        let (trees, held) = tree_nodes(table, &row.trees, all, hide, all);
         let free_mr = |m: usize| !hide.mrs && !held.contains(&m) && (all || table.mr(m).opened());
         let mut children = Vec::new();
         let mut lifted = Vec::new();
@@ -225,6 +227,7 @@ pub fn build(table: &Table, options: &Options) -> Vec<Node> {
     // tickets without a task that I work on (a worktree or an open MR), and
     // worktrees without a ticket; then, apart, open Jira tickets assigned to me
     // that nothing is done on yet
+    let all = all && !options.active_loose;
     let mut no_task = Vec::new();
     let mut assigned = Vec::new();
     for (i, loose) in table.loose.iter().enumerate() {
@@ -246,7 +249,7 @@ pub fn build(table: &Table, options: &Options) -> Vec<Node> {
         if !keep(text) {
             continue;
         }
-        let (trees, held) = tree_nodes(table, &loose.trees, all, hide);
+        let (trees, held) = tree_nodes(table, &loose.trees, all, hide, options.all);
         let mut children: Vec<Node> = loose
             .mrs
             .iter()
@@ -267,7 +270,7 @@ pub fn build(table: &Table, options: &Options) -> Vec<Node> {
         }
     }
 
-    for node in tree_nodes(table, &table.other_trees, all, hide).0 {
+    for node in tree_nodes(table, &table.other_trees, all, hide, options.all).0 {
         if let Kind::Tree(t) = node.kind
             && keep(format!(
                 "{} {}",
@@ -320,7 +323,13 @@ fn mr_node(m: usize) -> Node {
 /// Worktrees with agents first, then by changed files, then by name; finished
 /// ones only with `all`. Under each, the MR of its branch and its agents. Also
 /// returns the MRs placed so, which go nowhere else.
-fn tree_nodes(table: &Table, trees: &[usize], all: bool, hide: Hide) -> (Vec<Node>, Vec<usize>) {
+fn tree_nodes(
+    table: &Table,
+    trees: &[usize],
+    all: bool,
+    hide: Hide,
+    all_mrs: bool,
+) -> (Vec<Node>, Vec<usize>) {
     if hide.trees {
         return (Vec::new(), Vec::new());
     }
@@ -344,7 +353,7 @@ fn tree_nodes(table: &Table, trees: &[usize], all: bool, hide: Hide) -> (Vec<Nod
             let tree = table.tree(t);
             let mr = tree
                 .mr
-                .filter(|&m| !hide.mrs && (all || table.mr(m).opened()))
+                .filter(|&m| !hide.mrs && (all_mrs || table.mr(m).opened()))
                 .map(mr_node);
             let agents = (0..tree.agents.len()).map(|a| {
                 Node::leaf(
@@ -567,6 +576,55 @@ mod tests {
             trees,
             vec!["tree:/z-agent", "tree:/b-busy", "tree:/a", "tree:/c"]
         );
+    }
+
+    #[test]
+    fn active_loose_keeps_all_task_content_only() {
+        let table = table(
+            vec![task_note(
+                "done",
+                "done: true\ntickets: [DEMO-1]",
+                "2026-10-01",
+            )],
+            vec![
+                ticket("DEMO-2", Category::Done, false),
+                ticket("DEMO-3", Category::New, true),
+            ],
+            vec![
+                mr(1, "DEMO-1-a", "merged task MR", "merged"),
+                mr(2, "DEMO-2-a", "closed ticket, open MR", "opened"),
+                mr(3, "misc", "no ticket", "opened"),
+                mr(4, "DEMO-4-a", "finished loose", "merged"),
+            ],
+            vec![tree("a", "DEMO-1-a"), tree("finished", "DEMO-4-a")],
+        );
+        let options = Options {
+            all: true,
+            active_loose: true,
+            ..Default::default()
+        };
+        let shown = outline(&build(&table, &options));
+        assert!(shown.contains(&"task:done".into()));
+        assert!(shown.contains(&"  tree:/a".into()));
+        assert!(shown.contains(&format!("    mr:{}", table.mr_index(1))));
+        assert!(
+            !shown
+                .iter()
+                .any(|n| n.contains("DEMO-2") || n.contains("finished"))
+        );
+        assert!(!shown.contains(&format!("mr:{}", table.mr_index(3))));
+        assert!(shown.contains(&"header:assigned to me in Jira".into()));
+        assert!(shown.contains(&"loose:DEMO-3".into()));
+        // The existing all view retains its expanded loose sections.
+        let all = outline(&build(
+            &table,
+            &Options {
+                all: true,
+                ..Default::default()
+            },
+        ));
+        assert!(all.contains(&"loose:DEMO-2".into()));
+        assert!(all.contains(&format!("mr:{}", table.mr_index(3))));
     }
 
     #[test]

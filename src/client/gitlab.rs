@@ -59,7 +59,7 @@ impl GitLab {
     /// the gitlab crate spends two requests on the token check and the current
     /// user first.
     pub fn my_open_merge_requests(&self, project: &str) -> Result<Vec<MergeRequest>, String> {
-        self.my_merge_requests(project, ("state", "opened"), 10)
+        self.my_merge_requests(project, &[("state", "opened")])
     }
 
     /// My merge requests in `project` updated in the last `days` days, open or not.
@@ -69,40 +69,33 @@ impl GitLab {
         days: i64,
     ) -> Result<Vec<MergeRequest>, String> {
         let since = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
-        self.my_merge_requests(project, ("updated_after", &since), 3)
+        self.my_merge_requests(project, &[("state", "all"), ("updated_after", &since)])
     }
 
     fn my_merge_requests(
         &self,
         project: &str,
-        filter: (&str, &str),
-        max_pages: u32,
+        filters: &[(&str, &str)],
     ) -> Result<Vec<MergeRequest>, String> {
         let url = self.project_url(project, &["merge_requests"])?;
-        let mut mrs: Vec<MergeRequest> = Vec::new();
-        for page in 1..=max_pages {
+        merge_request_pages(|page| {
             let page = page.to_string();
-            let query = [
+            let mut query = vec![
                 ("scope", "created_by_me"),
                 ("per_page", "100"),
-                filter,
                 ("page", page.as_str()),
             ];
+            query.extend_from_slice(filters);
             let response = self.get(url.clone(), &query)?;
             let last = response
                 .headers()
                 .get("x-next-page")
                 .is_none_or(|v| v.is_empty());
-            mrs.extend(
-                response
-                    .json::<Vec<MergeRequest>>()
-                    .map_err(|e| e.to_string())?,
-            );
-            if last {
-                break;
-            }
-        }
-        Ok(mrs)
+            let mrs = response
+                .json::<Vec<MergeRequest>>()
+                .map_err(|e| e.to_string())?;
+            Ok((mrs, last))
+        })
     }
 
     pub fn mr_review(&self, project: &str, iid: u64) -> Result<MrReview, String> {
@@ -156,6 +149,22 @@ impl GitLab {
             unresolved,
         })
     }
+}
+
+/// Follow every page in the bounded time window; a failed page must fail the
+/// source, so callers use the cache rather than treating a partial list as live.
+fn merge_request_pages(
+    mut fetch: impl FnMut(u32) -> Result<(Vec<MergeRequest>, bool), String>,
+) -> Result<Vec<MergeRequest>, String> {
+    let mut mrs = Vec::new();
+    for page in 1.. {
+        let (listed, last) = fetch(page)?;
+        mrs.extend(listed);
+        if last {
+            break;
+        }
+    }
+    Ok(mrs)
 }
 
 /// Review state of an open MR: three more requests, so only for open ones.
@@ -244,8 +253,35 @@ mod tests {
     use super::GitLab;
 
     #[test]
+    fn mr_pagination_has_no_three_page_truncation_and_propagates_errors() {
+        let mut calls = Vec::new();
+        let mrs = super::merge_request_pages(|page| {
+            calls.push(page);
+            let mr = serde_json::from_value(serde_json::json!({
+                "iid": page, "title": "x", "state": "merged", "source_branch": "x",
+                "web_url": "https://gitlab/mr/x", "sha": null
+            }))
+            .unwrap();
+            Ok((vec![mr], page == 4))
+        })
+        .unwrap();
+        assert_eq!(calls, vec![1, 2, 3, 4]);
+        assert_eq!(mrs.len(), 4);
+        assert!(super::merge_request_pages(|_| Err("unavailable".into())).is_err());
+        let empty = super::merge_request_pages(|_| Ok((vec![], true))).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
     fn project_path_is_one_segment() {
-        let gitlab = GitLab::new("gitlab.example", "token").unwrap();
+        // URL construction needs no system proxy lookup or network access.
+        let gitlab = GitLab {
+            client: reqwest::blocking::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
+            host: "gitlab.example".into(),
+        };
         let url = gitlab
             .project_url("demo/service", &["merge_requests", "7", "approvals"])
             .unwrap();

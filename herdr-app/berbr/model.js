@@ -55,8 +55,7 @@ export function classifyBlocked(screenText) {
   return question ? {kind:"question", detail:question} : {kind:"waiting"};
 }
 
-export function closePlan(row, liveSpaces = []) {
-  const related = walk(row?.children);
+export function closePlan(row, liveSpaces = [], related = walk(row?.children)) {
   const unique = items => [...new Map(items.map(item => [item.url || item.cwd || item.id || item.target || item.tree || item, item])).values()];
   const mrs = unique(related.filter(item => item.kind === "mr"));
   const trees = unique(related.filter(item => item.kind === "tree"));
@@ -122,6 +121,7 @@ export function parseTreeMarks(body = "", state = "") {
 }
 
 export function looseWhy(row) {
+  if (isMergedTree(row) || row.children?.some(isMergedTree)) return "The branch is merged; its worktree is still on disk.";
   if (row.kind === "ticket") {
     const tree = row.children?.find(child => child.kind === "tree");
     const mr = walk(row.children).find(child => child.kind === "mr" && child.state?.toLowerCase() === "opened");
@@ -173,17 +173,16 @@ export function matchesFilter(row, query) {
     item.branch, ...(item.tags ?? [])].filter(Boolean).join(" ").toLowerCase().includes(needle));
 }
 
-export function taskDetail(row, liveAgents = []) {
+export function taskDetail(row, liveAgents = [], liveByTerminal = new Map(liveAgents.flatMap(agent => [[agent.address, agent], [agent.pane, agent]]))) {
   const children = row?.children ?? [];
   const tickets = children.filter(item => item.kind === "ticket");
   const agentDetail = item => {
-    const live = liveAgents.find(agent => item.terminal &&
-      (agent.address === item.terminal || agent.pane === item.terminal));
+    const live = item.terminal ? liveByTerminal.get(item.terminal) : undefined;
     return { row:item, live, status:live ? live.status : item.state ?? "unknown" };
   };
   const treeRank = tree => tree.agents.some(agent => agent.live) ? 0
     : tree.mr?.state?.toLowerCase() === "opened" ? 1
-    : ["merged", "closed"].includes(tree.mr?.state?.toLowerCase()) ? 3 : 2;
+    : isMergedTree(tree.row) || ["merged", "closed"].includes(tree.mr?.state?.toLowerCase()) ? 3 : 2;
   const treeName = tree => tree.row.label ?? tree.row.tree ?? "";
   const trees = children.filter(item => item.kind === "tree").map(tree => ({
     row:tree,
@@ -206,7 +205,7 @@ export function taskDetail(row, liveAgents = []) {
       if (mr.kind === "mr") addMr(mr, child.target);
     }
   }
-  const paragraph = cleanObsidian(row?.body).split(/\n\s*\n/).map(plainParagraph).find(Boolean) ?? "";
+  const paragraph = cleanObsidian(beforeMachineSection(row?.body)).split(/\n\s*\n/).map(plainParagraph).find(Boolean) ?? "";
   return {
     tickets:{open:tickets.filter(item => !isClosedTicket(item)), closed:tickets.filter(isClosedTicket)},
     trees,
@@ -218,6 +217,21 @@ export function taskDetail(row, liveAgents = []) {
   };
 }
 
+function beforeMachineSection(body) {
+  const lines = String(body ?? "").split(/\r?\n/);
+  let fence = null;
+  for (let index = 0; index < lines.length; index++) {
+    const marker = lines[index].match(/^ {0,3}(`{3,}|~{3,})/);
+    if (marker) {
+      if (!fence) fence = marker[1];
+      else if (marker[1][0] === fence[0] && marker[1].length >= fence.length &&
+          !lines[index].slice(marker[0].length).trim()) fence = null;
+    } else if (!fence && /^ {0,3}#{2,6}[ \t]+(?:agent notes|sessions|сессии)[ \t]*#*[ \t]*$/i.test(lines[index]))
+      return lines.slice(0, index).join("\n");
+  }
+  return lines.join("\n");
+}
+
 function plainParagraph(text) {
   return text.replace(/^\s{0,3}#{1,6}\s+/gm, "")
     .replace(/^\s*(?:[-+*]|\d+[.)])\s+/gm, "")
@@ -227,9 +241,8 @@ function plainParagraph(text) {
     .replace(/\s+/g, " ").trim();
 }
 
-export function taskSignals(row, liveAgents = [], liveSpaces = []) {
-  const related = walk(row.children);
-  const live = new Map(liveAgents.flatMap(agent => [[agent.address, agent], [agent.pane, agent]]));
+export function taskSignals(row, liveAgents = [], liveSpaces = [], related = walk(row.children),
+  live = new Map(liveAgents.flatMap(agent => [[agent.address, agent], [agent.pane, agent]])), relatedFor = row => walk(row.children)) {
   const terminals = new Set(related.filter(item => item.kind === "agent").map(item => item.terminal).filter(Boolean));
   const taskAgents = [...new Set([...terminals].map(terminal => live.get(terminal)).filter(Boolean))];
   const working = taskAgents.filter(agent => agent.status === "working").length;
@@ -247,7 +260,7 @@ export function taskSignals(row, liveAgents = [], liveSpaces = []) {
   return {
     status, working, agents:taskAgents,
     workingAgent,
-    workingTree:workingAgent && related.find(item => item.kind === "tree" && walk(item.children).some(child =>
+    workingTree:workingAgent && related.find(item => item.kind === "tree" && relatedFor(item).some(child =>
       child.kind === "agent" && child.terminal && [workingAgent.address, workingAgent.pane].includes(child.terminal))),
     attention: attention === "blocked" ? "Needs you" : attention === "done" ? "Finished"
       : working ? `${working} working` : "",
@@ -259,24 +272,20 @@ export function taskSignals(row, liveAgents = [], liveSpaces = []) {
   };
 }
 
-export function groupSections(rows = [], liveAgents = [], liveSpaces = []) {
-  const sections = [
-    { id: "needs", label: "Needs you", rows: [] },
-    { id: "running", label: "Running", rows: [] },
-    { id: "progress", label: "In progress", rows: [] },
-    { id: "ideas", label: "Ideas", rows: [] },
-    { id: "inbox", label: "Inbox", rows: [], collapsible: true },
-    { id: "notInTask", label: "Not in a task", rows: [], collapsible: true },
-    { id: "cleanup", label: "Cleanup", rows: [], collapsible: true },
-    { id: "done", label: "Done", rows: [] },
-  ];
+export const sectionLabels = {
+  needs:"Needs you", running:"Running", progress:"In progress", ideas:"Ideas",
+  inbox:"Inbox", notInTask:"Not in a task", cleanup:"Cleanup", done:"Done",
+};
+
+export function groupSections(rows = [], liveAgents = [], liveSpaces = [], signalFor = row => taskSignals(row, liveAgents, liveSpaces)) {
+  const sections = Object.entries(sectionLabels).map(([id, label]) => ({id, label, rows:[], collapsible:true}));
   const byId = new Map(sections.map(section => [section.id, section]));
   const seen = new Set();
   const tasks = (rows ?? []).flatMap(row => row.kind === "header" ? row.children ?? [] : [row]);
   for (const row of tasks) {
     if (row.kind !== "task" || seen.has(row.id)) continue;
     seen.add(row.id);
-    const signal = taskSignals(row, liveAgents, liveSpaces);
+    const signal = signalFor(row);
     const section = row.done ? "done" : ["blocked", "done"].includes(signal.status) ? "needs"
       : signal.working ? "running" : row.state === "idea" ? "ideas" : "progress";
     byId.get(section).rows.push(row);
@@ -306,6 +315,7 @@ export function groupSections(rows = [], liveAgents = [], liveSpaces = []) {
 }
 
 export function looseReason(row) {
+  if (isMergedTree(row) || row.children?.some(isMergedTree)) return "merged · worktree left";
   if (row.kind === "ticket") {
     const tree = (row.children ?? []).find(child => child.kind === "tree" &&
       (!isClosedTicket(row) || child.state?.toLowerCase() === "active"));
@@ -338,8 +348,179 @@ export function ticketTitle(row) {
 }
 
 export function rowState(row) {
+  if (isMergedTree(row)) return "Merged";
   if (row.kind === "ticket") return normalizeTicketState(row.state);
   if (row.kind === "mr") return { opened: "Open", merged: "Merged", closed: "Closed" }[row.state?.toLowerCase()] ?? normalizeTicketState(row.state);
   if (row.kind === "tree" && row.state === "active") return "";
   return normalizeTicketState(row.state);
+}
+
+export function treeMarks(row) {
+  const marks = parseTreeMarks(row?.body, row?.state);
+  return {...marks, merged:row?.merged === true || row?.mr_state === "merged" || marks.merged ||
+    row?.children?.some(child => child.kind === "mr" && child.state === "merged") === true};
+}
+
+export function isMergedTree(row) {
+  return row?.kind === "tree" && treeMarks(row).merged;
+}
+
+export function mergedPlan(trees = []) {
+  const remove = [], keep = [];
+  for (const row of trees) {
+    const marks = treeMarks(row);
+    const reason = marks.changes ? "uncommitted changes" : marks.unpushed ? "unpushed commits"
+      : row.mr_state === "opened" || row.children?.some(child => child.kind === "mr" && child.state === "opened")
+        ? "open MR" : !marks.merged ? "not merged" : null;
+    if (reason) keep.push({tree:row.tree ?? row.label, reason});
+    else remove.push({tree:row.tree ?? row.label, path:row.cwd ?? marks.path,
+      uncommitted:marks.changes, unpushed:marks.unpushed, merged:true});
+  }
+  return {kind:"trees", blockers:[], remove, keep, close_tickets:[], leave_tickets:[],
+    note_done:false, close_space:false, steps:[]};
+}
+
+export function backendClosePlan(plan) {
+  if (!plan || !["task", "trees"].includes(plan.kind) ||
+      !["blockers", "remove", "keep", "close_tickets", "leave_tickets", "steps"].every(key => Array.isArray(plan[key])))
+    throw new Error("Invalid close plan");
+  return {blockers:plan.blockers, removals:plan.remove.map(tree => ({name:tree.tree, path:tree.path,
+    changes:tree.uncommitted ?? 0, unpushed:tree.unpushed ?? 0})), keep:plan.keep,
+    jira:plan.close_tickets, leave:plan.leave_tickets,
+    also:[...(plan.note_done ? ["Marks the note done"] : []), ...(plan.close_space ? ["Closes the Herdr space"] : [])],
+    proof:{count:0, latest:null}};
+}
+
+// Snapshot traversal belongs here, once per snapshot. Hover/focus redraws reuse it.
+export class PanelModel {
+  update(data, liveAgents = [], liveSpaces = [], options = {}) {
+    const key = liveAgents.map(agent => `${agent.address}:${agent.status}:${agent.seq}:${agent.pane}`).join("|") + "/" +
+      liveSpaces.map(space => `${space.id}:${space.active}:${(space.tabs ?? []).map(tab => `${tab.id}:${tab.working_since}`).join(",")}`).join("|");
+    if (this.data !== data || !this.related) {
+      this.data = data; this.related = new Map(); this.search = new Map();
+      this.trees = []; const treeKeys = new Set();
+      const visit = row => {
+        const children = [];
+        let search = [row.title, row.label, row.task, row.target, row.branch, ...(row.tags ?? [])].filter(Boolean).join(" ").toLowerCase();
+        for (const child of row.children ?? []) {
+          visit(child); children.push(child, ...this.related.get(child));
+          search += " " + this.search.get(child);
+        }
+        this.related.set(row, children); this.search.set(row, search);
+        if (row.kind === "tree") {
+          const id = row.cwd || row.tree || row.id || row;
+          if (!treeKeys.has(id)) { treeKeys.add(id); this.trees.push(row); }
+        }
+      };
+      for (const row of data?.rows ?? []) visit(row);
+      this.key = null;
+    }
+    if (this.key !== key) {
+      this.activities = new Map();
+      this.key = key; this.agents = liveAgents; this.spaces = liveSpaces;
+      this.live = new Map(liveAgents.flatMap(agent => [[agent.address, agent], [agent.pane, agent]]));
+      this.signals = new Map(); this.details = new Map(); this.reasons = new Map(); this.whys = new Map(); this.plans = new Map();
+      this.sections = groupSections(data?.rows, liveAgents, liveSpaces, row => this.signal(row));
+      this.mergedTrees = this.trees.filter(isMergedTree);
+      this.bulkPlan = mergedPlan(this.trees);
+      this.visibleKey = null;
+    }
+    const visibleKey = JSON.stringify([options.query ?? "", Boolean(options.showDone),
+      [...(options.collapsed ?? [])].sort(), options.expanded ?? null]);
+    if (this.visibleKey !== visibleKey) {
+      this.visibleKey = visibleKey;
+      const needle = String(options.query ?? "").trim().toLowerCase();
+      this.visible = this.sections.filter(section => section.id !== "done" || options.showDone).map(section => ({...section,
+        rows:section.rows.filter(row => !needle || this.search.get(row)?.includes(needle)),
+        expanded:Boolean(needle) || !options.collapsed?.has(section.id),
+      })).filter(section => section.rows.length);
+      this.rows = visibleRows(this.visible);
+    }
+    return this;
+  }
+  signal(row) {
+    if (!this.signals.has(row)) this.signals.set(row, taskSignals(row, this.agents, this.spaces, this.related.get(row) ?? walk(row.children), this.live, item => this.related.get(item) ?? walk(item.children)));
+    return this.signals.get(row);
+  }
+  detail(row) {
+    if (!this.details.has(row)) this.details.set(row, taskDetail(row, this.agents, this.live));
+    return this.details.get(row);
+  }
+  reason(row) {
+    if (!this.reasons.has(row)) this.reasons.set(row, looseReason(row));
+    return this.reasons.get(row);
+  }
+  why(row) {
+    if (!this.whys.has(row)) this.whys.set(row, looseWhy(row));
+    return this.whys.get(row);
+  }
+  plan(row) {
+    if (!this.plans.has(row)) this.plans.set(row, closePlan(row, this.spaces, this.related.get(row)));
+    return this.plans.get(row);
+  }
+}
+
+export function parseFrontmatter(text) {
+  const source = String(text ?? "");
+  if (!/^---\r?\n/.test(source)) return {properties:{}, body:source};
+  const match = source.match(/^---\r?\n([\s\S]*?)^---\r?$(?:\n)?/m);
+  if (!match) return {properties:{}, body:source};
+  const properties = {};
+  const scalar = value => {
+    value = value.trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
+      return value.slice(1, -1);
+    return value.replace(/\s+#.*$/, "");
+  };
+  let list = null;
+  for (const line of match[1].split(/\r?\n/)) {
+    const entry = line.match(/^([\w-]+):\s*(.*)$/);
+    if (entry) {
+      const [, key, raw] = entry;
+      list = raw ? null : key;
+      properties[key] = raw.startsWith("[") && raw.endsWith("]")
+        ? (raw.slice(1, -1).match(/"[^"]*"|'[^']*'|[^,]+/g) ?? []).map(scalar).filter(Boolean)
+        : raw ? scalar(raw) : [];
+    } else if (list) {
+      const item = line.match(/^\s*-\s+(.+)$/);
+      if (item && !/^[\w-]+:\s/.test(item[1])) properties[list].push(scalar(item[1]));
+      else if (line.trim() && !line.trim().startsWith("#")) list = null;
+    }
+  }
+  return {properties, body:source.slice(match[0].length)};
+}
+
+// Resolve only paths within the note directory, never arbitrary scheme targets.
+export function wikiPath(path, target) {
+  const name = String(target ?? "").split("#")[0].trim();
+  if (!name || /^(?:\/|[a-z]+:)/i.test(name) || name.split(/[\\/]/).includes("..")) return null;
+  const folder = path.slice(0, path.lastIndexOf("/")) || "/";
+  return `${folder === "/" ? "" : folder}/${name}${name.endsWith(".md") ? "" : ".md"}`;
+}
+
+function outsideCode(text, transform) {
+  return String(text ?? "").split(/(^\s*```[^\n]*\n[\s\S]*?^\s*```\s*$|^\s*~~~[^\n]*\n[\s\S]*?^\s*~~~\s*$|`[^`\n]*`)/gm)
+    .map((part, index) => index % 2 ? part : transform(part)).join("");
+}
+
+export function wikiTargets(text) {
+  const targets = new Set();
+  outsideCode(text, part => {
+    for (const match of part.matchAll(/(!?)\[\[([^\]]+)\]\]/g))
+      if (!match[1]) targets.add(match[2].split("|")[0]);
+    return part;
+  });
+  return [...targets];
+}
+
+export function transformWikilinks(text, path, existing = new Set()) {
+  const escape = label => label.replace(/[\\[\]*_`<>]/g, "\\$&");
+  return outsideCode(text, part => part.replace(/(!?)\[\[([^\]]+)\]\]/g, (_match, embed, link) => {
+    const [target, alias] = link.split("|");
+    const label = alias ?? target.split("#")[0];
+    if (embed) return `![[${label}]]`; // The note renderer turns embeds into dim chips.
+    const destination = wikiPath(path, target);
+    return destination && existing.has(destination)
+      ? `[${escape(label)}](berbr-note:${encodeURIComponent(destination)})` : escape(label);
+  }));
 }

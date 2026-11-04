@@ -185,7 +185,7 @@ pub struct Tree {
     /// The branch's head commit; read only when commits are unpushed.
     pub head: Option<String>,
     pub agents: Vec<Agent>,
-    /// The MR opened from this worktree's branch, index into `Table::mrs`.
+    /// The latest MR from this worktree's branch, index into `Table::mrs`.
     pub mr: Option<usize>,
     /// Its MR is merged or closed and nothing local is left: safe to remove.
     pub finished: bool,
@@ -317,21 +317,26 @@ pub struct Table {
 /// `online: false` skips Jira and GitLab: worktrees, agents, workspaces and
 /// sessions only, without task states — for commands that must answer fast.
 pub fn build(config: &Config, tasks: Vec<Task>, online: bool) -> Table {
-    let inputs = fetch::fetch(config, tasks, online, online);
+    let inputs = fetch::fetch(config, tasks, online, online, true);
     crate::trace::time("matching", || matching::assemble(inputs))
+}
+
+/// Fresh planning data, without writing remote or transcript caches.
+pub fn build_read_only(config: &Config, tasks: Vec<Task>) -> Table {
+    matching::assemble(fetch::fetch(config, tasks, true, true, false))
 }
 
 /// Offline, but with the tickets and MRs of the last online build: the TUI's
 /// first frame shows them at once while the refresh runs.
 pub fn build_cached(config: &Config, tasks: Vec<Task>) -> Table {
-    matching::assemble(fetch::fetch(config, tasks, false, true))
+    matching::assemble(fetch::fetch(config, tasks, false, true, true))
 }
 
 /// MR merged or closed, and the branch has nothing beyond it: either every commit
 /// is on origin, or the local tip is the MR head (squash merges leave the branch
 /// commits off master, and the remote branch is usually deleted).
 pub fn branch_finished(mr: &MergeRequest, unpushed: usize, head: Option<&str>) -> bool {
-    if mr.state() == MrState::Opened {
+    if !matches!(mr.state(), MrState::Merged | MrState::Closed) {
         return false;
     }
     unpushed == 0 || (head.is_some() && head == mr.sha())

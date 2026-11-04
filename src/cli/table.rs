@@ -124,6 +124,7 @@ fn print_status(table: &Table, tag: Option<&str>, all: bool) {
         table,
         &view::Options {
             all,
+            active_loose: false,
             filter: "",
             tag,
             hide: view::Hide {

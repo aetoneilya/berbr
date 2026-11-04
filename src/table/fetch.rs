@@ -60,7 +60,13 @@ impl RemoteCache {
 /// `online: false` skips Jira and GitLab and git status. `cached`: what Jira
 /// and GitLab said last time stands in for what they do not say now, offline or
 /// failing.
-pub(super) fn fetch(config: &Config, tasks: Vec<Task>, online: bool, cached: bool) -> Inputs {
+pub(super) fn fetch(
+    config: &Config,
+    tasks: Vec<Task>,
+    online: bool,
+    cached: bool,
+    persist: bool,
+) -> Inputs {
     // a project without Jira or GitLab asks them nothing, as offline
     let jira = (online && config.jira.is_some()).then(|| config.jira_client());
     let gitlab = config
@@ -125,12 +131,14 @@ pub(super) fn fetch(config: &Config, tasks: Vec<Task>, online: bool, cached: boo
         cache.map(|c| c.mrs),
         &mut warnings,
     );
-    if complete {
+    if complete && persist {
         RemoteCache::save(&config.name, &tickets, &mrs);
     }
 
     let roots = worktree_roots(config);
-    let sessions = trace::time("sessions", || load_sessions(&roots, &trees, &tasks));
+    let sessions = trace::time("sessions", || {
+        load_sessions(&roots, &trees, &tasks, persist)
+    });
     Inputs {
         tasks,
         tickets,
@@ -216,6 +224,7 @@ fn load_sessions(
     roots: &[PathBuf],
     trees: &[Tree],
     tasks: &[Task],
+    persist: bool,
 ) -> HashMap<String, sessions::Session> {
     let mut dirs: Vec<PathBuf> = roots
         .iter()
@@ -237,7 +246,9 @@ fn load_sessions(
             found.insert(session.id.clone(), session);
         }
     }
-    cache.save();
+    if persist {
+        cache.save();
+    }
     found
 }
 
@@ -332,6 +343,7 @@ fn fetch_mrs(
     {
         projects.push(gitlab.project.as_str());
     }
+    projects.sort_unstable();
     projects.dedup();
 
     std::thread::scope(|scope| {
