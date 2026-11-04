@@ -1,4 +1,4 @@
-//! `wt done` and `wt attach`: closing a task or worktrees, attaching a ticket.
+//! `berbr done` and `berbr attach`: closing a task or worktrees, attaching a ticket.
 
 use super::common::{
     Terminal, Ui, confirm, err, find_task, is_ticket_key, list, resolve_task, resolve_tree,
@@ -17,7 +17,7 @@ use crate::vault::note::Note;
 use crate::vault::task::Task;
 use serde_yaml::Value;
 
-/// `wt done`: with the name of an open task, or a ticket of one, closes the task;
+/// `berbr done`: with the name of an open task, or a ticket of one, closes the task;
 /// otherwise removes worktrees.
 pub(in crate::cli) fn cli_done(config: &Config, args: DoneArgs) -> Result<(), String> {
     if let Some(name) = args.name.as_deref().filter(|_| !args.merged)
@@ -45,11 +45,11 @@ fn print(line: String) {
     println!("{line}");
 }
 
-/// What `wt done <task>` would do, checked against fresh Jira and GitLab: the
+/// What `berbr done <task>` would do, checked against fresh Jira and GitLab: the
 /// task's worktrees go (each must be finished: MR merged or closed, nothing
 /// unpushed; uncommitted changes are lost once confirmed), my open tickets of
 /// it are closed in Jira, the note gets `done: true` with the final MRs and
-/// branches — after that worktable leaves it alone — and its herdr workspace
+/// branches — after that berbr leaves it alone — and its herdr workspace
 /// closes with every tab, agent and shell in it.
 pub(crate) struct TaskPlan {
     table: Table,
@@ -277,7 +277,7 @@ pub(crate) fn finish_task(
     }
 }
 
-/// `wt done [<worktree>]` and `wt done --merged`: worktrees go one by one, each
+/// `berbr done [<worktree>]` and `berbr done --merged`: worktrees go one by one, each
 /// once it is finished.
 fn done_trees(config: &Config, args: DoneArgs) -> Result<(), String> {
     let (table, warning) = trees_for_done(config, args.force)?;
@@ -355,7 +355,7 @@ pub(crate) fn trees_for_done(
     Ok((table, warning))
 }
 
-/// What `wt done <worktree>` would do: the worktree goes, with its branch and
+/// What `berbr done <worktree>` would do: the worktree goes, with its branch and
 /// herdr tabs, once nothing holds it.
 pub(crate) struct TreePlan {
     table: Table,
@@ -521,7 +521,7 @@ pub(in crate::cli) fn cli_attach(
     attach(config, key, task, &mut Terminal)
 }
 
-/// `wt attach <KEY> [<task>]`: the ticket joins a task — just its `tickets:`,
+/// `berbr attach <KEY> [<task>]`: the ticket joins a task — just its `tickets:`,
 /// no worktree or agent. Without a task, a picker over the open ones.
 pub(crate) fn attach(
     config: &Config,

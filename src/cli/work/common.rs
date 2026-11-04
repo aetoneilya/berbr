@@ -121,7 +121,7 @@ pub(super) fn choose_repo(config: &Config, ui: &mut dyn Ui) -> Result<PathBuf, S
         .ok()
         .and_then(|d| worktree::main_checkout(&d).ok());
     match mains.len() {
-        0 => return Err("no [[repo]] in ~/.config/worktable/config.toml".to_string()),
+        0 => return Err("no [[repo]] in ~/.config/berbr/config.toml".to_string()),
         1 => return Ok(mains[0].clone()),
         _ => {}
     }
@@ -206,24 +206,45 @@ where
     I::IntoIter: Clone,
 {
     let tasks = tasks.into_iter();
+    // An immutable ID must win over another task's editable title.
+    if let Some(i) = tasks
+        .clone()
+        .position(|t| !t.done && same_name(&t.name, target))
+        .or_else(|| tasks.clone().position(|t| same_name(&t.name, target)))
+    {
+        return Ok(Some(i));
+    }
     let names = |t: &Task| {
         if is_ticket_key(target) {
             t.tickets.iter().any(|k| k == target)
         } else {
-            same_name(&t.name, target)
+            same_name(&t.name, target) || t.title().is_some_and(|title| same_name(&title, target))
         }
     };
-    let found = tasks
+    let mut exact: Vec<usize> = tasks
         .clone()
-        .position(|t| !t.done && names(t))
-        .or_else(|| tasks.clone().position(names));
-    if found.is_some() || !partial {
-        return Ok(found);
+        .enumerate()
+        .filter(|(_, t)| !t.done && names(t))
+        .map(|(i, _)| i)
+        .collect();
+    if exact.is_empty() {
+        exact = tasks
+            .clone()
+            .enumerate()
+            .filter(|(_, t)| names(t))
+            .map(|(i, _)| i)
+            .collect();
+    }
+    match exact.as_slice() {
+        [i] => return Ok(Some(*i)),
+        [] if !partial => return Ok(None),
+        [] => {}
+        _ => return Err(format!("\"{target}\" matches several tasks; use its ID")),
     }
     let needle = target.to_lowercase();
     let matches: Vec<usize> = tasks
         .enumerate()
-        .filter(|(_, t)| !t.done && t.name.to_lowercase().contains(&needle))
+        .filter(|(_, t)| !t.done && t.display_name().to_lowercase().contains(&needle))
         .map(|(i, _)| i)
         .collect();
     match matches.as_slice() {
@@ -245,7 +266,9 @@ pub(super) fn resolve_task(
     if let Some(arg) = arg {
         return match find_task(&tasks, arg, true)? {
             Some(i) => Ok(tasks.swap_remove(i)),
-            None => Err(format!("no task \"{arg}\": wt start \"{arg}\" creates it")),
+            None => Err(format!(
+                "no task \"{arg}\": berbr start \"{arg}\" creates it"
+            )),
         };
     }
     let mut table = table::build(config, tasks, false);
@@ -257,7 +280,7 @@ pub(super) fn resolve_task(
         .collect();
     let items: Vec<String> = open
         .iter()
-        .map(|&i| table.tasks[i].task.name.clone())
+        .map(|&i| table.tasks[i].task.display_name())
         .collect();
     let chosen = open[ui.pick("Task", &items)?];
     Ok(table.tasks.swap_remove(chosen).task)
@@ -267,7 +290,7 @@ pub(super) fn resolve_task(
 /// unpushed counts.
 pub(super) fn tree_table(config: &Config, online: bool) -> Result<Table, String> {
     if config.repos.is_empty() {
-        return Err("no [[repo]] in ~/.config/worktable/config.toml".to_string());
+        return Err("no [[repo]] in ~/.config/berbr/config.toml".to_string());
     }
     // tasks don't decide which worktree is which, and are not needed here
     Ok(table::build(config, Vec::new(), online))

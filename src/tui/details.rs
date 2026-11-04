@@ -81,7 +81,7 @@ impl App {
                 let state = row.row_state();
                 lines.push(Line::from(spans([
                     look::state(state, false),
-                    Piece::new(row.task.name.clone(), Tone::Bold),
+                    Piece::new(row.task.display_name(), Tone::Bold),
                 ])));
                 let mut meta = vec![dim(state.map_or("", |s| s.as_str()))];
                 if !row.task.tags.is_empty() {
@@ -167,7 +167,7 @@ impl App {
             Kind::Header(_) => {}
             Kind::NewTask => {
                 lines.push(Line::raw("⏎ a new task: a note, a herdr workspace,"));
-                lines.push(Line::raw("a worktree tab with claude (wt start)"));
+                lines.push(Line::raw("a worktree tab with an agent (berbr start)"));
             }
             Kind::Agent(at, a) => {
                 lines.push(Line::from(rows::agent_spans(

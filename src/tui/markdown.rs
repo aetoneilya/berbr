@@ -13,7 +13,7 @@ static HEADING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(#{1,6})\s+(.*)
 static RULE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(-{3,}|\*{3,}|_{3,})$").unwrap());
 static ITEM: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^( *)([-*+]|\d+[.)])\s+(?:\[([ xX])\]\s+)?(.*)$").unwrap());
-/// A dated line: `- 2026-10-20 slug: text` from `wt note`, `- 2026-10-20: text`
+/// A dated line: `- 2026-10-20 slug: text` from `berbr note`, `- 2026-10-20: text`
 /// from the N key.
 static DATED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[-*+] (\d{4}-\d{2}-\d{2})(?: ([^\s:]+))?: (.+)$").unwrap());

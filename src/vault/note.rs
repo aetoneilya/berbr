@@ -58,6 +58,30 @@ impl Note {
         }
     }
 
+    /// The task's own text, before its append-only agent findings.
+    pub fn description(&self) -> &str {
+        let body = self.body();
+        let end = agent_notes_start(body).unwrap_or(body.len());
+        body[..end].trim()
+    }
+
+    /// Replace the task's description, keeping frontmatter and agent findings.
+    pub fn set_description(&mut self, description: &str) {
+        let body = self.body();
+        let start = self.text.len() - body.len();
+        let notes = agent_notes_start(body).map(|i| body[i..].to_string());
+        self.text.truncate(start);
+        if !self.text.is_empty() && !self.text.ends_with('\n') {
+            self.text.push('\n');
+        }
+        self.text.push_str(description.trim());
+        self.text.push('\n');
+        if let Some(notes) = notes {
+            self.text.push('\n');
+            self.text.push_str(&notes);
+        }
+    }
+
     /// File name without `.md`.
     pub fn name(&self) -> String {
         self.path
@@ -163,7 +187,7 @@ impl Note {
         }
 
         let file_name = self.path.file_name().unwrap_or_default().to_string_lossy();
-        let tmp = self.path.with_file_name(format!(".{file_name}.wt-tmp"));
+        let tmp = self.path.with_file_name(format!(".{file_name}.berbr-tmp"));
         fs::write(&tmp, &self.text).map_err(io_err)?;
         fs::rename(&tmp, &self.path).map_err(io_err)?;
         self.modified = fs::metadata(&self.path)
@@ -174,6 +198,14 @@ impl Note {
 }
 
 const AGENT_NOTES: &str = "## Agent notes";
+
+fn agent_notes_start(body: &str) -> Option<usize> {
+    body.match_indices(AGENT_NOTES).map(|(i, _)| i).find(|&i| {
+        (i == 0 || body[..i].ends_with('\n'))
+            && (body[i + AGENT_NOTES.len()..].is_empty()
+                || body[i + AGENT_NOTES.len()..].starts_with(['\n', '\r']))
+    })
+}
 
 fn append_under_heading(text: &str, heading: &str, line: &str) -> String {
     let item = format!("- {line}\n");

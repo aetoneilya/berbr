@@ -1,7 +1,8 @@
-//! `wt review`: a reviewer agent next to the task's agent.
+//! `berbr review`: a reviewer agent next to the task's agent.
 
 use super::common::{Terminal, Ui, err, resolve_tree, tree_table};
 use super::launch::live_agents;
+use crate::client::agent::AgentKind;
 use crate::client::herdr;
 use crate::config::Config;
 
@@ -16,10 +17,10 @@ pub(in crate::cli) fn cli_review(config: &Config, name: Option<String>) -> Resul
     review(config, name, &mut Terminal)
 }
 
-/// A reviewer claude on the worktree, under the task's agent or in a tab of its own.
+/// A reviewer agent on the worktree, under the task's agent or in a tab of its own.
 pub(crate) fn review(config: &Config, name: Option<String>, ui: &mut dyn Ui) -> Result<(), String> {
     if !herdr::available() {
-        return Err("wt review needs herdr: run it inside a herdr pane".to_string());
+        return Err("berbr review needs herdr: run it inside a herdr pane".to_string());
     }
     // worktrees and agents only: nothing here needs Jira or GitLab
     let table = tree_table(config, false)?;
@@ -37,12 +38,21 @@ pub(crate) fn review(config: &Config, name: Option<String>, ui: &mut dyn Ui) -> 
     .map_err(err)?;
 
     let reviewer = herdr::agent_name(&format!("{}-review", wt.name()));
+    let kind = config
+        .workflow
+        .agent_override
+        .or(config.workflow.review_agent)
+        .unwrap_or(config.workflow.agent);
+    let model = match kind {
+        AgentKind::Claude => &config.workflow.review_model,
+        AgentKind::Codex => &config.workflow.codex_review_model,
+    };
     let mut args = Vec::new();
-    if let Some(model) = config.workflow.review_model.as_deref() {
+    if let Some(model) = model.as_deref() {
         args.extend(["--model", model]);
     }
     args.push(REVIEW_PROMPT);
-    herdr::start_claude(&reviewer, &pane, &args).map_err(err)?;
+    herdr::start_agent(kind, &reviewer, &pane, &args).map_err(err)?;
 
     ui.say(format!("Started {reviewer} in {}", wt.path.display()));
     Ok(())

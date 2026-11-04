@@ -1,3 +1,4 @@
+use crate::client::agent::AgentKind;
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,7 +7,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, Deserialize)]
 pub struct JiraConfig {
     pub host: String,
-    /// Where `wt start --new-ticket` creates tickets, e.g. "DEMO".
+    /// Where `berbr start --new-ticket` creates tickets, e.g. "DEMO".
     pub project: Option<String>,
     /// Their type, by name as the project shows it.
     #[serde(default = "default_issue_type")]
@@ -28,8 +29,17 @@ pub struct GitLabConfig {
 pub struct WorkflowConfig {
     /// Prepended to new task branches, e.g. "demo/".
     pub branch_prefix: String,
-    /// Model for `wt review`; the claude default when empty.
+    /// CLI used for new conversations; existing conversations keep their owner.
+    pub agent: AgentKind,
+    /// Optional separate CLI for reviews.
+    pub review_agent: Option<AgentKind>,
+    /// An explicit --agent filter for this invocation only.
+    #[serde(skip)]
+    pub agent_override: Option<AgentKind>,
+    /// Model for Claude reviews; Claude's default when empty.
     pub review_model: Option<String>,
+    /// Model for Codex reviews; Codex's configured default when empty.
+    pub codex_review_model: Option<String>,
     /// macOS app the TUI's `i` opens a worktree in.
     pub ide: String,
 }
@@ -38,7 +48,11 @@ impl Default for WorkflowConfig {
     fn default() -> Self {
         WorkflowConfig {
             branch_prefix: String::new(),
+            agent: AgentKind::Claude,
+            review_agent: None,
+            agent_override: None,
             review_model: None,
+            codex_review_model: None,
             ide: "IntelliJ IDEA".to_string(),
         }
     }
@@ -50,7 +64,7 @@ pub struct VaultConfig {
     pub path: PathBuf,
     /// Folders scanned for task notes, relative to `path`.
     pub task_dirs: Vec<PathBuf>,
-    /// Folder for notes created by `wt start <name>`, relative to `path`.
+    /// Folder for notes created by `berbr start <name>`, relative to `path`.
     pub new_task_dir: PathBuf,
 }
 
@@ -100,6 +114,8 @@ struct ProjectFile {
     new_task_dir: Option<PathBuf>,
     /// Default: `[workflow] branch_prefix`.
     branch_prefix: Option<String>,
+    /// Default: [workflow] agent.
+    agent: Option<AgentKind>,
     #[serde(default, rename = "repo")]
     repos: Vec<RepoConfig>,
 }
@@ -118,6 +134,9 @@ impl FileConfig {
                 let mut workflow = self.workflow.clone();
                 if let Some(prefix) = p.branch_prefix {
                     workflow.branch_prefix = prefix;
+                }
+                if let Some(agent) = p.agent {
+                    workflow.agent = agent;
                 }
                 Ok(Config {
                     name: p.name,
@@ -161,17 +180,33 @@ pub fn expand_home(path: &Path) -> PathBuf {
     }
 }
 
-/// `$WORKTABLE_CONFIG`, else `worktable/config.toml` in the config dir.
-fn config_path() -> PathBuf {
+/// Explicit config, then an existing plugin config, then the standalone config.
+pub(crate) fn config_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .or_else(dirs::config_dir)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    std::env::var_os("WORKTABLE_CONFIG")
+    std::env::var_os("BERBR_CONFIG")
+        .or_else(|| std::env::var_os("WORKTABLE_CONFIG"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| base.join("worktable").join("config.toml"))
+        .or_else(|| {
+            let path =
+                PathBuf::from(std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")?).join("config.toml");
+            path.is_file().then_some(path)
+        })
+        .unwrap_or_else(|| default_config_path(&base))
+}
+
+fn default_config_path(base: &Path) -> PathBuf {
+    let path = base.join("berbr").join("config.toml");
+    let legacy = base.join("worktable").join("config.toml");
+    if !path.exists() && legacy.is_file() {
+        legacy
+    } else {
+        path
+    }
 }
 
 /// Every configured project, in the file's order.
@@ -250,12 +285,20 @@ pub fn project_of(projects: &[Config], dir: &Path) -> Option<usize> {
         .position(|p| p.repos.iter().any(|r| dir.starts_with(&r.path)))
 }
 
-/// worktable's own cache: last Jira and GitLab answers, the session index, the
-/// notes lock, `wt prepare` specs.
+/// berbr's own cache: last Jira and GitLab answers, the session index, the
+/// notes lock, `berbr prepare` specs.
 pub fn cache_dir() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("worktable")
+    cache_path(&dirs::cache_dir().unwrap_or_else(std::env::temp_dir))
+}
+
+fn cache_path(base: &Path) -> PathBuf {
+    // Keep existing state and the note-write lock shared with older binaries.
+    let legacy = base.join("worktable");
+    if legacy.is_dir() {
+        legacy
+    } else {
+        base.join("berbr")
+    }
 }
 
 #[derive(Debug, Error)]
@@ -271,6 +314,33 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renamed_config_prefers_berbr_and_falls_back_to_worktable() {
+        let base = crate::table::fixtures::temp_dir();
+        let new = base.join("berbr/config.toml");
+        let old = base.join("worktable/config.toml");
+        assert_eq!(default_config_path(&base), new);
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, "legacy").unwrap();
+        assert_eq!(default_config_path(&base), old);
+        fs::create_dir_all(new.parent().unwrap()).unwrap();
+        fs::write(&new, "new").unwrap();
+        assert_eq!(default_config_path(&base), new);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn existing_cache_stays_shared_with_legacy_binaries() {
+        let base = crate::table::fixtures::temp_dir();
+        let new = base.join("berbr");
+        let old = base.join("worktable");
+        assert_eq!(cache_path(&base), new);
+        fs::create_dir(&new).unwrap();
+        fs::create_dir(&old).unwrap();
+        assert_eq!(cache_path(&base), old);
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn projects_share_the_vault_and_defaults() {
@@ -312,6 +382,51 @@ mod tests {
         assert_eq!(choose_project(&projects, None, None), Ok(0));
         assert_eq!(choose_project(&projects, Some("VPN"), None), Ok(1));
         assert!(choose_project(&projects, Some("kitten"), None).is_err());
+    }
+
+    #[test]
+    fn agent_defaults_and_project_overrides_are_backward_compatible() {
+        let text = r#"
+            [vault]
+            path = "/v"
+            [[project]]
+            name = "legacy"
+            task_dirs = ["tasks"]
+        "#;
+        let file: FileConfig = toml::from_str(text).unwrap();
+        assert_eq!(
+            file.projects().unwrap()[0].workflow.agent,
+            AgentKind::Claude
+        );
+        let text = r#"
+            [vault]
+            path = "/v"
+            [workflow]
+            agent = "codex"
+            review_agent = "claude"
+            review_model = "claude-review-model"
+            codex_review_model = "codex-review-model"
+            [[project]]
+            name = "default"
+            task_dirs = ["tasks"]
+            [[project]]
+            name = "override"
+            task_dirs = ["other"]
+            agent = "claude"
+        "#;
+        let file: FileConfig = toml::from_str(text).unwrap();
+        let projects = file.projects().unwrap();
+        assert_eq!(projects[0].workflow.agent, AgentKind::Codex);
+        assert_eq!(projects[1].workflow.agent, AgentKind::Claude);
+        assert_eq!(projects[0].workflow.review_agent, Some(AgentKind::Claude));
+        assert_eq!(
+            projects[0].workflow.codex_review_model.as_deref(),
+            Some("codex-review-model")
+        );
+        assert!(
+            toml::from_str::<FileConfig>(&text.replace("agent = \"codex\"", "agent = \"typo\""))
+                .is_err()
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Modal dialogs: commands run in the background and report and ask here, in
-//! the TUI itself, rather than in a `wt` process given the terminal.
+//! the TUI itself, rather than in a `berbr` process given the terminal.
 
 use super::{App, Update};
 use crate::cli::work::Ui;
@@ -27,7 +27,7 @@ pub(super) enum Dialog {
         /// The field on: yes or no.
         yes: bool,
     },
-    /// Before `wt start <key>`: it creates a note, a worktree and an agent.
+    /// Before `berbr start <key>`: it creates a note, a worktree and an agent.
     Start {
         key: String,
         summary: String,
@@ -37,7 +37,7 @@ pub(super) enum Dialog {
     Report(Report),
     /// `v`: which kinds of rows are shown; the selected toggle.
     Hide { selected: usize },
-    /// "+ new task": the form for `wt start`.
+    /// "+ new task": the form for `berbr start`.
     NewTask(super::new_task::Form),
     /// "+ new project" in the project dropdown.
     NewProject(super::project::Form),
@@ -202,7 +202,7 @@ impl Action {
         lines = vec!["not finished:".to_string()];
         lines.extend(blockers.iter().map(|b| format!("  {b}")));
         lines.push(String::new());
-        lines.push("finish these, or wt done --force in a terminal".to_string());
+        lines.push("finish these, or berbr done --force in a terminal".to_string());
         (lines, true)
     }
 
@@ -262,7 +262,7 @@ impl App {
         });
     }
 
-    /// Runs a `wt` command in the background, its report and questions in a
+    /// Runs a `berbr` command in the background, its report and questions in a
     /// dialog.
     pub(super) fn run_command<F>(&mut self, title: String, then: Then, command: F)
     where

@@ -21,8 +21,8 @@ pub fn ticket_keys(text: &str) -> Vec<String> {
     keys
 }
 
-/// A claude session held in one of the task's worktrees, stored in the note as
-/// `<session id> <worktree name> <date>`.
+/// An agent session held in one of the task's worktrees, stored in the note as
+/// `<session id> <worktree name> <date>`; Codex ids have a `codex:` prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRef {
     pub id: String,
@@ -80,6 +80,7 @@ impl TaskState {
 #[derive(Debug)]
 pub struct Task {
     pub note: Note,
+    /// Stable note identity: `<project>-<number>` for new tasks, filename for legacy notes.
     pub name: String,
     pub tickets: Vec<String>,
     pub tags: Vec<String>,
@@ -100,6 +101,21 @@ fn link_target(link: &str) -> Option<String> {
 }
 
 impl Task {
+    /// Stable identity is the note's file name; titles never move the note.
+    pub fn title(&self) -> Option<String> {
+        self.note
+            .string("title")
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.note.string("id").is_none().then(|| self.name.clone()))
+    }
+
+    pub fn display_name(&self) -> String {
+        match self.title() {
+            Some(title) if title != self.name => format!("{}  {title}", self.name),
+            _ => self.name.clone(),
+        }
+    }
+
     pub fn from_note(note: Note) -> Task {
         Task {
             name: note.name(),
@@ -287,5 +303,8 @@ mod tests {
         let s = SessionRef::parse("a9c0 a2i-config 2026-10-08").unwrap();
         assert_eq!(s.worktree, "a2i-config");
         assert_eq!(s.entry(), "a9c0 a2i-config 2026-10-08");
+        let codex = SessionRef::parse("codex:a9c0 a2i-config 2026-10-29").unwrap();
+        assert_eq!(codex.entry(), "codex:a9c0 a2i-config 2026-10-29");
+        assert_ne!(codex.id, s.id);
     }
 }

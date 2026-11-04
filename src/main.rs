@@ -1,6 +1,7 @@
 mod cli;
 mod client;
 mod config;
+mod metadata;
 mod table;
 mod trace;
 mod tui;

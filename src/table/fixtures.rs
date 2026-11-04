@@ -18,7 +18,7 @@ pub const ROOT: &str = "/r/.claude/worktrees";
 pub fn temp_dir() -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "worktable-test-{}-{}",
+        "berbr-test-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
@@ -99,6 +99,7 @@ pub fn agent(name: &str, tree: &str, space: &str) -> herdr::Agent {
         tab_id: format!("{space}:t"),
         workspace_id: space.to_string(),
         agent_session: None,
+        extra: Default::default(),
     }
 }
 

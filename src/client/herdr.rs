@@ -1,6 +1,10 @@
+mod app;
+
+use super::agent::AgentKind;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
 
@@ -20,18 +24,53 @@ pub(crate) type Result<T> = std::result::Result<T, HerdrError>;
 
 /// True when running inside a herdr-managed pane.
 pub fn available() -> bool {
-    std::env::var("HERDR_ENV").is_ok_and(|v| v == "1")
+    app::enabled() || std::env::var("HERDR_ENV").is_ok_and(|v| v == "1")
 }
 
 /// herdr's stdout, or its stderr as the error.
 fn herdr_output(args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("herdr").args(args).output()?;
+    if app::enabled() {
+        return app::output(args);
+    }
+    let output = Command::new(herdr_bin()).args(args).output()?;
     if !output.status.success() {
         return Err(HerdrError::NonZeroExit(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
         ));
     }
     Ok(output.stdout)
+}
+
+fn herdr_bin() -> OsString {
+    std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into())
+}
+
+/// Plugin actions and panes start in the plugin checkout, not the caller's repo.
+pub fn caller_dir() -> Option<PathBuf> {
+    let context = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").ok()?;
+    let context: serde_json::Value = serde_json::from_str(&context).ok()?;
+    [
+        "/focused_pane_cwd",
+        "/worktree/checkout_path",
+        "/workspace_cwd",
+    ]
+    .iter()
+    .filter_map(|key| context.pointer(key).and_then(|v| v.as_str()))
+    .find(|path| !path.is_empty())
+    .map(PathBuf::from)
+}
+
+pub fn open_board() -> Result<()> {
+    run_herdr(&[
+        "plugin",
+        "pane",
+        "open",
+        "--plugin",
+        "berbr",
+        "--entrypoint",
+        "board",
+    ])
+    .map(|_| ())
 }
 
 fn run_herdr(args: &[&str]) -> Result<serde_json::Value> {
@@ -52,6 +91,8 @@ pub struct Agent {
     pub tab_id: String,
     pub workspace_id: String,
     pub agent_session: Option<AgentSession>,
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// The agent's own session handle; for claude, the session id.
@@ -63,6 +104,53 @@ pub struct AgentSession {
 impl Agent {
     pub fn session_id(&self) -> Option<&str> {
         self.agent_session.as_ref().map(|s| s.value.as_str())
+    }
+
+    pub fn kind(&self) -> Option<AgentKind> {
+        ["agent", "kind", "agent_kind", "agent_type"]
+            .iter()
+            .find_map(|key| {
+                let value = self.extra.get(*key)?;
+                match value
+                    .as_str()
+                    .or_else(|| value.get("kind").and_then(|v| v.as_str()))?
+                {
+                    "claude" | "claude-code" | "claude_code" => Some(AgentKind::Claude),
+                    "codex" => Some(AgentKind::Codex),
+                    _ => None,
+                }
+            })
+    }
+
+    /// Backend-qualified lookup; ambiguous raw ids never pick another CLI's session.
+    pub fn session<'a>(
+        &self,
+        sessions: &'a std::collections::HashMap<String, super::sessions::Session>,
+    ) -> Option<&'a super::sessions::Session> {
+        let id = self.session_id()?;
+        if let Some(kind) = self.kind() {
+            return sessions.get(&kind.session_key(id));
+        }
+        match (
+            sessions.get(id),
+            sessions.get(&AgentKind::Codex.session_key(id)),
+        ) {
+            (Some(session), None) | (None, Some(session)) => Some(session),
+            _ => None,
+        }
+    }
+
+    pub fn matches_session(
+        &self,
+        key: &str,
+        sessions: &std::collections::HashMap<String, super::sessions::Session>,
+    ) -> bool {
+        if self.session_id() != Some(AgentKind::native_id(key)) {
+            return false;
+        }
+        self.kind()
+            .map(|kind| kind == AgentKind::from_session_key(key))
+            .unwrap_or_else(|| self.session(sessions).is_some_and(|s| s.id == key))
     }
 
     pub fn runs_in(&self, dir: &Path) -> bool {
@@ -100,6 +188,32 @@ pub fn list_agents() -> Result<Vec<Agent>> {
 
 pub fn list_workspaces() -> Result<Vec<Workspace>> {
     result_field(run_herdr(&["workspace", "list"])?, "/result/workspaces")
+}
+
+/// Only wt-owned tokens; empty values remove an old token instead of retaining it.
+pub fn report_metadata(
+    scope: &str,
+    target: &str,
+    tokens: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let mut args = vec![
+        scope.to_string(),
+        "report-metadata".into(),
+        target.into(),
+        "--source".into(),
+        "berbr".into(),
+        "--ttl-ms".into(),
+        "180000".into(),
+    ];
+    for (key, value) in tokens {
+        if value.is_empty() {
+            args.extend(["--clear-token".into(), key.clone()]);
+        } else {
+            args.extend(["--token".into(), format!("{key}={value}")]);
+        }
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    herdr_output(&args).map(|_| ())
 }
 
 pub fn close_workspace(workspace_id: &str) -> Result<()> {
@@ -167,19 +281,35 @@ pub fn create_workspace(label: &str, cwd: &Path) -> Result<(String, String)> {
 
 /// Types `command` and Enter into the shell of `pane`.
 pub fn run_in_pane(pane: &str, command: &str) -> Result<()> {
-    herdr_output(&["pane", "run", pane, command]).map(|_| ())
+    let command = if std::env::var_os("HERDR_PLUGIN_ROOT").is_some() {
+        let exe = std::env::current_exe()?;
+        let bin = exe.parent().unwrap_or(Path::new("."));
+        format!(
+            "export PATH={}:\"$PATH\"; export BERBR_CONFIG={}; export HERDR_BIN_PATH={}; {command}",
+            shell_quote(&bin.to_string_lossy()),
+            shell_quote(&crate::config::config_path().to_string_lossy()),
+            shell_quote(&herdr_bin().to_string_lossy()),
+        )
+    } else {
+        command.to_string()
+    };
+    herdr_output(&["pane", "run", pane, &command]).map(|_| ())
 }
 
 /// Names the agent `pane` will host once herdr detects it, in the background:
 /// claude started by a plain command in the pane is detected a moment later.
 pub fn name_agent_when_up(pane: &str, name: &str) -> Result<()> {
+    if app::enabled() {
+        return rename_agent(pane, name);
+    }
     use std::os::unix::process::CommandExt;
     Command::new("sh")
         .args([
             "-c",
-            r#"i=0; while [ $i -lt 120 ]; do herdr agent rename "$0" "$1" >/dev/null 2>&1 && exit 0; i=$((i+1)); sleep 0.5; done"#,
+            r#"i=0; while [ $i -lt 120 ]; do "$2" agent rename "$0" "$1" >/dev/null 2>&1 && exit 0; i=$((i+1)); sleep 0.5; done"#,
             pane,
             name,
+            &herdr_bin().to_string_lossy(),
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -232,16 +362,9 @@ pub fn focus_agent(target: &str) -> Result<()> {
     run_herdr(&["agent", "focus", target]).map(|_| ())
 }
 
-/// Starts claude in the shell of `pane` and names the agent once herdr sees it.
-/// Typed as `command claude` rather than through `herdr agent start`: ai-launcher
-/// keeps putting a `claude` shell function into ~/.zshrc that refuses to run it.
-pub fn start_claude(name: &str, pane: &str, claude_args: &[&str]) -> Result<()> {
-    let mut command = String::from("command claude");
-    for arg in claude_args {
-        command.push(' ');
-        command.push_str(&shell_quote(arg));
-    }
-    run_in_pane(pane, &command)?;
+/// Starts the chosen CLI directly, bypassing shell wrappers, then names it.
+pub fn start_agent(kind: AgentKind, name: &str, pane: &str, args: &[&str]) -> Result<()> {
+    run_in_pane(pane, &kind.shell_command(args))?;
     name_agent_when_up(pane, name)
 }
 
@@ -265,7 +388,7 @@ pub fn agent_name(raw: &str) -> String {
     let name = if name.is_empty() {
         "agent".to_string()
     } else if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
-        format!("wt-{name}")
+        format!("berbr-{name}")
     } else {
         name.to_string()
     };
@@ -301,12 +424,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_session_identity_includes_the_cli_kind() {
+        use super::super::sessions::Session;
+        let transcript = |id: &str| Session {
+            id: id.into(),
+            date: "2026-10-29".into(),
+            cwds: vec![],
+            first_cwd: None,
+            last_cwd: None,
+            modified: 1,
+        };
+        let sessions = [transcript("same"), transcript("codex:same")]
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
+            .collect();
+        let mut agent: Agent = serde_json::from_value(serde_json::json!({
+            "name": "test", "agent_status": "idle", "cwd": "/main", "pane_id": "pane",
+            "tab_id": "tab", "workspace_id": "space", "agent": "codex",
+            "agent_session": {"value": "same"}
+        }))
+        .unwrap();
+        assert_eq!(agent.session(&sessions).unwrap().id, "codex:same");
+        assert!(agent.matches_session("codex:same", &sessions));
+        assert!(!agent.matches_session("same", &sessions));
+        agent.extra.clear();
+        assert!(agent.session(&sessions).is_none());
+        assert!(!agent.matches_session("same", &sessions));
+        assert!(!agent.matches_session("codex:same", &sessions));
+    }
+
+    #[test]
     fn agent_names_keep_what_herdr_takes() {
         assert_eq!(agent_name("a2i-config-folder"), "a2i-config-folder");
         assert_eq!(agent_name("javadoc-и ко всем точкам"), "javadoc");
         assert_eq!(agent_name("Схлопнуть d2d и hnsw"), "d2d-hnsw");
         assert_eq!(agent_name("единый образ"), "agent");
-        assert_eq!(agent_name("2fa"), "wt-2fa");
+        assert_eq!(agent_name("2fa"), "berbr-2fa");
         assert_eq!(agent_name(&"x-".repeat(40)).len(), 31);
         let taken = vec!["video".to_string(), "video-2".to_string()];
         assert_eq!(free_agent_name("video", &taken), "video-3");

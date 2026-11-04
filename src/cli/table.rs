@@ -217,7 +217,7 @@ fn print_status(table: &Table, tag: Option<&str>, all: bool) {
                 &format!("{finished_trees} worktree(s) with merged MRs →"),
                 Tone::Dim
             ),
-            paint("wt done --merged", Tone::Bold)
+            paint("berbr done --merged", Tone::Bold)
         ));
     }
     if hidden > 0 && tag.is_none() {
@@ -227,7 +227,7 @@ fn print_status(table: &Table, tag: Option<&str>, all: bool) {
                 &format!("{hidden} ticket(s) and MR(s) without activity →"),
                 Tone::Dim
             ),
-            paint("wt status --all", Tone::Bold)
+            paint("berbr status --all", Tone::Bold)
         ));
     }
     if !footer.is_empty() {
@@ -356,7 +356,10 @@ fn task_cells(table: &Table, i: usize, node: &Node, lead: Cell, width: usize) ->
     let room = width.saturating_sub(name.text.chars().count());
     let progress = look::progress(table, i).map(Cell::from).unwrap_or_default();
     let room = room.saturating_sub(progress.text.chars().count());
-    name.push(Cell::styled(truncate(&row.task.name, room), Tone::Bold));
+    name.push(Cell::styled(
+        truncate(&row.task.display_name(), room),
+        Tone::Bold,
+    ));
     let tags: String = row.task.tags.iter().map(|t| format!(" #{t}")).collect();
     let room = width.saturating_sub(name.text.chars().count() + progress.text.chars().count());
     if !tags.is_empty() && room > 2 {
@@ -371,7 +374,7 @@ fn task_cells(table: &Table, i: usize, node: &Node, lead: Cell, width: usize) ->
     ]
 }
 
-/// Open tasks whose work is all finished, here and in subtasks: `wt done` them.
+/// Open tasks whose work is all finished, here and in subtasks: `berbr done` them.
 fn finished_tasks(table: &Table, nodes: &[Node], out: &mut Vec<String>) {
     for node in nodes {
         if let Kind::Task(i) = node.kind {

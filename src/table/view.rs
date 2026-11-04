@@ -1,4 +1,4 @@
-//! What is shown and how it nests, for the TUI and `wt status` alike: tasks →
+//! What is shown and how it nests, for the TUI and `berbr status` alike: tasks →
 //! their tickets → MRs no shown worktree holds, then the task's worktrees → the
 //! MR of their branch, agents; then agents of the task working in none of its
 //! worktrees. After the tasks, a `no task` section (tickets I
@@ -129,7 +129,7 @@ pub fn build(table: &Table, options: &Options) -> Vec<Node> {
         let keys: Vec<&str> = row.tickets().map(String::as_str).collect();
         let text = format!(
             "{} #{} {} {} {}",
-            row.task.name,
+            row.task.display_name(),
             row.task.tags.join(" #"),
             keys.join(" "),
             summaries.join(" "),

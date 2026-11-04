@@ -1,0 +1,32 @@
+id = "berbr"
+name = "Berbr"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Tasks, tickets, merge requests, worktrees and agents in one table"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+[[actions]]
+id = "open"
+title = "Open berbr"
+contexts = ["workspace"]
+command = ["./target/release/berbr", "plugin-open"]
+
+[[startup]]
+command = ["sh", "scripts/metadata.sh"]
+
+[[actions]]
+id = "metadata"
+title = "Update sidebar metadata"
+contexts = ["workspace"]
+command = ["sh", "scripts/metadata.sh"]
+
+[[panes]]
+id = "board"
+title = "Berbr"
+placement = "popup"
+width = "90%"
+height = "90%"
+command = ["sh", "scripts/popup.sh"]

@@ -7,6 +7,7 @@ use super::{
 };
 use crate::cli::work;
 use crate::cli::{AddArgs, SelectArgs, StartArgs};
+use crate::client::agent::AgentKind;
 use crate::client::herdr;
 use crate::table::look::clean;
 use ratatui::DefaultTerminal;
@@ -104,6 +105,7 @@ impl App {
             KeyCode::Char('o') => self.open_note_in_obsidian(),
             KeyCode::Char('e') => self.edit_note(terminal),
             KeyCode::Char('s') => self.start(),
+            KeyCode::Char('n') => self.new_agent(),
             KeyCode::Char('c') => {
                 if let Some(target) = self.target() {
                     self.select_work(SelectArgs {
@@ -248,7 +250,7 @@ impl App {
         }
     }
 
-    /// The task name or loose ticket key `wt select` takes for the selection.
+    /// The task name or loose ticket key `berbr select` takes for the selection.
     pub(super) fn target(&self) -> Option<String> {
         match &self.current()?.root {
             Kind::Task(i) => Some(self.table.tasks[*i].task.name.clone()),
@@ -291,8 +293,8 @@ impl App {
         }
     }
 
-    /// ⏎: to the agent of the selection — focus a live one, otherwise `wt select`
-    /// resumes or starts claude there; an MR opens in the browser.
+    /// ⏎: to the agent of the selection — focus a live one, otherwise `berbr select`
+    /// resumes or starts an agent there; an MR opens in the browser.
     pub(super) fn go(&mut self) {
         let Some(row) = self.current() else { return };
         match row.kind.clone() {
@@ -304,7 +306,7 @@ impl App {
                     return;
                 }
                 let Some(target) = self.target() else {
-                    self.say("worktree without a ticket: wt add to attach it");
+                    self.say("worktree without a ticket: berbr add to attach it");
                     return;
                 };
                 self.select_work(SelectArgs {
@@ -320,7 +322,7 @@ impl App {
             }),
             Kind::Header(_) => {}
             Kind::NewTask => self.open_new_task(),
-            // nothing `wt select` can get back to yet: no worktree, no open MR
+            // nothing `berbr select` can get back to yet: no worktree, no open MR
             Kind::Loose(i) if self.table.loose[i].state.is_none() => {
                 let key = self.table.loose[i].key.clone();
                 let summary = self
@@ -346,7 +348,7 @@ impl App {
         }
     }
 
-    /// `wt select`: back to the work, picking in the dialog what it asks.
+    /// `berbr select`: back to the work, picking in the dialog what it asks.
     fn select_work(&mut self, args: SelectArgs) {
         let title = format!("select {}", args.target.as_deref().unwrap_or(""));
         self.run_command(title, Then::Navigate, move |config, ui| {
@@ -354,7 +356,44 @@ impl App {
         });
     }
 
-    /// `wt start <target>`: a task with its worktree tab and agent.
+    pub(super) fn new_agent_args(&self) -> Option<SelectArgs> {
+        let row = self.current()?;
+        if !matches!(
+            row.kind,
+            Kind::Task(_) | Kind::Tree(_) | Kind::Agent(..) | Kind::Ticket(_) | Kind::Loose(_)
+        ) {
+            return None;
+        }
+        let target = match &row.kind {
+            Kind::Ticket(key) => key.clone(),
+            _ => self.target()?,
+        };
+        Some(SelectArgs {
+            target: Some(target),
+            tree: self.tree().map(|t| self.table.tree(t).wt.name()),
+            new_session: true,
+            ..SelectArgs::default()
+        })
+    }
+
+    /// `n`: choose a CLI and open a fresh conversation in the selected worktree.
+    fn new_agent(&mut self) {
+        let Some(args) = self.new_agent_args() else {
+            self.say("n works on a task, ticket or its worktree");
+            return;
+        };
+        self.run_command("new agent".into(), Then::Navigate, move |config, ui| {
+            let kinds = [AgentKind::Codex, AgentKind::Claude];
+            let labels = kinds.iter().map(ToString::to_string).collect::<Vec<_>>();
+            let kind = kinds[ui.pick("New agent", &labels)?];
+            let mut config = config.clone();
+            config.workflow.agent = kind;
+            config.workflow.agent_override = Some(kind);
+            work::select(&config, args, ui)
+        });
+    }
+
+    /// `berbr start <target>`: a task with its worktree tab and agent.
     pub(super) fn start_work(&mut self, target: String) {
         self.run_command(
             format!("start {target}"),
@@ -456,7 +495,7 @@ impl App {
         self.refresh();
     }
 
-    /// `s`: a ticket gets its worktree (`wt start KEY` adds it to its task); on a
+    /// `s`: a ticket gets its worktree (`berbr start KEY` adds it to its task); on a
     /// task, asks which ticket to add.
     fn start(&mut self) {
         let Some(row) = self.current() else { return };

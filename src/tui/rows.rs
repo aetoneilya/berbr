@@ -232,7 +232,7 @@ fn label(table: &Table, kind: &Kind) -> Vec<Span<'static>> {
             let row = &table.tasks[*i];
             let mut pieces = vec![
                 look::state(row.row_state(), false),
-                Piece::new(row.task.name.clone(), Tone::Bold),
+                Piece::new(row.task.display_name(), Tone::Bold),
             ];
             if !row.task.tags.is_empty() {
                 pieces.push(Piece::dim(format!(" #{}", row.task.tags.join(" #"))));

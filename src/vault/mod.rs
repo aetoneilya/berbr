@@ -1,9 +1,10 @@
+pub mod identity;
 pub mod note;
 pub mod task;
 
 use std::fs::{File, OpenOptions};
 
-/// Serialises note writes between concurrent `wt` processes.
+/// Serialises note writes between concurrent `berbr` processes.
 pub fn lock() -> std::io::Result<File> {
     let dir = crate::config::cache_dir();
     std::fs::create_dir_all(&dir)?;

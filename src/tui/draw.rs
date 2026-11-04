@@ -23,7 +23,8 @@ impl App {
         .areas(frame.area());
         self.preview_shown = self.preview.unwrap_or(body.width >= PREVIEW_MIN_WIDTH);
         let [left, right] = if self.preview_shown {
-            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(body)
+            let list_width = ((u32::from(body.width) * 40 / 100) as u16).min(56);
+            Layout::horizontal([Constraint::Length(list_width), Constraint::Min(0)]).areas(body)
         } else {
             Layout::horizontal([Constraint::Percentage(100), Constraint::Length(0)]).areas(body)
         };
@@ -158,7 +159,7 @@ impl App {
                     if !tree.agents.is_empty() {
                         keys.push(("⏎", "agent".into()));
                     } else if self.target().is_some() {
-                        keys.push(("⏎", "resume claude".into()));
+                        keys.push(("⏎", "resume session".into()));
                     }
                     if has_url {
                         keys.push(("b", if tree.mr.is_some() { "MR" } else { "jira" }.into()));
@@ -176,6 +177,9 @@ impl App {
                         keys.push(("d", "done".into()));
                     }
                 }
+            }
+            if self.new_agent_args().is_some() {
+                keys.push(("n", "new agent".into()));
             }
             if self.ide_tree().is_some() {
                 keys.push(("i", "idea".into()));
@@ -317,14 +321,15 @@ impl App {
             "↑↓ j k     move             ← h  fold / to parent        → l  unfold        space  fold",
             "z          fold all / unfold all",
             "↑ at top   project dropdown: ⏎ opens it, ⏎ on \"+ new project\" adds one   Tab ] [  next / previous project",
-            "⏎          agent: focus; worktree: its agent or claude --resume; task: wt select",
+            "⏎          agent: focus; worktree: its agent or a resumed session; task: berbr select",
             "b          ticket / MR in the browser   o  note in Obsidian       e  note in $EDITOR",
             "i          worktree in IntelliJ IDEA ([workflow] ide); on a task: its only worktree",
-            "s          ticket: wt start KEY; task: add a ticket (wt add)",
-            "c          pick a session (wt select --session); ⏎ on \"+ new task\": wt start",
-            "a          ticket without a task: attach it to a task (wt attach)",
+            "s          ticket: berbr start KEY; task: add a ticket (berbr add)",
+            "c          pick a session (berbr select --session); ⏎ on \"+ new task\": berbr start",
+            "n          new agent: choose Codex or Claude, then a fresh session in this worktree",
+            "a          ticket without a task: attach it to a task (berbr attach)",
             "N          add a dated line to the task note",
-            "R          review worktree (wt review)  d  worktree: remove it; task: close it with its Jira tickets",
+            "R          review worktree (berbr review)  d  worktree: remove it; task: close it with its Jira tickets",
             "/          filter, Esc clears           .  all / active only      r  refresh",
             "v          show / hide tickets, MRs, worktrees with agents",
             "mouse      wheel scrolls the list or the details, click selects, again folds",

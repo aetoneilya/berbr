@@ -1,4 +1,4 @@
-//! How table items look, for the TUI and `wt status` alike: glyphs, labels and
+//! How table items look, for the TUI and `berbr status` alike: glyphs, labels and
 //! colors as pieces of text with a tone, which each renderer maps to its own
 //! styles. Where the pieces go stays with the renderers.
 
@@ -107,7 +107,7 @@ pub fn state(state: Option<RowState>, labelled: bool) -> Piece {
     Piece::new(format!("{mark} {label}"), tone)
 }
 
-/// What `wt status` shows as the state of a worktree without a ticket.
+/// What `berbr status` shows as the state of a worktree without a ticket.
 pub fn no_ticket() -> Piece {
     Piece::dim("◌ no ticket")
 }

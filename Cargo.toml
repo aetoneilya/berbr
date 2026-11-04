@@ -1,10 +1,10 @@
 [package]
-name = "worktable"
+name = "berbr"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "wt"
+name = "berbr"
 path = "src/main.rs"
 
 [dependencies]
