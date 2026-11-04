@@ -1531,12 +1531,11 @@ test("filtering expands all matching sections while retaining collapsed choices 
   assert.equal(byId(rendered, "section-needs").nodes.at(-1).attributes.text_color[0], "blocked");
 });
 
-test("Go to space is explicit in task actions and the 20px monitor button stops propagation", () => {
-  const task = {id:"space-task", kind:"task", task:"Demo", space:"live", title:"Demo"};
+test("the 20px monitor button is the only Go to space control and stops propagation", () => {
+  const task = {id:"space-task", kind:"task", task:"Demo", space:"live", title:"Demo", note:"/notes/demo.md"};
   const {view, cx, jobs} = setup({data:{rows:[task]}, liveSpaces:[{id:"live"}]});
-  const action = view.detailItems(task).find(item => item.id === `${task.id}/action/open`);
-  assert.equal(action.label, "Go to space");
-  assert.equal(view.detailItems(task).some(item => item.label === "Open"), false);
+  const actions = view.detailItems(task).filter(item => item.type === "action").map(item => item.label);
+  assert.deepEqual(actions, ["Note", "Close task"]);
   const control = byId(view.render(cx), `task-space-${task.id}`);
   assert.equal(control.attributes.size[0], 20);
   assert.equal(control.attributes.tooltip[0], "Go to space");
@@ -1548,11 +1547,10 @@ test("Go to space is explicit in task actions and the 20px monitor button stops 
   assert.equal(stopped, 1);
   assert.equal(view.expanded, null);
   assert.equal(jobs.length, 0);
-  action.action(cx);
-  assert.deepEqual(state.calls, [["space.select", {id:"live"}], ["space.select", {id:"live"}]]);
+  assert.deepEqual(state.calls, [["space.select", {id:"live"}]]);
   view.busy = true;
   click(byId(view.render(cx), `task-space-${task.id}`), cx);
-  assert.equal(state.calls.length, 2);
+  assert.equal(state.calls.length, 1);
   view.busy = false; state.spaces = [];
   assert.equal(byId(view.render(cx), `task-space-${task.id}`), undefined);
 });

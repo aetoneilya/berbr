@@ -520,9 +520,7 @@ export default class Berbr extends View {
           (cx, id) => key === "history" ? this.openUrl(row.url, cx, id) : this.openNote(row));
       }
     }
-    if (this.liveState().spaces.some(space => space.id === task.space))
-      add("action", "open", {label:"Go to space"}, () => run("space.select", {id:task.space}));
-    else if (!detail.trees.length)
+    if (!detail.trees.length && !this.liveState().spaces.some(space => space.id === task.space))
       add("action", "start", {label:"Start work", accent:true}, (cx, id) => this.open(task, cx, id));
     if (task.note) add("action", "note", {label:"Note"}, () => this.openNote(task));
     if (!task.done) add("action", "close", {label:"Close task", close:true}, () => this.formOverlay("done", {
