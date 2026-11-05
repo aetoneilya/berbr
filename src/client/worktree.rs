@@ -114,6 +114,51 @@ pub fn changed_files(path: &Path) -> Result<usize> {
     Ok(output.lines().filter(|l| !l.is_empty()).count())
 }
 
+#[derive(Debug, Default, serde::Serialize)]
+pub struct Diff {
+    pub adds: usize,
+    pub dels: usize,
+    pub files: usize,
+}
+
+/// Resolve once per repository; no fetch or remote lookup.
+pub fn default_branch(path: &Path, main_branch: Option<&str>) -> Option<String> {
+    git_output(path, &["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .ok()
+        .or_else(|| main_branch.map(|b| format!("refs/heads/{b}")))
+}
+
+/// Branch changes through the working tree, including the index. Untracked
+/// files are excluded, as with `git diff <merge-base>`.
+pub fn diff(path: &Path, default: &str) -> Result<Diff> {
+    let base = git_output(path, &["merge-base", "HEAD", default])?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["diff", "--shortstat", "--no-ext-diff", &base, "--"])
+        .env("LC_ALL", "C")
+        .output()?;
+    if !output.status.success() {
+        return Err(GitError::NonZeroExit(
+            String::from_utf8_lossy(&output.stderr).trim().into(),
+        ));
+    }
+    let mut diff = Diff::default();
+    for part in String::from_utf8_lossy(&output.stdout).trim().split(',') {
+        let mut words = part.split_whitespace();
+        let Some(count) = words.next().and_then(|s| s.parse().ok()) else {
+            continue;
+        };
+        match words.next() {
+            Some("file" | "files") => diff.files = count,
+            Some("insertion(+)" | "insertions(+)") => diff.adds = count,
+            Some("deletion(-)" | "deletions(-)") => diff.dels = count,
+            _ => {}
+        }
+    }
+    Ok(diff)
+}
+
 /// `git status --short`: one line per changed file.
 pub fn short_status(path: &Path) -> Result<String> {
     git_stdout(path, &["status", "--short"])
@@ -264,6 +309,12 @@ pub fn create_worktree(main: &Path, name: &str, branch: &str) -> Result<PathBuf>
     if dir.exists() {
         return Ok(dir);
     }
+    create_new_worktree(main, name, branch)
+}
+
+/// Unlike resume, add must fail if another caller already created this path.
+pub fn create_new_worktree(main: &Path, name: &str, branch: &str) -> Result<PathBuf> {
+    let dir = worktree_dir(main, name);
     let plan = plan_worktree(main, name, branch)?;
     // a failed fetch leaves the worktree on the remote branch as last fetched
     if let Some(remote_branch) = &plan.fetch {

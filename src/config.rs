@@ -72,6 +72,8 @@ pub struct VaultConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RepoConfig {
     pub path: PathBuf,
+    /// Local default branch for diffs when origin/HEAD is unavailable.
+    pub main_branch: Option<String>,
     /// Where its merge requests are; none without GitLab.
     pub gitlab_project: Option<String>,
 }
@@ -288,7 +290,16 @@ pub fn project_of(projects: &[Config], dir: &Path) -> Option<usize> {
 /// berbr's own cache: last Jira and GitLab answers, the session index, the
 /// notes lock, `berbr prepare` specs.
 pub fn cache_dir() -> PathBuf {
-    cache_path(&dirs::cache_dir().unwrap_or_else(std::env::temp_dir))
+    // Unit tests must not use the person's cache or share its note-write lock.
+    #[cfg(test)]
+    let base = {
+        static CACHE: std::sync::LazyLock<PathBuf> =
+            std::sync::LazyLock::new(crate::table::fixtures::temp_dir);
+        CACHE.clone()
+    };
+    #[cfg(not(test))]
+    let base = dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
+    cache_path(&base)
 }
 
 fn cache_path(base: &Path) -> PathBuf {

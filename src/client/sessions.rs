@@ -366,8 +366,7 @@ mod tests {
 
     #[test]
     fn forgets_deleted_transcripts() {
-        let dir = std::env::temp_dir().join(format!("berbr-sessions-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::table::fixtures::temp_dir();
         let kept = dir.join("kept.jsonl");
         std::fs::write(&kept, r#"{"cwd":"/a","timestamp":"2026-10-08T10:00:00Z"}"#).unwrap();
         let mut cache = Cache::default();
@@ -391,8 +390,7 @@ mod tests {
 
     #[test]
     fn codex_metadata_and_turn_contexts_are_parsed_without_tool_output() {
-        let dir = std::env::temp_dir().join(format!("wt-codex-parse-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::table::fixtures::temp_dir();
         let file = dir.join("rollout-fixture.jsonl");
         let records = [
             serde_json::json!({"type": "session_meta", "timestamp": "2026-10-29T10:00:00Z",

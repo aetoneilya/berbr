@@ -406,19 +406,25 @@ fn fetch_mrs(
 /// Linked worktrees of every configured repo; git status and the unpushed count
 /// take ~0.5s per worktree in a big repo, so they run in parallel.
 fn collect_trees(config: &Config, with_status: bool) -> Vec<Tree> {
-    let mut found: Vec<(PathBuf, Option<String>, Worktree)> = Vec::new();
+    let mut found = Vec::new();
     for repo in &config.repos {
         let Ok(main) = worktree::main_checkout(&repo.path) else {
             continue;
         };
+        let default = worktree::default_branch(&main, repo.main_branch.as_deref());
         for wt in worktree::linked_worktrees(&main).unwrap_or_default() {
-            found.push((main.clone(), repo.gitlab_project.clone(), wt));
+            found.push((
+                main.clone(),
+                repo.gitlab_project.clone(),
+                wt,
+                default.clone(),
+            ));
         }
     }
 
     // a worktree whose inspection panicked is left out
-    parallel(&found, GIT_RUNS, |(repo, project, wt)| {
-        let mut tree = inspect_tree(repo.clone(), wt.clone(), with_status);
+    parallel(&found, GIT_RUNS, |(repo, project, wt, default)| {
+        let mut tree = inspect_tree(repo.clone(), wt.clone(), with_status, default.as_deref());
         tree.project = project.clone();
         tree
     })
@@ -428,39 +434,53 @@ fn collect_trees(config: &Config, with_status: bool) -> Vec<Tree> {
 }
 
 /// `git status` is the slow part; offline callers skip it.
-fn inspect_tree(repo: PathBuf, wt: Worktree, with_status: bool) -> Tree {
-    let changes = with_status
-        .then(|| worktree::changed_files(&wt.path).ok())
-        .flatten();
-    let unpushed = with_status
-        .then(|| {
-            wt.branch
-                .as_deref()
-                .and_then(|b| worktree::unpushed_commits(&wt.path, b).ok())
-        })
-        .flatten();
-    // only `branch_finished` needs it, and only with unpushed commits
-    let head = match (unpushed, wt.branch.as_deref()) {
-        (Some(n), Some(branch)) if n > 0 => worktree::branch_head(&wt.path, branch).ok(),
-        _ => None,
-    };
-    let keys = wt.branch.as_deref().map(ticket_keys).unwrap_or_default();
-    let last_commit = with_status
-        .then(|| worktree::last_commit_time(&wt.path).ok())
-        .flatten();
-    Tree {
-        repo,
-        project: None,
-        wt,
-        keys,
-        changes,
-        unpushed,
-        head,
-        agents: Vec::new(),
-        mr: None,
-        finished: false,
-        last_commit,
-    }
+fn inspect_tree(repo: PathBuf, wt: Worktree, with_status: bool, default: Option<&str>) -> Tree {
+    // The diff runs alongside status, also for cached app snapshots: only
+    // remote data is cached, the working tree is always local and current.
+    std::thread::scope(|scope| {
+        let path = wt.path.clone();
+        let attached = wt.branch.is_some();
+        let diff = scope.spawn(move || {
+            if !attached {
+                return None;
+            }
+            worktree::diff(&path, default?).ok()
+        });
+        let changes = with_status
+            .then(|| worktree::changed_files(&wt.path).ok())
+            .flatten();
+        let unpushed = with_status
+            .then(|| {
+                wt.branch
+                    .as_deref()
+                    .and_then(|b| worktree::unpushed_commits(&wt.path, b).ok())
+            })
+            .flatten();
+        // only `branch_finished` needs it, and only with unpushed commits
+        let head = match (unpushed, wt.branch.as_deref()) {
+            (Some(n), Some(branch)) if n > 0 => worktree::branch_head(&wt.path, branch).ok(),
+            _ => None,
+        };
+        let keys = wt.branch.as_deref().map(ticket_keys).unwrap_or_default();
+        let last_commit = with_status
+            .then(|| worktree::last_commit_time(&wt.path).ok())
+            .flatten();
+        let diff = diff.join().unwrap_or_default();
+        Tree {
+            repo,
+            project: None,
+            wt,
+            keys,
+            changes,
+            diff,
+            unpushed,
+            head,
+            agents: Vec::new(),
+            mr: None,
+            finished: false,
+            last_commit,
+        }
+    })
 }
 
 fn live_herdr() -> (Vec<herdr::Agent>, Vec<herdr::Workspace>) {

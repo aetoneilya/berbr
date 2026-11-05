@@ -17,14 +17,22 @@ pub const ROOT: &str = "/r/.claude/worktrees";
 /// A fresh empty directory for one test's notes.
 pub fn temp_dir() -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "berbr-test-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    loop {
+        let dir = std::env::temp_dir().join(format!(
+            "berbr-test-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return dir,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("{}: {e}", dir.display()),
+        }
+    }
 }
 
 /// A task note with `frontmatter` (YAML lines), created at `created`.
@@ -80,6 +88,7 @@ pub fn tree(name: &str, branch: &str) -> Tree {
         },
         keys: ticket_keys(branch),
         changes: Some(0),
+        diff: None,
         unpushed: Some(0),
         head: None,
         agents: Vec::new(),

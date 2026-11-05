@@ -181,6 +181,7 @@ pub struct Tree {
     pub wt: Worktree,
     pub keys: Vec<String>,
     pub changes: Option<usize>,
+    pub diff: Option<crate::client::worktree::Diff>,
     pub unpushed: Option<usize>,
     /// The branch's head commit; read only when commits are unpushed.
     pub head: Option<String>,

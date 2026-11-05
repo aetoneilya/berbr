@@ -147,6 +147,32 @@ pub(super) fn open_work(
     Ok(())
 }
 
+/// Add waits for Git and the launch request, so a failed checkout is reported
+/// to the calling agent rather than hidden in a new terminal.
+pub(super) fn open_added_work(
+    task: &Task,
+    dir: &Path,
+    name: &str,
+    brief: String,
+    open: Open,
+    ui: &mut dyn Ui,
+) -> Result<(), String> {
+    let brief = write_brief(dir, &brief)?;
+    let prompt = agent_prompt(Some(&task.note.path), &brief, open.description.as_deref());
+    let (tab, pane) = open_tab(&task.name, dir, name)?;
+    let agent = free_agent_name(name);
+    let args: Vec<&str> = prompt.as_deref().into_iter().collect();
+    herdr::start_agent(open.kind, &agent, &pane, &args).map_err(err)?;
+    if open.focus {
+        herdr::focus_tab(&tab).map_err(err)?;
+    }
+    ui.say(format!(
+        "worktree: {}; tab: {tab}; terminal: {pane}; agent: {agent}",
+        dir.display()
+    ));
+    Ok(())
+}
+
 /// `berbr prepare <spec>`, run by `open_work` in the new tab: creates the worktree
 /// with progress on screen, writes the brief and the first prompt; the tab's
 /// shell then cds into the worktree and starts the agent.

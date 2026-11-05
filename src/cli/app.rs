@@ -32,7 +32,7 @@ pub(super) fn snapshot(projects: &[Config], chosen: usize, cached: bool) -> Resu
     println!(
         "{}",
         json!({
-            "version": 2, "project": config.name,
+            "version": 3, "project": config.name,
             "projects": projects.iter().map(|c| json!({"name":c.name,"cwd":c.repos.first().map(|r|&r.path),"agent":c.workflow.agent})).collect::<Vec<_>>(),
             "rows": rows, "warnings": table.warnings,
             "sources": {"jira":format!("{:?}",table.jira.fresh),"gitlab":format!("{:?}",table.gitlab.fresh)}
@@ -71,6 +71,26 @@ fn row(table: &Table, node: &Node, owner: Option<&str>) -> Value {
                     .map(|p| p.text.as_str())
                     .collect::<String>()
             );
+            if m.opened() {
+                let review = m.review.as_ref();
+                let ci = review.and_then(|r| r.pipeline.as_deref());
+                let unresolved = review.map_or(0, |r| r.unresolved);
+                let conflict =
+                    m.mr.has_conflicts || m.mr.detailed_merge_status.as_deref() == Some("conflict");
+                value["ci"] = json!(ci);
+                value["approvals"] = json!(review.map_or(0, |r| r.approved_by.len()));
+                value["unresolved"] = json!(unresolved);
+                value["draft"] = json!(m.mr.draft);
+                value["merge_status"] = json!(m.mr.detailed_merge_status);
+                value["conflict"] = json!(conflict);
+                value["ready"] = json!(
+                    !m.mr.draft
+                        && ci == Some("success")
+                        && !conflict
+                        && unresolved == 0
+                        && m.mr.detailed_merge_status.as_deref() == Some("mergeable")
+                );
+            }
         }
         Kind::Tree(i) => {
             let t = table.tree(*i);
@@ -79,6 +99,7 @@ fn row(table: &Table, node: &Node, owner: Option<&str>) -> Value {
             value["tree"] = json!(t.wt.name());
             value["cwd"] = json!(t.wt.path);
             value["branch"] = json!(t.wt.branch);
+            value["diff"] = json!(t.diff);
             value["merged"] = json!(
                 t.finished
                     || t.mr
@@ -133,7 +154,104 @@ fn ticket(table: &Table, value: &mut Value, key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::gitlab::MrReview;
     use crate::table::fixtures::{mr, table, task, tree};
+
+    #[test]
+    fn snapshot_review_fields_and_each_readiness_blocker() {
+        let node = Node {
+            id: "mr:1".into(),
+            kind: Kind::Mr(0),
+            children: vec![],
+        };
+        for state in ["opened", "merged", "closed"] {
+            for ci in [
+                None,
+                Some("success"),
+                Some("running"),
+                Some("pending"),
+                Some("failed"),
+                Some("canceled"),
+                Some("skipped"),
+                Some("manual"),
+                Some("created"),
+            ] {
+                for status in [
+                    None,
+                    Some("mergeable"),
+                    Some("conflict"),
+                    Some("ci_still_running"),
+                    Some("ci_must_pass"),
+                    Some("discussions_not_resolved"),
+                    Some("not_approved"),
+                    Some("need_rebase"),
+                    Some("draft_status"),
+                ] {
+                    for (draft, has_conflicts, unresolved) in [
+                        (false, false, 0),
+                        (true, false, 0),
+                        (false, true, 0),
+                        (false, false, 2),
+                    ] {
+                        let mut m = mr(1, "TEST-1-work", "work", state);
+                        m.mr.draft = draft;
+                        m.mr.has_conflicts = has_conflicts;
+                        m.mr.detailed_merge_status = status.map(str::to_string);
+                        m.review = Some(MrReview {
+                            pipeline: ci.map(str::to_string),
+                            approved_by: vec!["reviewer-a".into(), "reviewer-b".into()],
+                            unresolved,
+                        });
+                        let table = table(vec![], vec![], vec![m], vec![]);
+                        let value = row(&table, &node, None);
+                        assert!(value["body"].is_string());
+                        if state != "opened" {
+                            for field in [
+                                "ci",
+                                "approvals",
+                                "unresolved",
+                                "draft",
+                                "merge_status",
+                                "conflict",
+                                "ready",
+                            ] {
+                                assert!(value[field].is_null(), "{field}: {value}");
+                            }
+                            continue;
+                        }
+                        assert_eq!(value["ci"], json!(ci));
+                        assert_eq!(value["approvals"], 2);
+                        assert_eq!(value["unresolved"], unresolved);
+                        assert_eq!(value["draft"], draft);
+                        assert_eq!(value["merge_status"], json!(status));
+                        assert_eq!(
+                            value["conflict"],
+                            has_conflicts || status == Some("conflict")
+                        );
+                        assert_eq!(
+                            value["ready"],
+                            !draft
+                                && !has_conflicts
+                                && unresolved == 0
+                                && ci == Some("success")
+                                && status == Some("mergeable")
+                        );
+                    }
+                }
+            }
+        }
+        let table = table(
+            vec![],
+            vec![],
+            vec![mr(1, "work", "work", "opened")],
+            vec![],
+        );
+        let value = row(&table, &node, None);
+        assert_eq!(value["ci"], Value::Null);
+        assert_eq!(value["approvals"], 0);
+        assert_eq!(value["unresolved"], 0);
+        assert_eq!(value["ready"], false);
+    }
 
     #[test]
     fn snapshot_tree_exposes_terminal_mr_and_merge_state() {

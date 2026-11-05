@@ -216,6 +216,8 @@ pub struct MergeRequest {
     #[serde(default)]
     pub draft: bool,
     #[serde(default)]
+    pub has_conflicts: bool,
+    #[serde(default)]
     pub created_at: Option<String>,
     #[serde(default)]
     pub updated_at: Option<String>,

@@ -275,6 +275,9 @@ pub(super) fn resolve_task(
     if let Some(i) = current_task(&table) {
         return Ok(table.tasks.swap_remove(i).task);
     }
+    if !ui.can_ask() {
+        return Err("no task here; pass its ID explicitly: berbr add <task> <KEY>".into());
+    }
     let open: Vec<usize> = (0..table.tasks.len())
         .filter(|&i| !table.tasks[i].task.done)
         .collect();

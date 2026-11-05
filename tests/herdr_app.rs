@@ -1,4 +1,5 @@
 #![cfg(unix)]
+mod common;
 use serde_json::Value;
 use std::{
     fs,
@@ -11,15 +12,30 @@ struct Fixture {
     root: PathBuf,
 }
 impl Fixture {
+    fn git(&self, path: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "berbr-app-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = common::temp_dir("berbr-app");
         for path in ["bin", "vault/tasks", "repo", "home"] {
             fs::create_dir_all(root.join(path)).unwrap();
         }
@@ -139,11 +155,258 @@ fn native_snapshot_preserves_notes_and_never_queries_remote_machines() {
             .output()
             .unwrap(),
     );
-    assert_eq!(data["version"], 2);
+    assert_eq!(data["version"], 3);
     assert!(data.to_string().contains("задача"));
     assert_eq!(fs::read(path).unwrap(), before);
     assert!(f.calls().iter().any(|c| c[0] == "hc" && c[1][0] == "get"));
     assert!(!f.calls().iter().any(|c| c.to_string().contains("prod/")));
+}
+
+fn find_tree(value: &Value) -> &Value {
+    if value.get("kind").is_some_and(|kind| kind == "tree") {
+        return value;
+    }
+    value
+        .as_array()
+        .or_else(|| value["children"].as_array())
+        .into_iter()
+        .flatten()
+        .find_map(|child| {
+            let tree = find_tree(child);
+            (!tree.is_null()).then_some(tree)
+        })
+        .unwrap_or(&Value::Null)
+}
+
+#[test]
+fn snapshot_diff_uses_merge_base_and_includes_committed_staged_and_unstaged_changes() {
+    let f = Fixture::new();
+    let repo = f.root.join("repo");
+    f.git(&repo, &["branch", "-M", "main"]);
+    fs::write(repo.join("file"), "one\ntwo\n").unwrap();
+    f.git(&repo, &["add", "file"]);
+    f.git(&repo, &["commit", "-qm", "base"]);
+    let tree = repo.join(".claude/worktrees/work");
+    f.git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "TEST-1-work",
+            tree.to_str().unwrap(),
+        ],
+    );
+    fs::write(
+        f.root.join("vault/tasks/test-0.md"),
+        "---\nid: test-0\ntickets: [TEST-1]\n---\n",
+    )
+    .unwrap();
+    let snapshot = || {
+        success(
+            f.command()
+                .args(["app-snapshot", "--cached"])
+                .output()
+                .unwrap(),
+        )
+    };
+    let data = snapshot();
+    assert_eq!(find_tree(&data["rows"][0])["diff"], Value::Null);
+    // The configured local fallback works without origin/HEAD.
+    let config = f.root.join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "{}\nmain_branch = \"main\"\n",
+            fs::read_to_string(&config).unwrap()
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        find_tree(&snapshot()["rows"][0])["diff"],
+        serde_json::json!({"adds":0,"dels":0,"files":0})
+    );
+    fs::write(tree.join("file"), "one\ntwo\nthree\n").unwrap();
+    fs::write(tree.join("committed"), "commit\n").unwrap();
+    f.git(&tree, &["add", "file", "committed"]);
+    f.git(&tree, &["commit", "-qm", "branch work"]);
+    fs::write(tree.join("staged"), "stage\n").unwrap();
+    f.git(&tree, &["add", "staged"]);
+    fs::write(tree.join("file"), "two\nthree\n").unwrap();
+    fs::write(repo.join("upstream"), "upstream\n").unwrap();
+    f.git(&repo, &["add", "upstream"]);
+    f.git(&repo, &["commit", "-qm", "default advanced"]);
+    f.git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    f.git(
+        &repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    // origin/HEAD takes precedence over an invalid configured fallback.
+    fs::write(
+        &config,
+        fs::read_to_string(&config)
+            .unwrap()
+            .replace("main_branch = \"main\"", "main_branch = \"missing\""),
+    )
+    .unwrap();
+    assert_eq!(
+        find_tree(&snapshot()["rows"][0])["diff"],
+        serde_json::json!({"adds":3,"dels":1,"files":3})
+    );
+    f.git(&tree, &["checkout", "--detach"]);
+    let data = snapshot();
+    let detached = find_tree(&data["rows"]);
+    assert_eq!(detached["kind"], "tree");
+    assert_eq!(detached["diff"], Value::Null);
+}
+
+#[test]
+fn add_existing_key_creates_named_worktree_without_prompts_or_focus() {
+    for kind in ["codex", "claude"] {
+        let f = Fixture::new();
+        let repo = f.root.join("repo");
+        let caller = repo.join(".claude/worktrees/caller");
+        f.git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "TEST-1-caller",
+                caller.to_str().unwrap(),
+            ],
+        );
+        let note = f.root.join("vault/tasks/test-0.md");
+        fs::write(
+            &note,
+            "---\nid: test-0\ntickets: [TEST-1]\n---\nKeep context\n",
+        )
+        .unwrap();
+        let before = fs::read(&note).unwrap();
+        let out = f
+            .command()
+            .current_dir(&caller)
+            .env_remove("HERDR_WORKSPACE_ID")
+            .args([
+                "add",
+                "TEST-1",
+                "--name",
+                "followup",
+                "--description",
+                "Do the followup",
+                "--agent",
+                kind,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let tree = repo.join(".claude/worktrees/followup");
+        assert!(tree.is_dir());
+        assert_eq!(
+            f.git(&tree, &["branch", "--show-current"]),
+            "TEST-1-followup"
+        );
+        let output = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.contains(tree.to_str().unwrap()));
+        assert!(output.contains("tab: tb-created; terminal: t7"));
+        assert_eq!(fs::read(&note).unwrap(), before);
+        let calls = f.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c[1][1] == "tab.new" && c[1][2].as_str().unwrap().contains("sp-local"))
+        );
+        assert!(
+            !calls.iter().any(
+                |c| c[1][1] == "tab.select" && c[1][2].as_str().unwrap().contains("tb-created")
+            )
+        );
+        let send = calls
+            .iter()
+            .find(|c| c[0] == "hc" && c[1][0] == "send")
+            .unwrap();
+        assert!(send[1][2].as_str().unwrap().contains(kind));
+        assert!(
+            send[1][2]
+                .as_str()
+                .unwrap()
+                .contains("work on the task description")
+        );
+        let error = f
+            .command()
+            .args(["add", "test-0", "TEST-1"])
+            .output()
+            .unwrap();
+        assert!(!error.status.success());
+        assert!(error.stdout.is_empty());
+        let error = String::from_utf8(error.stderr).unwrap();
+        assert_eq!(error.lines().count(), 1);
+        assert!(error.contains("--name") && error.contains("--in"));
+        let reuse = f
+            .command()
+            .args(["add", "test-0", "TEST-1", "--in", "followup"])
+            .output()
+            .unwrap();
+        assert!(
+            reuse.status.success(),
+            "{}",
+            String::from_utf8_lossy(&reuse.stderr)
+        );
+        // Missing current context must return an error instead of opening a picker.
+        let error = f
+            .command()
+            .env_remove("HERDR_WORKSPACE_ID")
+            .args(["add", "TEST-1", "--name", "another"])
+            .output()
+            .unwrap();
+        assert!(!error.status.success());
+        assert!(String::from_utf8_lossy(&error.stderr).contains("pass its ID explicitly"));
+    }
+}
+
+#[test]
+fn add_reports_checkout_and_launch_failures_to_the_caller() {
+    let f = Fixture::new();
+    let note = f.root.join("vault/tasks/test-0.md");
+    fs::write(&note, "---\nid: test-0\ntickets: [TEST-1]\n---\n").unwrap();
+    f.git(&f.root.join("repo"), &["branch", "TEST-1-collision"]);
+    // This branch is already checked out elsewhere, so checkout must fail here.
+    let other = f.root.join("elsewhere");
+    f.git(
+        &f.root.join("repo"),
+        &[
+            "worktree",
+            "add",
+            other.to_str().unwrap(),
+            "TEST-1-collision",
+        ],
+    );
+    let out = f
+        .command()
+        .args(["add", "test-0", "TEST-1", "--name", "collision"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert_eq!(String::from_utf8_lossy(&out.stderr).lines().count(), 1);
+    let out = f
+        .command()
+        .env("BERBR_TEST_BUSY", "1")
+        .args(["add", "test-0", "TEST-1", "--name", "busy"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not an available shell"));
 }
 
 #[test]

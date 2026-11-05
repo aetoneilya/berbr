@@ -55,7 +55,9 @@ enum CliCommands {
     /// and a worktree tab with the selected agent briefed from the note and the first ticket.
     /// `berbr start DEMO-123`: the same, the task named after the ticket's summary
     Start(StartArgs),
-    /// Add a ticket to a task, with its own worktree tab in the task's workspace
+    /// Open a worktree tab and a new agent in the task's Herdr space. Use --name
+    /// for another branch of a ticket already in the task. Without a TTY, never
+    /// prompts or focuses the new tab; success prints its path, tab and terminal.
     Add(AddArgs),
     /// Put a ticket into a task without starting work on it (no worktree)
     Attach {
@@ -68,7 +70,8 @@ enum CliCommands {
     /// (internal) Run in a new tab by start/add: create the worktree, then the agent
     #[command(hide = true)]
     Prepare { spec: PathBuf },
-    /// (for agents) Append a finding to the task note's "Agent notes"
+    /// Append a dated finding to the task note's "Agent notes". Resolves the
+    /// current worktree/space or --task; never prompts. Prints the task ID.
     Note {
         /// Explicit task ID or title; defaults to the current worktree/workspace
         #[arg(long)]
@@ -76,7 +79,9 @@ enum CliCommands {
         #[arg(trailing_var_arg = true, required = true)]
         text: Vec<String>,
     },
-    /// Read or update the current task's title and description (for agents)
+    /// Show or update task context as JSON (id, title, description, note, done).
+    /// Defaults to the current worktree/space; pass an ID/title otherwise.
+    /// Never prompts. Updates preserve other note fields and Agent notes.
     Task {
         #[command(subcommand)]
         command: TaskCommand,
@@ -163,19 +168,22 @@ pub(crate) enum TaskCommand {
 
 #[derive(Args, Debug, Default)]
 pub(crate) struct AddArgs {
-    /// [<task>] <KEY>; the task defaults to the current one
+    /// [<task ID or title>] <KEY>; defaults to the current worktree/space's task
     #[arg(num_args = 1..=2, required = true)]
     pub(crate) args: Vec<String>,
     /// Run the agent in this existing worktree of the task (stacked MRs)
-    #[arg(long = "in")]
+    #[arg(long = "in", conflicts_with = "name")]
     pub(crate) in_tree: Option<String>,
+    /// New worktree, branch suffix, tab and agent name; required for an existing key
     #[arg(long, short = 'n')]
     pub(crate) name: Option<String>,
+    /// Context to include in the brief (without --description the agent waits)
     #[arg(long, short = 'm')]
     pub(crate) message: Option<String>,
     /// A description for the agent to work on immediately
     #[arg(long)]
     pub(crate) description: Option<String>,
+    /// Keep the caller's focus; automatic when stdin is not a TTY
     #[arg(long)]
     pub(crate) bg: bool,
 }

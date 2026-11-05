@@ -5,7 +5,7 @@ use super::common::{
     Terminal, Ui, branch_name, choose_repo, err, fetch_issue, find_task, is_ticket_key, list,
     name_from_issue, resolve_task,
 };
-use super::launch::{Context, Open, launch, open_work};
+use super::launch::{Context, Open, launch, open_added_work, open_work};
 use crate::cli::{AddArgs, StartArgs, load};
 use crate::client::jira::JiraIssue;
 use crate::client::worktree;
@@ -235,7 +235,7 @@ fn create_ticket(config: &Config, title: &str) -> Result<String, String> {
 /// `berbr add [<task>] <KEY>`: the ticket joins the task and gets a tab in the
 /// task's herdr workspace, in a new worktree or `--in` one the task has.
 pub(in crate::cli) fn cli_add(config: &Config, args: AddArgs) -> Result<(), String> {
-    add(config, args, &mut Terminal)
+    add(config, args, &mut Terminal).map_err(|e| e.lines().collect::<Vec<_>>().join(" "))
 }
 
 pub(crate) fn add(config: &Config, args: AddArgs, ui: &mut dyn Ui) -> Result<(), String> {
@@ -267,21 +267,23 @@ fn add_with(
         ));
     }
     let mut task = resolve_task(config, tasks, task_arg.as_deref(), ui)?;
-
-    if !task.tickets.contains(&key) {
-        let _lock = crate::vault::lock().map_err(err)?;
-        task.tickets.push(key.clone());
-        task.note.set("tickets", list(&task.tickets));
-        task.note.save().map_err(err)?;
-        ui.say(format!("{key} added to \"{}\"", task.name));
+    if task.tickets.contains(&key) && name.is_none() && in_tree.is_none() {
+        return Err(format!(
+            "{key} is already in task \"{}\"; pass --name <name> for a new worktree or --in <tree> for an existing one",
+            task.name
+        ));
     }
-
-    let issue = fetch_issue(config, &key)?;
+    let issue = config
+        .jira
+        .as_ref()
+        .map(|_| fetch_issue(config, &key))
+        .transpose()?;
     let main = match &in_tree {
         Some(existing) => super::common::repo_with_worktree(config, existing)
             .ok_or_else(|| format!("no worktree {existing}"))?,
         None => choose_repo(config, ui)?,
     };
+    let existing = in_tree.is_some();
     let (tree, branch, wt_name) = match in_tree {
         Some(existing) => {
             let dir = worktree::worktree_dir(&main, &existing);
@@ -292,26 +294,60 @@ fn add_with(
             (dir, branch, existing)
         }
         None => {
-            let wt_name = name.unwrap_or_else(|| name_from_issue(&issue));
+            let wt_name = name
+                .or_else(|| issue.as_ref().map(name_from_issue))
+                .ok_or("pass --name <name> when Jira is not configured")?;
+            if wt_name.is_empty()
+                || wt_name == "."
+                || wt_name == ".."
+                || wt_name
+                    .chars()
+                    .any(|c| c == '/' || c == '\\' || c.is_control())
+            {
+                return Err("--name must be a single non-empty directory name".into());
+            }
             let branch = branch_name(config, Some(&key), &wt_name);
-            (worktree::worktree_dir(&main, &wt_name), branch, wt_name)
+            let tree = worktree::worktree_dir(&main, &wt_name);
+            if tree.exists() {
+                return Err(format!(
+                    "worktree {} already exists; pass --in {wt_name} or another --name",
+                    tree.display()
+                ));
+            }
+            (tree, branch, wt_name)
         }
     };
+    if !crate::client::herdr::available() {
+        return Err("berbr add needs Herdr to open the worktree tab and agent".into());
+    }
+    if !existing {
+        worktree::create_new_worktree(&main, &wt_name, &branch).map_err(err)?;
+    }
+    if !task.tickets.contains(&key) {
+        let _lock = crate::vault::lock().map_err(err)?;
+        task.note.reload().map_err(err)?;
+        task = Task::from_note(task.note);
+        if !task.tickets.contains(&key) {
+            task.tickets.push(key.clone());
+            task.note.set("tickets", list(&task.tickets));
+            task.note.save().map_err(err)?;
+        }
+    }
     let brief = brief_text(
         &tree,
         &branch,
         Some(&task),
-        Some(&issue),
+        issue.as_ref(),
         &task.tickets,
         description.as_deref().or(message.as_deref()),
     );
     let open = Open {
         kind: config.workflow.agent,
         agent: true,
-        focus: !bg,
+        focus: !bg && ui.can_ask(),
         description,
     };
-    open_work(&task, &main, &wt_name, &branch, brief, open, ui)
+    open_added_work(&task, &tree, &wt_name, brief, open, ui)
 }
 
 /// My open Jira tickets that belong to no task, plus "new task…".

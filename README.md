@@ -124,7 +124,31 @@ command = "zsh -ic 'BERBR_POPUP=1 exec berbr'"
 The desktop version has a native task list in the right panel, alongside Files
 and Changes. See [Herdr App installation and behavior](herdr-app/README.md).
 
-`berbr app-snapshot [--cached]` emits snapshot version 2, retaining all v1 fields.
-Worktree rows add `merged` and `mr_state`, with the known MR as a child even when
+`berbr app-snapshot [--cached]` emits snapshot version 3, retaining all v1/v2 fields.
+Worktree rows retain `merged` and `mr_state`, with the known MR as a child even when
 merged or closed. Task subtrees include done work; loose sections follow the
 TUI's active-only rules. `--cached` uses the last remote data without network.
+
+Open MR rows, at every nesting level, add `ci` (head pipeline status or null),
+`approvals` (approver count), `unresolved` (discussion count), `draft`,
+`merge_status` (GitLab's detailed status or null), `conflict` and `ready`.
+`ready` requires successful CI, no draft/conflict/unresolved discussions and
+`merge_status == "mergeable"`. Missing review data gives null CI and zero counts,
+so readiness stays false. Merged/closed MRs omit these fields; `body` is retained.
+
+Each tree adds `diff: {adds, dels, files}` relative to its merge-base with
+`origin/HEAD`, or `main_branch = "main"` in `[[project.repo]]` when origin/HEAD is
+unavailable. It includes committed, staged and unstaged tracked changes, using
+local Git only, even with `--cached`. Zero changes gives zero counts; detached
+trees, missing defaults and Git errors give null.
+
+Agents can run `berbr add [<task>] TEST-1 --name followup --agent codex
+--description "Implement the followup"` to open another branch and agent in the
+task's Herdr space. The task defaults to the current worktree/space. An existing
+ticket requires `--name` for a new worktree or `--in <tree>` to reuse one; an
+existing path requires `--in`. Without Jira, supply `--name` or `--in`.
+Without a TTY, `add` never prompts and automatically behaves like `--bg`, keeping
+the caller's focus. It waits for worktree creation and the agent launch request,
+then prints one line with the path, tab and terminal IDs. Errors exit nonzero
+with one error line. Herdr is required; a failed launch leaves the worktree for
+inspection/retry with `--in`.

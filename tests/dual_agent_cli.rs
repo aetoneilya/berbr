@@ -1,11 +1,11 @@
 #![cfg(unix)]
+mod common;
 
 use serde_json::json;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Fixture {
     root: PathBuf,
@@ -30,12 +30,7 @@ fn git(repo: &Path, args: &[&str]) {
 
 impl Fixture {
     fn new(workflow: &str) -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "berbr-agent-cli-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let root = common::temp_dir("berbr-agent-cli");
         fs::create_dir_all(root.join("vault/tasks")).unwrap();
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::create_dir_all(root.join("home")).unwrap();

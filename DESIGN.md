@@ -410,13 +410,38 @@ fetch, the matching and the rendering took to stderr.
 
 ## Native app snapshot and completion plans
 
-`app-snapshot` version 2 preserves the v1 schema and adds `merged` and `mr_state`
+`app-snapshot` version 3 preserves the v1/v2 schema, including `merged` and `mr_state`
 to worktrees. The latest branch MR (highest project-local IID) is selected in
 its own repository, whether opened, merged or closed. `merged` means a merged MR
 is known or berbr considers the worktree finished; `mr_state` retains the exact
 MR state, including `closed`, or null when unknown. Task subtrees retain `all`
 content; `active_loose` restricts only the no-task and assigned sections, leaving
 the TUI and status defaults unchanged.
+
+Every open MR row adds `ci: string|null`, `approvals: number`,
+`unresolved: number`, `draft: bool`, `merge_status: string|null`, `conflict: bool`
+and `ready: bool`. These reuse the fetched `MrReview` and `MergeRequest`; no new
+requests are made. CI and merge status are GitLab's verbatim values. Conflict
+means `detailed_merge_status == "conflict"` or `has_conflicts`. Ready means not
+draft, CI `success`, no conflict, zero unresolved discussions and status
+`mergeable`; approval count is informational. Unknown review gives null CI and
+zero counts, never ready. Terminal MRs omit the additions and retain `body`.
+
+Trees expose `diff: {adds, dels, files}|null`. Resolve origin/HEAD once per repo,
+falling back to its optional `[[project.repo]] main_branch` local branch. Each
+attached tree runs one merge-base and one diff --shortstat alongside its status
+inspection, with no network. The diff includes the index and working tree;
+untracked files are excluded as in Git's normal diff. Cached remote snapshots
+still compute local diffs. Empty diff gives zeros; detached trees, absent defaults
+or Git errors give null.
+
+`add` supports additional worktrees for a task's existing ticket via `--name`;
+without it the caller must specify `--in`. New paths never silently reuse an
+existing directory. Unlike `start`'s asynchronous preparation, `add` creates the
+worktree before launching in Herdr, reporting checkout/launch-request failures
+to its caller. A failed launch leaves the created tree for `--in` retry. Success
+prints one line containing the path and tab/terminal IDs. Non-TTY calls never
+ask or focus the new tab; `--bg` gives interactive callers the same focus policy.
 
 GitLab uses the existing open-MR list and a 90-day `updated_after` list with
 `state=all`, both scoped to `created_by_me`, 100 per page, following pagination
