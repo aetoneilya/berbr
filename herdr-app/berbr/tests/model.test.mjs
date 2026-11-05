@@ -108,16 +108,34 @@ test("close plan finds deep blockers, deduplicates references and marks lost cha
 test("fixture tasks and header-delimited work are all grouped", () => {
   const sections = groupSections(snapshot.rows);
   assert.equal(section(sections, "progress").rows.length, 9);
-  assert.equal(section(sections, "ideas").rows.length, 1);
+  assert.equal(section(sections, "todo").rows.length, 4);
+  assert.equal(section(sections, "todo").rows[0].state, "idea");
   assert.equal(section(sections, "needs").rows.length, 0);
   assert.equal(section(sections, "running").rows.length, 0);
   assert.equal(section(sections, "done").rows.length, 19);
-  assert.deepEqual(section(sections, "inbox").rows.map(row => row.target), ["DEMO-44", "DEMO-43", "DEMO-36"]);
+  assert.deepEqual(section(sections, "todo").rows.filter(row => row.kind === "ticket").map(row => row.target), ["DEMO-44", "DEMO-43", "DEMO-36"]);
   const start = snapshot.rows.findIndex(row => row.label === "no task");
   const end = snapshot.rows.findIndex(row => row.label === "assigned to me in Jira");
   const loose = snapshot.rows.slice(start + 1, end);
   assert.deepEqual(section(sections, "notInTask").rows, loose.filter(row => row.kind === "ticket" && !isClosedTicket(row)));
   assert.deepEqual(section(sections, "cleanup").rows, loose.filter(row => row.kind !== "ticket" || isClosedTicket(row)));
+});
+
+test("Todo keeps idea tasks before assigned tickets in each part's original order", () => {
+  const first = {id:"first", kind:"task", state:"idea"};
+  const second = {id:"second", kind:"task", state:"idea"};
+  const ticket = {id:"ticket", kind:"ticket", target:"DEMO-1"};
+  const sibling = {id:"sibling", kind:"ticket", target:"DEMO-2"};
+  const sections = groupSections([
+    {kind:"header", label:"assigned to me in Jira", children:[ticket]},
+    first, sibling, second, ticket,
+  ]);
+  assert.deepEqual(section(sections, "todo").rows, [first, second, ticket, sibling]);
+  assert.equal(section(sections, "todo").label, "Todo");
+  assert.deepEqual(section(groupSections([first]), "todo").rows, [first]);
+  assert.deepEqual(section(groupSections([
+    {kind:"header", label:"assigned to me in Jira", children:[ticket]},
+  ]), "todo").rows, [ticket]);
 });
 
 test("subtasks stay out of panel sections while direct header tasks are included", () => {
@@ -136,10 +154,10 @@ test("nested headers, missing labels and unknown kinds are safe", () => {
   const tree = {id:"tree", kind:"tree", label:"Tree"};
   const unknown = {id:"future", kind:"future"};
   const sections = groupSections([
-    {id:"inbox", kind:"header", label:"Assigned TO ME IN JIRA", children:[ticket]},
+    {id:"assigned", kind:"header", label:"Assigned TO ME IN JIRA", children:[ticket]},
     {id:"unknown", kind:"header", children:[tree, unknown]},
   ]);
-  assert.deepEqual(section(sections, "inbox").rows, [ticket]);
+  assert.deepEqual(section(sections, "todo").rows, [ticket]);
   assert.deepEqual(section(sections, "cleanup").rows, [tree, unknown]);
   assert.deepEqual(walk(null), []);
   assert.ok(groupSections().every(item => item.rows.length === 0));
@@ -237,19 +255,19 @@ test("filter matches titles, task keys, tags and every descendant label, branch 
 
 test("visible rows skip collapsed sections, expand during search and honor Done", () => {
   const sections = groupSections(snapshot.rows);
-  const collapsed = new Set(["inbox", "cleanup"]);
+  const collapsed = new Set(["todo", "cleanup"]);
   const visible = visibleSections(sections, {collapsed});
-  assert.equal(visibleRows(visible).length, 13);
+  assert.equal(visibleRows(visible).length, 12);
   assert.ok(!visible.some(item => item.id === "done"));
   const filtered = visibleSections(sections, {collapsed, query:"demo-44"});
-  assert.equal(filtered[0].id, "inbox");
+  assert.equal(filtered[0].id, "todo");
   assert.equal(filtered[0].expanded, true);
   assert.equal(visibleRows(filtered)[0].target, "DEMO-44");
-  assert.equal(visibleRows(visibleSections(sections, {collapsed, showDone:true})).length, 32);
+  assert.equal(visibleRows(visibleSections(sections, {collapsed, showDone:true})).length, 31);
   assert.deepEqual(visibleSections(sections, {query:"no-such-task"}), []);
 });
 
-test("Inbox title prefills remove only the leading ticket key", () => {
+test("Assigned ticket title prefills remove only the leading ticket key", () => {
   assert.equal(ticketTitle({target:"DEMO-123", label:"DEMO-123  Fix DEMO-123"}), "Fix DEMO-123");
   assert.equal(ticketTitle({target:"DEMO-123", label:"DEMO-123"}), "");
   assert.equal(ticketTitle({label:"No key"}), "No key");
@@ -428,7 +446,7 @@ test("worktree marks parse paths, changes, unpushed commits, merge state and ina
   assert.deepEqual(parseTreeMarks("/repo\n +0 ↑0 quietly 35d"), {...empty, path:"/repo"});
 });
 
-test("loose why explains tree, MR, Inbox, closed ticket and unlinked work", () => {
+test("loose why explains tree, MR, assigned ticket, closed ticket and unlinked work", () => {
   const tree = {kind:"tree", tree:"checkout", branch:"dev/KEY-1"};
   const mr = {kind:"mr", label:"!42 Title", state:"opened"};
   const ticket = {kind:"ticket", target:"KEY-1", state:"New", children:[tree, mr]};
@@ -568,7 +586,7 @@ test("panel memoization survives focus redraws and invalidates live, snapshot an
 
 test("all section kinds are collapsible and filtering temporarily expands them without losing counts", () => {
   const sections = groupSections([{id:"task", kind:"task", title:"Demo", children:[]}]);
-  assert.deepEqual(sections.map(section => section.id), ["needs", "running", "progress", "ideas", "inbox", "notInTask", "cleanup", "done"]);
+  assert.deepEqual(sections.map(section => section.id), ["needs", "running", "progress", "todo", "notInTask", "cleanup", "done"]);
   assert.ok(sections.every(section => section.collapsible));
   const collapsed = new Set(sections.map(section => section.id));
   const hidden = visibleSections(sections, {collapsed});
@@ -579,7 +597,7 @@ test("all section kinds are collapsible and filtering temporarily expands them w
   const filtered = visibleSections(sections, {collapsed, query:"demo"});
   assert.equal(filtered[0].expanded, true);
   assert.equal(visibleRows(filtered)[0].id, "task");
-  assert.equal(collapsed.size, 8);
+  assert.equal(collapsed.size, 7);
 });
 
 test("task excerpts stop before machine sections, including when they are the whole body", () => {

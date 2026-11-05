@@ -28,11 +28,11 @@ export default class Berbr extends View {
       const saved = JSON.parse(localStorage.getItem("berbr.expanded"));
       if (typeof saved === "string") this.expanded = saved;
     } catch (_) { /* Storage is optional. */ }
-    this.collapsed = new Set(["inbox", "cleanup"]);
+    this.collapsed = new Set(["cleanup"]);
     try {
       const saved = JSON.parse(localStorage.getItem("berbr.collapsed"));
       if (Array.isArray(saved)) {
-        this.collapsed = new Set(saved.map(id => id === "unsorted" ? "cleanup" : id)
+        this.collapsed = new Set(saved.map(id => id === "unsorted" ? "cleanup" : id === "ideas" ? "todo" : id)
           .filter(id => Object.keys(sectionLabels).includes(id)));
         if (JSON.stringify(saved) !== JSON.stringify([...this.collapsed]))
           localStorage.setItem("berbr.collapsed", JSON.stringify([...this.collapsed]));
@@ -952,7 +952,7 @@ export default class Berbr extends View {
   looseRow(t, row, section) {
     const selected = this.panelFocused() && row.id === this.selected;
     const expanded = row.id === this.expanded;
-    const reason = section === "inbox" ? "Assigned in Jira" : this.liveState().reason(row);
+    const reason = section === "todo" ? "Assigned in Jira" : this.liveState().reason(row);
     const kindIcon = { ticket:"file-text", tree:"git-branch", mr:"git-compare" }[row.kind] ?? "file-text";
     const line = h_flex().id(`loose-${row.id}`).h(44).flex_none().px(8).gap(8).items_center().rounded(6)
       .when(selected, el => el.bg(t.selected)).hover(el => el.bg(selected ? t.selected : t.hover)).cursor_pointer()
@@ -965,6 +965,8 @@ export default class Berbr extends View {
     }
     return line.child(icon(kindIcon).text_color(t.dim))
       .child(this.looseContent(t, row, reason))
+      .when(section === "todo" && row.kind === "ticket" && !isClosedTicket(row) && this.hovered === row.id,
+        el => el.child(button(t, `make-task-${row.id}`, "Make task", () => this.makeTask(row), "ghost", this.busy)))
       .when(expanded || this.hovered === row.id || selected, el => el.child(iconButton(t, `details-${row.id}`,
         expanded ? "chevron-down" : "chevron-right", expanded ? "Collapse details" : "Expand details",
         cx => this.taskClick(row, cx), {size:22, disabled:this.busy})));
@@ -1013,8 +1015,8 @@ export default class Berbr extends View {
       this.selected = rows.find(row => row.id === this.expanded)?.id ?? rows[0]?.id ?? null;
     const allSections = this.liveState().sections;
     const done = allSections.find(section => section.id === "done").rows.length;
-    const open = allSections.filter(section => ["needs", "running", "progress", "ideas"].includes(section.id))
-      .reduce((count, section) => count + section.rows.length, 0);
+    const open = allSections.filter(section => ["needs", "running", "progress", "todo"].includes(section.id))
+      .reduce((count, section) => count + section.rows.filter(row => row.kind === "task").length, 0);
     const disabled = this.loading || this.busy;
     const list = v_flex().id("berbr-tasks").flex_1().min_h(0).overflow_y_scrollbar().px(6).py(4);
     if (!this.data && this.loading) {

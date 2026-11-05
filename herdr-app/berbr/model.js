@@ -351,8 +351,8 @@ export function taskSignals(row, liveAgents = [], liveSpaces = [], related = wal
 }
 
 export const sectionLabels = {
-  needs:"Needs you", running:"Running", progress:"In progress", ideas:"Ideas",
-  inbox:"Inbox", notInTask:"Not in a task", cleanup:"Cleanup", done:"Done",
+  needs:"Needs you", running:"Running", progress:"In progress", todo:"Todo",
+  notInTask:"Not in a task", cleanup:"Cleanup", done:"Done",
 };
 
 export function groupSections(rows = [], liveAgents = [], liveSpaces = [], signalFor = row => taskSignals(row, liveAgents, liveSpaces)) {
@@ -365,7 +365,7 @@ export function groupSections(rows = [], liveAgents = [], liveSpaces = [], signa
     seen.add(row.id);
     const signal = signalFor(row);
     const section = row.done ? "done" : ["blocked", "done"].includes(signal.status) ? "needs"
-      : signal.working ? "running" : row.state === "idea" ? "ideas" : "progress";
+      : signal.working ? "running" : row.state === "idea" ? "todo" : "progress";
     byId.get(section).rows.push(row);
   }
   let looseSection = "cleanup";
@@ -376,7 +376,7 @@ export function groupSections(rows = [], liveAgents = [], liveSpaces = [], signa
       for (const child of row.children ?? []) addLoose(child);
     } else if (!looseIds.has(row.id)) {
       looseIds.add(row.id);
-      const section = looseSection === "inbox" ? "inbox"
+      const section = looseSection === "todo" ? "todo"
         : row.kind === "ticket" && !isClosedTicket(row) ? "notInTask" : "cleanup";
       byId.get(section).rows.push(row);
     }
@@ -385,7 +385,7 @@ export function groupSections(rows = [], liveAgents = [], liveSpaces = [], signa
   for (const row of rows ?? []) {
     if (row.kind === "header") {
       looseSection = String(row.label ?? "").trim().toLowerCase() === "assigned to me in jira"
-        ? "inbox" : "cleanup";
+        ? "todo" : "cleanup";
       for (const child of row.children ?? []) addLoose(child);
     } else if (row.kind !== "task") addLoose(row);
   }

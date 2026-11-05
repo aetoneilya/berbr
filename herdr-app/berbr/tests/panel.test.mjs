@@ -545,16 +545,16 @@ test("loose sections default to active work visible and Cleanup collapsed; old U
   let {view, cx} = setup();
   assert.equal(view.sections().find(section => section.id === "notInTask").expanded, true);
   assert.equal(view.sections().find(section => section.id === "cleanup").expanded, false);
-  assert.equal(view.rows().filter(row => row.id?.startsWith("loose:")).length, 3);
+  assert.equal(view.rows().filter(row => row.id?.startsWith("loose:")).length, 6);
   ({view, cx} = setup({collapsed:["inbox", "unsorted"]}));
-  assert.deepEqual([...view.collapsed], ["inbox", "cleanup"]);
-  assert.deepEqual(JSON.parse(storage.get("berbr.collapsed")), ["inbox", "cleanup"]);
+  assert.deepEqual([...view.collapsed], ["cleanup"]);
+  assert.deepEqual(JSON.parse(storage.get("berbr.collapsed")), ["cleanup"]);
   view.toggleSection("cleanup", cx);
   assert.equal(view.sections().find(section => section.id === "cleanup").expanded, true);
-  assert.deepEqual(JSON.parse(storage.get("berbr.collapsed")), ["inbox"]);
+  assert.deepEqual(JSON.parse(storage.get("berbr.collapsed")), []);
 });
 
-test("Not in a task gives a second-line reason; Make task prefills both loose and Inbox tickets", () => {
+test("Not in a task gives a second-line reason; Make task prefills both loose and Todo tickets", () => {
   const {view, cx} = setup();
   view.collapsed.clear();
   for (const target of ["DEMO-61", "DEMO-44"]) {
@@ -1415,7 +1415,7 @@ function sectionPanel() {
       {id:"loose-tree", kind:"tree", tree:"demo-tree", label:"Demo tree"},
     ]},
     {kind:"header", label:"assigned to me in Jira", children:[
-      {id:"inbox-ticket", kind:"ticket", target:"DEMO-102", label:"Demo inbox", state:"New"},
+      {id:"assigned-ticket", kind:"ticket", target:"DEMO-102", label:"Demo assigned", state:"New"},
     ]},
   ]}});
   state.agents = [{address:"blocked", status:"blocked", seq:1}, {address:"working", status:"working", seq:1}];
@@ -1425,15 +1425,15 @@ function sectionPanel() {
 
 test("every section header toggles and persists, with the specified initial expansion", () => {
   const {view, cx} = sectionPanel();
-  const defaults = new Map([["needs", true], ["running", true], ["progress", true], ["ideas", true],
-    ["inbox", false], ["notInTask", true], ["cleanup", false], ["done", true]]);
+  const defaults = new Map([["needs", true], ["running", true], ["progress", true], ["todo", true],
+    ["notInTask", true], ["cleanup", false], ["done", true]]);
   assert.equal(view.sections().length, defaults.size);
   for (const [id, expanded] of defaults) {
     let section = view.sections().find(section => section.id === id);
     assert.equal(section.expanded, expanded, id);
     let header = byId(view.render(cx), `section-${id}`);
     assert.ok(text(header).includes(`chevron-${expanded ? "down" : "right"}.svg`), id);
-    assert.equal(text(header.nodes.at(-1)), "1");
+    assert.equal(text(header.nodes.at(-1)), id === "todo" ? "2" : "1");
     view.handle.focused = false;
     click(header, cx);
     assert.equal(view.handle.focused, true);
@@ -1454,7 +1454,7 @@ test("every section header toggles and persists, with the specified initial expa
 
 test("stored section ids migrate together, preserving every new id and removing unknowns", () => {
   const saved = ["needs", "running", "progress", "ideas", "done", "notInTask", "unsorted", "inbox", "unknown", "needs"];
-  const expected = ["needs", "running", "progress", "ideas", "done", "notInTask", "cleanup", "inbox"];
+  const expected = ["needs", "running", "progress", "todo", "done", "notInTask", "cleanup"];
   let {view} = setup({collapsed:saved});
   assert.deepEqual([...view.collapsed], expected);
   assert.deepEqual(JSON.parse(storage.get("berbr.collapsed")), expected);
@@ -1463,7 +1463,91 @@ test("stored section ids migrate together, preserving every new id and removing 
   ({view} = setup({collapsed:[]}));
   assert.deepEqual([...view.collapsed], []);
   ({view} = setup({collapsed:["inbox", "cleanup"]}));
-  assert.deepEqual([...view.collapsed], ["inbox", "cleanup"]);
+  assert.deepEqual([...view.collapsed], ["cleanup"]);
+  for (const [saved, expected] of [
+    [["ideas"], ["todo"]], [["inbox"], []], [["todo", "ideas", "inbox"], ["todo"]],
+  ]) {
+    ({view} = setup({collapsed:saved}));
+    assert.deepEqual([...view.collapsed], expected);
+    assert.deepEqual(JSON.parse(storage.get("berbr.collapsed")), expected);
+  }
+});
+
+test("Todo renders idea rings and assigned ticket icons together; hover Make task prefills the dialog", () => {
+  const {view, cx} = sectionPanel();
+  let rendered = view.render(cx);
+  const list = byId(rendered, "berbr-tasks");
+  const header = byId(list, "section-todo");
+  const index = list.nodes.indexOf(header);
+  assert.equal(text(header.nodes.at(-2)), "Todo");
+  assert.equal(text(header.nodes.at(-1)), "2");
+  assert.equal(list.nodes[index + 1].attributes.id[0], "task-idea-task");
+  assert.equal(list.nodes[index + 2].attributes.id[0], "loose-assigned-ticket");
+  assert.equal(list.nodes[index + 3].attributes.id[0], "section-notInTask");
+  const idea = byId(list, "task-idea-task");
+  assert.equal(idea.nodes[0].nodes[0].nodes[0].attributes.border[0], 1.5);
+  const ticket = byId(list, "loose-assigned-ticket");
+  assert.ok(ticket.nodes[0].asset.path.endsWith("file-text.svg"));
+  assert.ok(text(ticket).includes("Assigned in Jira"));
+  assert.equal(byId(ticket, "make-task-assigned-ticket"), undefined);
+  ticket.attributes.on_hover[0](true, cx);
+  rendered = view.render(cx);
+  click(byId(rendered, "make-task-assigned-ticket"), cx);
+  const props = state.overlays.at(-1).props;
+  assert.equal(props.form, "new");
+  assert.deepEqual(props.prefill, {title:"Demo assigned", ticket:"DEMO-102"});
+  const dialog = setup({props}).view;
+  assert.equal(dialog.ticketMode, "existing");
+  assert.equal(dialog.inputs.ticket.value(), "DEMO-102");
+  assert.equal(dialog.inputs.title.value(), "Demo assigned");
+});
+
+test("open count includes ideas and excludes assigned tickets regardless of collapse or filter", () => {
+  const idea = {id:"idea", kind:"task", title:"Demo idea", state:"idea"};
+  const assigned = {kind:"header", label:"assigned to me in Jira", children:[
+    {id:"ticket", kind:"ticket", target:"DEMO-1", label:"Demo ticket"},
+  ]};
+  const done = {id:"done", kind:"task", title:"Demo done", done:true};
+  for (const collapsed of [[], ["todo"]]) {
+    const {view, cx} = setup({data:{rows:[idea, assigned, done]}, collapsed});
+    assert.ok(!text(view.render(cx)).includes("No open tasks"));
+    assert.equal(text(byId(view.render(cx), "toggle-done")), "Done 1");
+    view.data = {rows:[assigned, done]};
+    assert.ok(text(view.render(cx)).includes("No open tasks"));
+    view.filter = "Demo";
+    assert.ok(!text(view.render(cx)).includes("No open tasks"));
+    assert.equal(text(byId(view.render(cx), "toggle-done")), "Done 1");
+  }
+});
+
+test("Todo keyboard navigation, filtering and jumps reveal both kinds of rows", () => {
+  const {view, cx, key} = sectionPanel();
+  view.project = "demo";
+  view.collapsed.add("todo");
+  view.selected = "section-todo";
+  key("right");
+  key("down");
+  assert.equal(view.chosen().id, "idea-task");
+  key("down");
+  assert.equal(view.chosen().id, "assigned-ticket");
+  view.collapsed.add("todo");
+  for (const query of ["Demo idea", "DEMO-102"]) {
+    view.filter = query;
+    assert.equal(view.sections()[0].id, "todo");
+    assert.equal(view.sections()[0].expanded, true);
+    assert.equal(view.sections()[0].rows.length, 1);
+    assert.ok(view.collapsed.has("todo"));
+  }
+  for (const [row, kind] of [["idea-task", "task"], ["assigned-ticket", "ticket"]]) {
+    view.collapsed.add("todo");
+    state.shared.set("berbr.jumpTarget", {project:"demo", row, kind});
+    view.receiveJump(cx);
+    assert.equal(view.collapsed.has("todo"), false);
+    assert.equal(view.filter, "");
+    assert.equal(view.expanded, row);
+    assert.equal(view.selected, row);
+    assert.ok(byId(view.render(cx), `${kind === "task" ? "task" : "loose"}-${row}`));
+  }
 });
 
 test("arrows stop on collapsed headers; Enter toggles and Right or Left set expansion", () => {
