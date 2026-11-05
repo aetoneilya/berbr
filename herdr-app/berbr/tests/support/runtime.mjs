@@ -33,10 +33,11 @@ export const InputState = {new:({value}) => {
 export const TextView = {html:(_id, text) => div().child(text), markdown:(_id, text) => div().child(text)};
 export const state = {props:{}, spaces:[], agents:[], shared:new Map(), calls:[], overlays:[], notices:[], execs:[]};
 export const appHome = () => "/test";
-export const focused = () => null;
+export const focused = () => state.focused ?? null;
 export const props = () => state.props;
 export const spaces = () => state.spaces;
 export const agents = () => state.agents;
+export const panes = () => state.panes ?? [];
 export const theme = () => new Proxy({}, {get:(_target, name) => name});
 export const shared = key => state.shared.get(key);
 export const setShared = (key, value) => state.shared.set(key, value);

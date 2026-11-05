@@ -193,6 +193,63 @@ export function mrFlags(mr) {
     needsYou:ci === "failed" || Boolean(conflict) || unresolved > 0};
 }
 
+// Presentation only: attention/needsYou semantics stay in mrFlags.
+export function mrPills(mr, {historical = false, state = mr?.state?.toLowerCase()} = {}) {
+  const flags = mrFlags(mr);
+  const spec = (label, tone, glyph = null, spin = false) => ({label, tone, glyph, spin});
+  if (["merged", "closed"].includes(state)) return [spec(state, "dim")];
+  const ci = {failed:spec("CI failed", "blocked", "✕"),
+    running:spec("CI running", "working", "spinner", true), passed:spec("CI passed", "done", "check")}[flags.ci];
+  const worst = flags.worst && flags.worst !== "CI failed"
+    ? flags.worst === "ready to merge" ? spec(flags.worst, "accent", "check")
+      : spec(flags.worst, flags.worst === "draft" ? "dim" : "blocked") : null;
+  // "ready to merge" already means CI passed: one pill, not two.
+  return [worst, flags.ready && flags.ci === "passed" ? null : ci].filter(Boolean).map(pill => historical ? {...pill, tone:"dim"} : pill);
+}
+
+export function focusedTask(rows, focus, liveSpaces = [], liveAgents = []) {
+  if (!focus) return null;
+  const terminal = liveAgents.find(agent => [agent.address, agent.pane].includes(focus.terminal));
+  let caller = null;
+  const tasks = [];
+  const visit = (rows, owner = null) => {
+    for (const row of rows ?? []) {
+      const task = row.kind === "task" ? row : owner;
+      if (row.kind === "task") tasks.push(row);
+      if (focus.terminal && [focus.terminal, terminal?.address, terminal?.pane].filter(Boolean).includes(row.terminal)) caller = task;
+      visit(row.children, task);
+    }
+  };
+  visit(rows);
+  return caller ?? tasks.find(task => taskSpace(task, liveSpaces)?.id === focus.space) ?? null;
+}
+
+export function focusedTree(rows, cwd) {
+  if (!cwd) return null;
+  const path = value => String(value ?? "").replace(/\/+$/, "") || "/";
+  const current = path(cwd);
+  return walk(rows).filter(row => row.kind === "tree").map(row => ({row, path:path(row.cwd || treeMarks(row).path)}))
+    .filter(entry => (entry.row.cwd || treeMarks(entry.row).path) &&
+      (current === entry.path || current.startsWith(entry.path === "/" ? "/" : entry.path + "/")))
+    .sort((a, b) => b.path.length - a.path.length)[0]?.row ?? null;
+}
+
+// Navigation only. Snapshot agent rows identify candidates, never prove liveness.
+export function treeFocusTarget(tree, liveAgents = [], livePanes = []) {
+  const path = String(tree.cwd || treeMarks(tree).path || "").replace(/\/+$/, "");
+  const inside = cwd => Boolean(path && cwd && (cwd === path || cwd.startsWith(path + "/")));
+  const linked = new Set(walk(tree.children).filter(row => row.kind === "agent" && row.terminal).map(row => row.terminal));
+  const candidates = liveAgents.filter(agent => linked.has(agent.address) || linked.has(agent.pane) ||
+    livePanes.some(pane => pane.terminal && [pane.terminal, pane.pane]
+      .some(id => id && [agent.address, agent.pane].includes(id)) && inside(pane.cwd)));
+  const agent = candidates.sort((a, b) => Number(b.status === "working") - Number(a.status === "working") ||
+    (b.seq ?? 0) - (a.seq ?? 0))[0];
+  if (agent) return {agent:true, terminal:agent.address || agent.pane};
+  const pane = livePanes.filter(pane => pane.terminal && inside(pane.cwd))
+    .sort((a, b) => Number(b.focused) - Number(a.focused))[0];
+  return pane ? {agent:false, terminal:pane.terminal, tab:pane.tab} : null;
+}
+
 export function jumpItems(data, liveAgents = []) {
   const items = [], seen = new Set();
   const visit = (rows, task = null, parent = null) => {

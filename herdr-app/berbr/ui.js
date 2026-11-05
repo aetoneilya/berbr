@@ -5,6 +5,17 @@ export function icon(name, size = 14) {
   return svg(`mods/berbr/icons/${name}.svg`).size(size).flex_none();
 }
 
+export function pill(t, {label, tone = "dim", glyph, spin = false, tooltip = label}) {
+  const color = t[tone] ?? t.dim;
+  const tinted = typeof color === "string" && /^#[0-9a-f]{6}$/i.test(color);
+  return h_flex().h(19).px(6).gap(4).flex_none().items_center().rounded(5).text_size(11)
+    .bg(tinted ? color + (tone === "dim" ? "12" : "24") : t.raised).text_color(color)
+    .tooltip(tooltip).accessibility_label(tooltip)
+    .when(Boolean(glyph), el => el.child(["check", "spinner"].includes(glyph)
+      ? icon(glyph, 11).when(spin, mark => mark.spin(900)) : div().flex_none().child(glyph)))
+    .child(div().flex_none().text_color(color).child(label));
+}
+
 export function iconButton(t, id, name, label, action, { disabled = false, spinning = false, size = 26 } = {}) {
   return h_flex().id(id).size(size).flex_none().items_center().justify_center().rounded(6)
     .text_color(t.dim).cursor_pointer().tooltip(label).accessibility_label(label)
