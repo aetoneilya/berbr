@@ -9,6 +9,44 @@ export function taskSpace(row, liveSpaces = []) {
     ?? liveSpaces.find(space => taskSpaceMatches(row, space.name));
 }
 
+// Only actions with enough data to run are offered. Rows here are snapshot rows,
+// not the panel's presentation wrappers (detail, disclosure, action, ...).
+export function rowMenu(row, ctx = {}) {
+  if (!row) return [];
+  const items = [];
+  const add = (id, label, extra = {}) => items.push({id, label, ...extra});
+  if (row.kind === "task") {
+    if (taskSpace(row, ctx.spaces)) add("space", "Go to space");
+    else if (row.task && !row.done && !walk(row.children).some(child => child.kind === "tree"))
+      add("start", "Start work");
+    if (row.task) add("rename", "Rename…");
+    if (row.note) add("note", "Open note");
+    if (row.title || row.label || row.task) add("copy-title", "Copy title");
+    if (row.task && !row.done) add("done", "Close task…", {danger:true, separatorBefore:items.length > 0});
+  } else if (row.kind === "tree") {
+    if (row.task) add("resume", "Resume agent");
+    if (row.task && row.tree) add("review", "Review");
+    const mr = ctx.mr ?? row.children?.find(child => child.kind === "mr");
+    if (mr?.url) add("mr", "Open MR");
+    if (row.cwd || treeMarks(row).path) add("copy-path", "Copy path");
+    if (row.branch) add("copy-branch", "Copy branch");
+    if (row.tree) add("remove-tree", "Remove worktree…", {danger:true, separatorBefore:items.length > 0});
+  } else if (row.kind === "agent") {
+    if (ctx.live?.address || row.terminal) {
+      add("agent", "Go to agent");
+      add("copy-terminal", "Copy terminal address");
+      add("stop-agent", "Stop agent…", {danger:true, separatorBefore:true});
+    }
+  } else if (["mr", "ticket"].includes(row.kind)) {
+    if (row.url) {
+      add("url", row.kind === "mr" ? "Open in GitLab" : "Open in Jira");
+      add("copy-link", "Copy link");
+    }
+    if (row.kind === "mr" && row.branch) add("copy-branch", "Copy branch");
+  }
+  return items;
+}
+
 export function walk(rows = []) {
   return (rows ?? []).flatMap(row => [row, ...walk(row.children)]);
 }

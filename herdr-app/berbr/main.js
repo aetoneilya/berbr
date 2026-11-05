@@ -2,7 +2,7 @@ import { View, div, svg, image } from "gpui-kit";
 import { h_flex, v_flex, Input, InputState, TextView } from "gpui-base";
 import { appHome, exec, focused, spaces, agents, theme, run, props,
   openOverlay, closeOverlay, notify, shared, setShared, nextCommand, hc } from "herdr";
-import { walk, visibleRows, sectionLabels, taskSpace,
+import { walk, visibleRows, sectionLabels, taskSpace, rowMenu,
   normalizeTicketState, ticketTitle,
   worktreeNameCollision, cleanCliText, isClosedTicket,
   agentActivity, formatElapsed, blockedPrompt, mrFlags, jumpItems, matchJump, closePlan, PanelModel, treeMarks, isMergedTree, mergedPlan, backendClosePlan } from "./model.js";
@@ -21,6 +21,8 @@ export default class Berbr extends View {
     this.expanded = null; this.busyAction = null;
     this.blockedReasons = new Map(); this.panelModel = new PanelModel();
     this.jumpIndex = 0; this.jumpQuery = "";
+    this.menuIndex = 0;
+    if (this.form === "menu") this.menuItems = rowMenu(p.row, {spaces:spaces(), mr:p.mr, live:p.live});
     if (this.form === "done") this.closePlan = p.plan ?? closePlan(p.row, spaces());
     if (this.form === "remove-merged") this.bulkPlan = mergedPlan(p.trees);
     this.history = new Set(); this.subtasks = new Set(); this.closedTickets = new Set();
@@ -59,6 +61,7 @@ export default class Berbr extends View {
       input.on("submit", (_event, cx) => {
         if (this.form === "jump" && key === "search") this.chooseJump(cx);
         if (this.form === "new" && ["title", "ticket"].includes(key)) this.submitNew(cx);
+        if (this.form === "rename" && key === "title") this.submitRename(cx);
         if (this.form === "ticket" && key === "ticket") this.submitTicket(cx, true);
       });
       if (key === "search") {
@@ -92,7 +95,7 @@ export default class Berbr extends View {
       });
     } else if (this.form === "jump") {
       this.jumpEntries = jumpItems(p.snapshot, p.agents ?? []); this.inputs.search.focus();
-    } else if (this.form === "new") this.inputs.title.focus();
+    } else if (["new", "rename"].includes(this.form)) this.inputs.title.focus();
     else if (this.form === "ticket") this.inputs.ticket.focus();
     if (["done", "remove-merged"].includes(this.form)) this.loadClosePlan(cx);
   }
@@ -129,7 +132,7 @@ export default class Berbr extends View {
         this.agent = data.projects?.find(project => project.name === data.project)?.agent ?? "codex";
         setShared("berbr.project", this.project);
         const firstData = !this.data;
-        this.data = data; this.error = null;
+        this.data = data; this.contextRow = null; this.error = null;
         if (firstData) {
           const flat = walk(data.rows);
           const caller = (this.opening?.terminal && flat.find(row => row.terminal === this.opening.terminal))
@@ -148,6 +151,7 @@ export default class Berbr extends View {
   switchProject(name, cx) {
     if (this.loading || this.busy || name === this.project) return;
     this.project = name; this.selected = null; this.didOnline = false;
+    this.contextRow = null;
     this.setExpanded(null, cx);
     this.cwd = this.data?.projects?.find(project => project.name === name)?.cwd ?? null;
     this.data = null; this.refresh(cx, true);
@@ -306,7 +310,8 @@ export default class Berbr extends View {
       }) : []),
     ]);
   }
-  chosen() { return this.rows().find(row => row.id === this.selected); }
+  chosen() { return this.rows().find(row => row.id === this.selected)
+    ?? (this.contextRow?.id === this.selected ? this.contextRow : undefined); }
 
   openJump() {
     if (!this.busy) this.formOverlay("jump", {snapshot:this.data, agents:agents()});
@@ -383,7 +388,7 @@ export default class Berbr extends View {
     });
   }
 
-  openUrl(url, cx, action = url) {
+  openUrl(url, cx, action = url, {close = false} = {}) {
     if (!url || this.busy) return;
     this.busy = true; this.busyAction = action; this.error = null;
     cx.notify();
@@ -391,6 +396,7 @@ export default class Berbr extends View {
       try {
         const result = await exec("open", [url]);
         if (result.code !== 0) throw new Error(result.stderr.trim() || "Could not open link");
+        if (close && props()?.overlay) closeOverlay(props().overlay);
       } catch (error) { this.error = String(error.message ?? error); }
       this.busy = false; this.busyAction = null; cx.notify();
     });
@@ -425,14 +431,101 @@ export default class Berbr extends View {
 
   formOverlay(form, extra = {}) {
     if (this.busy) return;
-    const popup = ["projects", "attach-task"].includes(form);
+    const popup = ["projects", "attach-task", "menu"].includes(form);
     openOverlay({ mod:"berbr", kind: popup ? "popup" : "dialog",
-      width: ["done", "remove-merged"].includes(form) ? 520 : form === "projects" ? 220 : form === "attach-task" ? 300 : ["jump", "new"].includes(form) ? 560 : form === "remove-tree" ? 440 : 480,
-      height: popup ? undefined : form === "jump" ? 0.6 : ["done", "remove-merged"].includes(form) ? 0.75 : form === "new" ? 380 : form === "remove-tree" ? 300 : 240,
-      modal: ["new", "remove-tree", "done", "remove-merged"].includes(form),
+      width: ["done", "remove-merged"].includes(form) ? 520 : ["projects", "menu"].includes(form) ? 220 : form === "attach-task" ? 300 : ["jump", "new"].includes(form) ? 560 : form === "remove-tree" ? 440 : 480,
+      height: popup ? undefined : form === "jump" ? 0.6 : ["done", "remove-merged"].includes(form) ? 0.75 : form === "new" ? 380 : form === "remove-tree" ? 360 : 240,
+      modal: ["new", "rename", "stop-agent", "remove-tree", "done", "remove-merged"].includes(form),
       ...(popup ? {at:"pointer"} : {}),
       props:{ form, project:this.project, binary:this.binary, agent:this.agent,
         opening:this.opening, cwd:this.cwd, ...extra } });
+  }
+
+  menuTarget(item) {
+    if (item?.kind === "detail")
+      return ["tree", "agent", "mr", "ticket", "subtask"].includes(item.type) ? item.row : null;
+    return item;
+  }
+
+  openRowMenu(item, cx) {
+    if (this.busy) return;
+    const row = this.menuTarget(item);
+    const mr = item?.mr ?? row?.children?.find(child => child.kind === "mr");
+    const live = row?.terminal && this.liveState().live.get(row.terminal);
+    if (!rowMenu(row, {spaces:spaces(), mr, live}).length) return;
+    // Inline links may represent a row which also appears as a detail item.
+    this.selected = this.rows().find(candidate => candidate.id === item.id || candidate.row?.id === row.id)?.id ?? item.id;
+    this.contextRow = item;
+    this.handle.focus(); cx.notify();
+    this.formOverlay("menu", {row, mr, live, rows:this.data?.rows ?? []});
+  }
+
+  chooseMenu(cx, id = this.menuItems?.[this.menuIndex]?.id) {
+    if (this.busy || !this.menuItems?.some(item => item.id === id)) return;
+    const p = props(), row = p.row;
+    const close = () => { if (p.overlay) closeOverlay(p.overlay); };
+    const form = (name, extra) => { close(); this.formOverlay(name, extra); };
+    const terminal = p.live?.address ?? row.terminal;
+    switch (id) {
+      case "space": {
+        const space = taskSpace(row, spaces());
+        if (space) { close(); run("space.select", {id:space.id}); }
+        else { this.error = "Space is no longer available."; cx.notify(); }
+        break;
+      }
+      case "start": case "resume": this.open(row, cx); break;
+      case "review": this.perform(cx, ["review", row.tree], {close:true}); break;
+      case "rename": form("rename", {row, prefill:{title:row.title ?? row.label ?? row.task}}); break;
+      case "note": close(); this.openNote(row); break;
+      case "done": form("done", {task:row.task, label:row.title ?? row.label, row}); break;
+      case "remove-tree": close(); this.removeTree(row, p.mr, p.rows); break;
+      case "stop-agent": form("stop-agent", {row, terminal}); break;
+      case "agent": this.open({...row, terminal}, cx); break;
+      case "url": this.openUrl(row.url, cx, id, {close:true}); break;
+      case "mr": this.openUrl(p.mr?.url ?? row.children?.find(child => child.kind === "mr")?.url, cx, id, {close:true}); break;
+      case "copy-title": this.copyText(row.title ?? row.label ?? row.task, cx); break;
+      case "copy-path": this.copyText(row.cwd || treeMarks(row).path, cx); break;
+      case "copy-branch": this.copyText(row.branch, cx); break;
+      case "copy-terminal": this.copyText(terminal, cx); break;
+      case "copy-link": this.copyText(row.url, cx); break;
+    }
+  }
+
+  copyText(value, cx) {
+    if (this.busy || value == null) return;
+    this.busy = true; this.error = null; cx.notify();
+    cx.spawn(async cx => {
+      try {
+        // Text is an argv entry; shell metacharacters and leading dashes stay literal.
+        const result = await exec("/bin/sh", ["-c", 'printf %s "$1" | /usr/bin/pbcopy', "berbr-copy", String(value)]);
+        if (result.code !== 0) throw new Error(result.stderr.trim() || "Could not copy text");
+        notify({title:"Berbr", body:"Copied", level:"info"});
+        if (props()?.overlay) closeOverlay(props().overlay);
+      } catch (error) { this.error = String(error.message ?? error); }
+      this.busy = false; cx.notify();
+    });
+  }
+
+  submitRename(cx) {
+    const title = this.values.title?.trim(), task = props()?.row?.task;
+    if (!title || !task) { this.error = "Enter a task title."; cx.notify(); return; }
+    this.perform(cx, ["rename", task, title], {close:true});
+  }
+
+  submitStopAgent(cx) {
+    const terminal = props()?.terminal;
+    if (this.busy || !terminal) return;
+    this.busy = true; this.error = null; cx.notify();
+    cx.spawn(async cx => {
+      try {
+        const result = await hc(["kill", terminal]);
+        if (result.code !== 0) throw new Error(result.stderr.trim() || result.stdout.trim() || "Could not stop agent");
+        run("berbr.refresh");
+        notify({title:"Berbr", body:"Agent stopped", level:"info"});
+        if (props()?.overlay) closeOverlay(props().overlay);
+      } catch (error) { this.error = String(error.message ?? error); }
+      this.busy = false; cx.notify();
+    });
   }
 
   loadClosePlan(cx) {
@@ -477,8 +570,8 @@ export default class Berbr extends View {
     this.perform(cx, worktree ? ["add", task, ticket] : ["attach", ticket, task], {close:true});
   }
 
-  removeTree(tree, mr) {
-    this.formOverlay("remove-tree", {tree, mr, rows:this.data?.rows ?? []});
+  removeTree(tree, mr, rows = this.data?.rows ?? []) {
+    this.formOverlay("remove-tree", {tree, mr, rows});
   }
 
   submitRemoveTree(cx) {
@@ -496,7 +589,7 @@ export default class Berbr extends View {
 
   enterTree(tree, mr, cx, action, remove = false) {
     if (this.busy) return;
-    if (remove || isMergedTree(tree) || !tree.task || ["merged", "closed"].includes(mr?.state?.toLowerCase())) this.removeTree(tree, mr);
+    if (remove || !tree.task) this.removeTree(tree, mr);
     else this.open(tree, cx, action);
   }
 
@@ -511,7 +604,8 @@ export default class Berbr extends View {
     this.selected = row.id; this.handle.focus();
     if (row.kind === "waiting") { cx.notify(); return; }
     if (row.kind === "section") this.toggleSection(row.section, cx);
-    else if (row.kind === "detail") { if (row.type !== "tree") row.action?.(cx); }
+    else if (row.kind === "detail") row.action?.(cx);
+    else if (row.kind === "tree" && row.task) this.enterTree(row, row.children?.find(child => child.kind === "mr"), cx, row.id);
     else this.setExpanded(this.expanded === row.id ? null : row.id, cx);
     cx.notify();
   }
@@ -536,6 +630,16 @@ export default class Berbr extends View {
 
   key(event, cx) {
     if (this.form === "note" && noteKey(this, event, cx)) return;
+    if (this.form === "menu" && ["up", "down", "enter"].includes(event.key)) {
+      if (event.key === "enter") this.chooseMenu(cx);
+      else if (!this.busy && this.menuItems.length)
+        this.menuIndex = (this.menuIndex + (event.key === "down" ? 1 : -1) + this.menuItems.length) % this.menuItems.length;
+      cx.stop_propagation(); cx.notify(); return;
+    }
+    if (!this.form && this.panelFocused() && !this.searchFocused && !this.replyFocused &&
+        (event.keystroke === "shift-f10" || ["contextmenu", "menu", "apps"].includes(event.key))) {
+      this.openRowMenu(this.chosen(), cx); cx.stop_propagation(); return;
+    }
     if (!this.form && this.panelFocused() && event.keystroke === "cmd-k") {
       this.openJump(); cx.stop_propagation(); return;
     }
@@ -624,7 +728,7 @@ export default class Berbr extends View {
       .on_hover((hovered, cx) => this.hoverRow(row.id, hovered, cx))
       .on_click((_event, cx) => this.taskClick(row, cx))
       .on_mouse_down("right", (_event, cx) => {
-        this.taskClick(row, cx); cx.stop_propagation();
+        this.openRowMenu(row, cx); cx.stop_propagation();
       })
       .child(div().pt(2).child(statusMark(t, signal.status)))
       .child(v_flex().flex_1().min_w(0).gap(2)
@@ -691,11 +795,7 @@ export default class Berbr extends View {
     const trees = row.kind === "tree" ? [row] : (row.children ?? []).filter(child => child.kind === "tree");
     for (const tree of trees) {
       const mr = tree.children?.find(child => child.kind === "mr");
-      add("tree", tree.id, {row:tree, mr, loose:true, ticket}, (cx, id) => {
-        if (ticket && !isClosedTicket(ticket) && ticket.target)
-          this.perform(cx, ["select", ticket.target], {close:true, action:id});
-        else this.removeTree(tree, mr);
-      });
+      add("tree", tree.id, {row:tree, mr, loose:true, ticket}, (cx, id) => this.enterTree(tree, mr, cx, id));
     }
     const mrs = new Map((row.kind === "mr" ? [row] : walk(row.children)).filter(child => child.kind === "mr")
       .map(mr => [mr.url || mr.id || mr, mr]));
@@ -742,26 +842,32 @@ export default class Berbr extends View {
       .opacity(this.busy && !pending && ![`${item.id}/review`, `${item.id}/resume`, `${item.id}/mr`, `${item.id}/ticket`].includes(this.busyAction) ? 0.4 : 1)
       .when(Boolean(item.action), el => el.cursor_pointer()
         .on_hover((hovered, cx) => this.hoverRow(item.id, hovered, cx))
-        .on_click((_event, cx) => { cx.stop_propagation(); this.taskClick(item, cx); }));
+        .on_click((_event, cx) => { cx.stop_propagation(); this.taskClick(item, cx); }))
+      .when(Boolean(this.menuTarget(item)), el => el.on_mouse_down("right", (_event, cx) => {
+        this.openRowMenu(item, cx); cx.stop_propagation();
+      }));
   }
 
   treeActions(t, tree, mr, id, {remove = false, review = true, suffix = "", loose = false, ticket = null} = {}) {
-    const closed = remove || isMergedTree(tree) || !tree.task || ["merged", "closed"].includes(mr?.state?.toLowerCase());
-    const action = `${id}/${closed ? "remove" : "resume"}${suffix ? `/${suffix}` : ""}`;
+    const primaryRemove = !tree.task;
+    const closed = remove || isMergedTree(tree) || [tree.mr_state, mr?.state]
+      .some(state => ["merged", "closed"].includes(state?.toLowerCase()));
+    const action = `${id}/${primaryRemove ? "remove" : "resume"}${suffix ? `/${suffix}` : ""}`;
     if (this.hovered !== id && !(this.panelFocused() && this.selected === id) &&
-        ![action, `${id}/resume`, `${id}/review`].includes(this.busyAction)) return [];
-    if (loose) {
-      const buttons = [];
+        ![action, `${id}/resume`, `${id}/remove`, `${id}/review`].includes(this.busyAction)) return [];
+    if (loose && !tree.task) {
+      const buttons = [iconButton(t, `${id}/remove`, "archive", "Remove worktree", () => this.removeTree(tree, mr),
+        {size:20, disabled:this.busy})];
       if (ticket && !isClosedTicket(ticket) && ticket.target) buttons.push(iconButton(t, `${id}/resume`, "terminal", "Resume agent",
         cx => this.perform(cx, ["select", ticket.target], {close:true, action:`${id}/resume`}),
         {size:20, disabled:this.busy, spinning:this.busy && this.busyAction === `${id}/resume`}));
-      buttons.push(iconButton(t, `${id}/remove`, "archive", "Remove worktree", () => this.removeTree(tree, mr),
-        {size:20, disabled:this.busy}));
       return buttons;
     }
-    const buttons = [iconButton(t, action, closed ? "archive" : "terminal", closed ? "Remove worktree" : "Resume agent",
-      cx => this.enterTree(tree, mr, cx, action, remove),
+    const buttons = [iconButton(t, action, primaryRemove ? "archive" : "terminal", primaryRemove ? "Remove worktree" : "Resume agent",
+      cx => this.enterTree(tree, mr, cx, action),
       {size:20, disabled:this.busy, spinning:this.busy && this.busyAction === action})];
+    if (tree.task && closed) buttons.push(iconButton(t, `${id}/remove`, "archive", "Remove worktree",
+      () => this.removeTree(tree, mr), {size:20, disabled:this.busy}));
     if (review && tree.task) buttons.push(iconButton(t, `${id}/review`, "git-compare", "Review",
       cx => this.perform(cx, ["review", tree.tree], {action:`${id}/review`}),
       {size:20, disabled:this.busy, spinning:this.busy && this.busyAction === `${id}/review`}));
@@ -775,6 +881,8 @@ export default class Berbr extends View {
       .tooltip(`Open ${key} in ${mr ? "GitLab" : "Jira"}`)
       .opacity(this.busy && this.busyAction !== id ? 0.4 : 1)
       .hover(el => el.text_color(t.foreground).underline())
+      .when(this.panelFocused() && this.selected === row.id, el => el.bg(t.selected))
+      .on_mouse_down("right", (_event, cx) => {cx.stop_propagation(); this.openRowMenu(row, cx);})
       .on_click((_event, cx) => {cx.stop_propagation(); this.openUrl(row.url, cx, id);})
       .when(this.busy && this.busyAction === id, el => el.child(icon("spinner", 11).text_color(t.dim).spin(900)));
   }
@@ -902,7 +1010,12 @@ export default class Berbr extends View {
       return v_flex().child(this.taskRow(t, task)).children(waiting.map(item => {
         const agent = rows.trees.flatMap(tree => tree.agents.map(agent => ({...agent, tree:tree.row})))
           .concat(rows.mainAgents).find(agent => agent.live?.address === item.agent.address);
-        return v_flex().child(this.agentLine(t, h_flex().h(24).mx(28).gap(6).items_center().min_w(0), agent ?? {
+        return v_flex().child(this.agentLine(t, h_flex().h(24).mx(28).gap(6).items_center().min_w(0)
+          .on_mouse_down("right", (_event, cx) => {
+            cx.stop_propagation();
+            this.openRowMenu({id:item.id, kind:"detail", type:"agent",
+              row:agent?.row ?? {kind:"agent", terminal:item.agent.address}}, cx);
+          }), agent ?? {
           row:{label:item.agent.title}, live:item.agent, status:"blocked",
         })).child(this.waitingCard(t, item));
       }));
@@ -959,6 +1072,7 @@ export default class Berbr extends View {
       .when(selected, el => el.bg(t.selected)).hover(el => el.bg(selected ? t.selected : t.hover)).cursor_pointer()
       .opacity(this.busy ? 0.4 : 1)
       .on_hover((hovered, cx) => this.hoverRow(row.id, hovered, cx))
+      .on_mouse_down("right", (_event, cx) => {cx.stop_propagation(); this.openRowMenu(row, cx);})
       .on_click((_event, cx) => this.taskClick(row, cx));
     if (row.kind === "agent") {
       const live = row.terminal && this.liveState().live.get(row.terminal);
@@ -1012,7 +1126,7 @@ export default class Berbr extends View {
     const panelFocused = this.panelFocused();
     const sections = this.sections();
     const rows = this.rows(sections);
-    if (!rows.some(row => row.id === this.selected))
+    if (!rows.some(row => row.id === this.selected) && this.contextRow?.id !== this.selected)
       this.selected = rows.find(row => row.id === this.expanded)?.id ?? rows[0]?.id ?? null;
     const allSections = this.liveState().sections;
     const done = allSections.find(section => section.id === "done").rows.length;

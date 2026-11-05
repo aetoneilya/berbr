@@ -3,10 +3,55 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { taskSpace, taskSpaceMatches, walk, groupSections, taskSignals, visibleSections, visibleRows, parseMrFlags,
   normalizeTicketState, isClosedTicket, cleanObsidian, stripFrontmatter, obsidianUri, matchesFilter, ticketTitle, rowState, taskDetail, looseReason, worktreeNameCollision, cleanCliText, parseTreeMarks, looseWhy,
-  agentActivity, formatElapsed, classifyBlocked, closePlan } from "../model.js";
+  agentActivity, formatElapsed, classifyBlocked, closePlan, rowMenu } from "../model.js";
 
 const snapshot = JSON.parse(await readFile(new URL("../fixtures/sample-snapshot.json", import.meta.url)));
 const section = (sections, id) => sections.find(item => item.id === id);
+
+test("task menu offers a live space instead of starting work and hides unavailable actions", () => {
+  const task = {kind:"task", task:"demo", title:"Demo", note:"/home/dev/demo.md", children:[]};
+  const ids = ctx => rowMenu(task, ctx).map(item => item.id);
+  assert.deepEqual(ids({spaces:[{id:"space", name:"Demo"}]}), ["space", "rename", "note", "copy-title", "done"]);
+  assert.deepEqual(ids({spaces:[]}), ["start", "rename", "note", "copy-title", "done"]);
+  assert.ok(!rowMenu({...task, children:[{kind:"tree"}]}).some(item => item.id === "start"));
+  assert.ok(!rowMenu({...task, done:true}).some(item => ["start", "done"].includes(item.id)));
+  assert.deepEqual(rowMenu({kind:"task", title:"Untitled"}).map(item => item.id), ["copy-title"]);
+});
+
+test("active, merged and loose worktrees all offer removal with a danger separator", () => {
+  const mr = {kind:"mr", url:"https://gitlab.example/demo/-/merge_requests/1", state:"opened"};
+  const tree = {kind:"tree", tree:"demo", task:"task", branch:"demo-branch", cwd:"/home/dev/demo", children:[mr]};
+  assert.deepEqual(rowMenu(tree).map(item => item.id), ["resume", "review", "mr", "copy-path", "copy-branch", "remove-tree"]);
+  assert.deepEqual(rowMenu(tree).at(-1), {id:"remove-tree", label:"Remove worktree…", danger:true, separatorBefore:true});
+  assert.ok(rowMenu({...tree, merged:true}).some(item => item.id === "remove-tree"));
+  assert.deepEqual(rowMenu({...tree, task:null}).map(item => item.id), ["mr", "copy-path", "copy-branch", "remove-tree"]);
+  assert.deepEqual(rowMenu({kind:"tree", tree:"loose", body:"/home/dev/loose\n +2"}).map(item => item.id), ["copy-path", "remove-tree"]);
+  assert.ok(!rowMenu({kind:"tree", tree:"loose"}).some(item => item.id === "copy-path"));
+  assert.ok(rowMenu({kind:"tree", tree:"demo"}, {mr}).some(item => item.id === "mr"));
+});
+
+test("agent menu offers focus, address and confirmed stop only with a terminal", () => {
+  assert.deepEqual(rowMenu({kind:"agent", terminal:"demo"}).map(item => item.id), ["agent", "copy-terminal", "stop-agent"]);
+  assert.deepEqual(rowMenu({kind:"agent", terminal:"demo"}).at(-1), {id:"stop-agent", label:"Stop agent…", danger:true, separatorBefore:true});
+  assert.equal(rowMenu({kind:"agent"}, {live:{address:"demo"}}).length, 3);
+  assert.deepEqual(rowMenu({kind:"agent"}), []);
+});
+
+test("MR and ticket menus offer service links and only MRs offer branch copying", () => {
+  const fields = {url:"https://example.test/demo", branch:"demo"};
+  assert.deepEqual(rowMenu({kind:"mr", ...fields}).map(item => item.label), ["Open in GitLab", "Copy link", "Copy branch"]);
+  assert.deepEqual(rowMenu({kind:"ticket", ...fields}).map(item => item.label), ["Open in Jira", "Copy link"]);
+  assert.deepEqual(rowMenu({kind:"mr"}), []);
+  assert.deepEqual(rowMenu({kind:"mr", branch:"demo"}).map(item => item.id), ["copy-branch"]);
+});
+
+test("section headers and presentation detail rows have no menu and inputs stay unchanged", () => {
+  for (const row of [null, {kind:"header"}, {kind:"section"}, {kind:"detail", type:"tree"}, {kind:"unknown"}])
+    assert.deepEqual(rowMenu(row), []);
+  const task = Object.freeze({kind:"task", task:"demo", title:"Demo", children:Object.freeze([])});
+  const ctx = Object.freeze({spaces:Object.freeze([{id:"space", name:"Demo"}])});
+  assert.deepEqual(rowMenu(task, ctx), rowMenu(task, ctx));
+});
 
 test("agent activity strips leading brands and spinners, preserving the actual activity", () => {
   for (const [title, app, expected] of [

@@ -351,6 +351,157 @@ fn select_automatically_resumes_codex_despite_claude_default() {
     );
 }
 
+fn git_snapshot(repo: &Path) -> Vec<Vec<u8>> {
+    [
+        vec!["status", "--porcelain"],
+        vec!["show-ref"],
+        vec!["worktree", "list", "--porcelain"],
+    ]
+    .into_iter()
+    .map(|args| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        out.stdout
+    })
+    .collect()
+}
+
+#[test]
+fn explicit_tree_resumes_its_latest_session_without_changing_git() {
+    let fixture = Fixture::new("");
+    let tree = fixture.tree();
+    fixture.sessions(&tree, false);
+    fs::write(fixture.root.join("vault/tasks/task.md"),
+        "---\ntickets: [DEMO-1]\nsessions: [\"codex:shared task 2026-10-29\", \"codex:recent task 2026-10-30\"]\n---\nContext\n").unwrap();
+    fs::write(fixture.root.join("codex/sessions/2026/10/29/rollout-recent.jsonl"),
+        json!({"type":"session_meta","timestamp":"2026-10-30T10:00:00Z","payload":{"id":"recent","cwd":tree,"source":"cli"}}).to_string()).unwrap();
+    let before = git_snapshot(&fixture.repo);
+    let commands = fixture.run(&["select", "task", "--tree", "task", "--bg"]);
+    assert_eq!(
+        pane_command(&commands),
+        "command codex --no-daemon 'resume' 'recent'"
+    );
+    assert_eq!(git_snapshot(&fixture.repo), before);
+    assert!(
+        commands
+            .iter()
+            .any(|c| c.contains(&tree.to_string_lossy().into_owned()))
+    );
+}
+
+#[test]
+fn explicit_tree_without_sessions_starts_fresh_without_changing_git() {
+    let fixture = Fixture::new("");
+    let tree = fixture.tree();
+    fs::write(
+        fixture.root.join("vault/tasks/task.md"),
+        "---\ntickets: [DEMO-1]\n---\nContext\n",
+    )
+    .unwrap();
+    let before = git_snapshot(&fixture.repo);
+    let commands = fixture.run(&[
+        "select", "task", "--tree", "task", "--bg", "--agent", "codex",
+    ]);
+    assert!(pane_command(&commands).starts_with("command codex --no-daemon 'Context:"));
+    assert_eq!(git_snapshot(&fixture.repo), before);
+    assert!(
+        commands
+            .iter()
+            .any(|c| c.contains(&tree.to_string_lossy().into_owned()))
+    );
+}
+
+#[test]
+fn explicit_tree_names_the_first_checkout_of_a_task_without_trees_or_sessions() {
+    let fixture = Fixture::new("");
+    fs::write(
+        fixture.root.join("vault/tasks/task.md"),
+        "---\ntitle: Demo idea\n---\nContext\n",
+    )
+    .unwrap();
+    let commands = fixture.run(&["select", "task", "--tree", "chosen-tree", "--bg"]);
+    let command = pane_command(&commands);
+    assert!(command.contains(" prepare "), "{command}");
+    assert!(
+        command.contains(".claude/worktrees/chosen-tree"),
+        "{command}"
+    );
+    let note = fs::read_to_string(fixture.root.join("vault/tasks/task.md")).unwrap();
+    assert!(note.contains("chosen-tree"));
+    let cache = if cfg!(target_os = "macos") {
+        fixture.root.join("home/Library/Caches/berbr")
+    } else {
+        fixture.root.join("cache/berbr")
+    };
+    let spec_path = fs::read_dir(cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("prepare-")
+        })
+        .unwrap();
+    let spec: serde_json::Value = serde_json::from_slice(&fs::read(spec_path).unwrap()).unwrap();
+    assert_eq!(spec["name"], "chosen-tree");
+}
+
+#[test]
+fn explicit_missing_tree_is_refused_when_the_task_has_worktrees_or_sessions() {
+    for (other_tree, saved) in [(true, false), (false, true), (true, true)] {
+        let fixture = Fixture::new("");
+        let tree = fixture.tree();
+        if saved {
+            fixture.sessions(&tree, false);
+        } else {
+            fs::write(
+                fixture.root.join("vault/tasks/task.md"),
+                "---\ntickets: [DEMO-1]\n---\nContext\n",
+            )
+            .unwrap();
+        }
+        git(
+            &fixture.repo,
+            &["worktree", "remove", tree.to_str().unwrap()],
+        );
+        if other_tree {
+            let other = fixture.repo.join(".claude/worktrees/other");
+            git(
+                &fixture.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-qb",
+                    "DEMO-1-other",
+                    other.to_str().unwrap(),
+                ],
+            );
+        }
+        let before = git_snapshot(&fixture.repo);
+        let out = fixture
+            .command(env!("CARGO_BIN_EXE_berbr"))
+            .args(["select", "task", "--tree", "task", "--bg"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("has no worktree task"));
+        assert!(!tree.exists());
+        assert_eq!(git_snapshot(&fixture.repo), before);
+        assert!(
+            !fixture
+                .commands()
+                .iter()
+                .any(|c| c.starts_with(&["pane".into(), "run".into()]))
+        );
+    }
+}
+
 #[test]
 fn review_uses_the_chosen_cli_and_its_own_model_setting() {
     let fixture = Fixture::new(

@@ -927,6 +927,34 @@ mod tests {
     }
 
     #[test]
+    fn finished_worktrees_keep_their_task_and_discovered_sessions() {
+        for state in ["merged", "closed"] {
+            let mut input = inputs(
+                vec![task("demo", &["DEMO-1"])],
+                vec![],
+                vec![mr(1, "DEMO-1-done", "Demo change", state)],
+                vec![tree("done", "DEMO-1-done")],
+            );
+            input.sessions.insert(
+                "codex:demo".into(),
+                Session {
+                    id: "codex:demo".into(),
+                    date: "2026-10-30".into(),
+                    cwds: vec![(format!("{ROOT}/done"), 1)],
+                    first_cwd: None,
+                    last_cwd: None,
+                    modified: 1,
+                },
+            );
+            let table = assemble(input);
+            assert!(table.trees[0].finished);
+            assert_eq!(table.tasks[0].trees, vec![0]);
+            assert_eq!(table.tasks[0].new_sessions[0].id, "codex:demo");
+            assert_eq!(table.tasks[0].new_sessions[0].worktree, "done");
+        }
+    }
+
+    #[test]
     fn write_back_updates_managed_keys_only() {
         let mut inputs = inputs(
             vec![task_note(

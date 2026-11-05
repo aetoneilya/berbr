@@ -1,7 +1,7 @@
 import { div } from "gpui-kit";
 import { h_flex, v_flex, TextView, EditorState, Editor } from "gpui-base";
 import { props, closeOverlay, setShared, readTextFile, writeTextFile, watchFolder, settings } from "herdr";
-import { parseFrontmatter, transformWikilinks, wikiTargets, wikiPath, obsidianUri } from "./model.js";
+import { parseFrontmatter, transformWikilinks, wikiTargets, wikiPath, obsidianUri, treeMarks } from "./model.js";
 import { icon, iconButton, button, chip, segmented, kbd, worktreeSwitch } from "./ui.js";
 
 function reloadNote(view, cx, {discard = false} = {}) {
@@ -324,15 +324,57 @@ function removeTreeForm(view, t, p) {
   const key = p.mr?.label?.match(/!\d+/)?.[0] ?? "";
   const state = p.mr?.state?.toLowerCase();
   const summary = p.mr ? `Its MR${key ? ` ${key}` : ""} is ${state}. ` : "";
+  const marks = treeMarks(p.tree);
   return v_flex().size_full().min_h(0).p(24).gap(12).bg(t.popover).text_color(t.foreground)
     .child(div().text_size(15).font_semibold().child(`Remove worktree “${p.tree?.tree ?? "unknown"}”?`))
     .child(v_flex().flex_1().min_h(0).gap(12).overflow_y_scrollbar()
       .child(div().text_size(13).text_color(t.muted).whitespace_normal()
-        .child(`${summary}The checkout folder is deleted. Berbr refuses if it has uncommitted changes, unpushed commits or an open MR.`))
+        .child(`${summary}Deletes the checkout folder, its Herdr tabs, and the local branch when safe. Uncommitted files are never discarded here.`))
+      .child(div().text_size(12).text_color(t.muted).whitespace_normal()
+        .child("Berbr refuses uncommitted changes, an open MR, unknown unpushed commits, or local commits not covered by a merged/closed MR. Unmerged commits already pushed to origin can be removed locally; the remote branch remains. Git and GitLab are checked again before removal."))
+      .when(marks.changes > 0, el => el.child(div().text_size(12).text_color(t.blocked).whitespace_normal()
+        .child(`Removal will be refused: ${marks.changes} uncommitted change(s) in the snapshot.`)))
+      .when(state === "opened" || p.tree?.mr_state === "opened", el => el.child(div().text_size(12).text_color(t.blocked)
+        .child("Removal will be refused: the MR is open.")))
       .when(Boolean(view.error), el => el.child(errorLine(view, t).whitespace_normal())))
     .child(h_flex().gap(8).justify_end().child(cancel(view, t))
       .child(button(t, "remove-tree", "Remove", cx => view.submitRemoveTree(cx),
         "primary", view.busy, view.busyAction === "remove-tree")));
+}
+
+function menuForm(view, t) {
+  return v_flex().p(4).bg(t.popover).text_color(t.foreground)
+    .children(view.menuItems.map((item, index) => v_flex()
+      .when(Boolean(item.separatorBefore), el => el.child(div().h(1).my(4).bg(t.border)))
+      .child(h_flex().id(`menu-${item.id}`).h(28).flex_none().px(10).items_center().rounded(5)
+        .text_size(13).text_color(item.danger ? t.blocked : t.foreground).cursor_pointer()
+        .when(index === view.menuIndex, el => el.bg(t.selected))
+        .hover(el => el.bg(t.hover)).opacity(view.busy ? 0.4 : 1)
+        .on_hover((hovered, cx) => { if (hovered && !view.busy) { view.menuIndex = index; cx.notify(); } })
+        .on_click((_event, cx) => {cx.stop_propagation(); view.chooseMenu(cx, item.id);})
+        .child(item.label))))
+    .when(Boolean(view.error), el => el.child(div().p(8).child(errorLine(view, t).whitespace_normal())));
+}
+
+function renameForm(view, t) {
+  return v_flex().size_full().p(24).gap(12).bg(t.popover).text_color(t.foreground)
+    .child(div().text_size(15).font_semibold().child("Rename task"))
+    .child(view.input("title"))
+    .when(Boolean(view.error), el => el.child(errorLine(view, t).whitespace_normal()))
+    .child(div().flex_1())
+    .child(h_flex().gap(8).justify_end().child(cancel(view, t))
+      .child(button(t, "rename-task", "Rename", cx => view.submitRename(cx), "primary", view.busy, view.busyAction === "rename")));
+}
+
+function stopAgentForm(view, t, p) {
+  return v_flex().size_full().min_h(0).p(24).gap(12).bg(t.popover).text_color(t.foreground)
+    .child(div().text_size(15).font_semibold().child("Stop agent?"))
+    .child(div().text_size(13).text_color(t.muted).whitespace_normal()
+      .child(`Stops terminal ${p.terminal ?? "unknown"}. Work in progress in this agent will be interrupted.`))
+    .when(Boolean(view.error), el => el.child(errorLine(view, t).whitespace_normal()))
+    .child(div().flex_1())
+    .child(h_flex().gap(8).justify_end().child(cancel(view, t))
+      .child(button(t, "stop-agent", "Stop agent", cx => view.submitStopAgent(cx), "primary", view.busy)));
 }
 
 function projectsForm(view, t, p) {
@@ -382,6 +424,9 @@ function attachTaskForm(view, t, p) {
 
 export function formView(view, t) {
   const p = props() ?? {};
+  if (view.form === "menu") return menuForm(view, t);
+  if (view.form === "rename") return renameForm(view, t);
+  if (view.form === "stop-agent") return stopAgentForm(view, t, p);
   if (view.form === "note") return noteForm(view, t, p);
   if (view.form === "new") return newForm(view, t);
   if (view.form === "ticket") return ticketForm(view, t, p);

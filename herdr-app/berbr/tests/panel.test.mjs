@@ -626,7 +626,7 @@ test("expanded details align with the task title, clip exactly two lines and mut
 });
 
 
-test("worktree clicks only select; Resume is explicit and keeps select arguments", async () => {
+test("task-owned worktree clicks and Resume keep the explicit select tree arguments", async () => {
   const {view, cx, jobs} = setup();
   const task = snapshot.rows[0];
   view.showDetails(task, cx);
@@ -637,9 +637,9 @@ test("worktree clicks only select; Resume is explicit and keeps select arguments
   click(byId(view.render(cx), item.id), cx);
   assert.equal(view.selected, item.id);
   assert.equal(view.handle.focused, true);
-  assert.equal(jobs.length, 0);
-  assert.deepEqual(args, []);
-  assert.deepEqual(state.calls, []);
+  await jobs.shift()(cx);
+  assert.deepEqual(args, [["select", task.task, "--tree", item.row.tree]]);
+  jobs.length = 0; view.loading = false; args.length = 0;
   const rendered = view.render(cx);
   const line = byId(rendered, item.id);
   const ids = nodes(line).map(node => node.attributes?.id?.[0]);
@@ -652,7 +652,7 @@ test("worktree clicks only select; Resume is explicit and keeps select arguments
   assert.deepEqual(args, [["select", task.task, "--tree", item.row.tree]]);
 });
 
-test("merged worktrees show Remove, and Enter or Remove opens a modal without running CLI", () => {
+test("merged worktrees show both Resume and Remove; click and Enter resume, only Remove opens a modal", async () => {
   const {view, cx, jobs, key} = setup();
   view.showDetails(snapshot.rows[0], cx);
   const item = view.rows().find(row => row.type === "tree" && row.mr?.state === "merged");
@@ -660,22 +660,29 @@ test("merged worktrees show Remove, and Enter or Remove opens a modal without ru
   view.cli = async values => {args.push(values); return "";};
   click(byId(view.render(cx), item.id), cx);
   assert.equal(state.overlays.length, 0);
+  await jobs.shift()(cx);
+  jobs.length = 0; view.loading = false;
   const rendered = view.render(cx);
-  assert.equal(byId(rendered, `${item.id}/resume`), undefined);
+  const resume = byId(rendered, `${item.id}/resume`);
+  assert.equal(resume.attributes.tooltip[0], "Resume agent");
+  click(resume, cx);
+  await jobs.shift()(cx);
+  jobs.length = 0; view.loading = false;
+  key("enter");
+  await jobs.shift()(cx);
+  jobs.length = 0; view.loading = false;
+  assert.deepEqual(args, Array.from({length:3}, () => ["select", item.row.task, "--tree", item.row.tree]));
   const remove = byId(rendered, `${item.id}/remove`);
   assert.equal(remove.attributes.tooltip[0], "Remove worktree");
   assert.equal(remove.attributes.size[0], 20);
   click(remove, cx);
   assert.equal(state.overlays.length, 1);
-  key("enter");
-  assert.equal(state.overlays.length, 2);
   const spec = state.overlays.at(-1);
   assert.equal(spec.props.form, "remove-tree");
   assert.equal(spec.props.tree.tree, item.row.tree);
   assert.equal(spec.width, 440);
   assert.equal(spec.modal, true);
   assert.equal(jobs.length, 0);
-  assert.deepEqual(args, []);
 });
 
 test("remove confirmation checks current task names, runs done without force and closes on success", async () => {
@@ -687,7 +694,7 @@ test("remove confirmation checks current task names, runs done without force and
   const rendered = view.render(cx);
   assert.ok(text(rendered).includes("Remove worktree “branch”?"));
   assert.ok(text(rendered).includes("Its MR !42 is merged."));
-  assert.ok(text(rendered).includes("unpushed commits or an open MR"));
+  assert.ok(text(rendered).includes("unknown unpushed commits, or local commits not covered by a merged/closed MR"));
   click(byId(rendered, "remove-tree"), cx);
   assert.equal(view.busy, true);
   await jobs.shift()(cx);
@@ -823,20 +830,40 @@ test("loose worktrees never select their tree name, including children of loose 
   assert.equal(state.calls.length, 0);
 });
 
-test("loose inner trees only offer Remove even when an obsolete task field remains", () => {
+test("task-owned trees resume even when rendered among loose rows", async () => {
   const tree = {id:"loose-tree", kind:"tree", tree:"loose", task:"old task"};
   const {view, cx, jobs} = setup({data:{rows:[tree]}});
   view.collapsed.clear();
-  view.taskClick(tree, cx);
+  view.showDetails(tree, cx);
   const inner = view.looseItems(tree).find(item => item.type === "tree");
   view.selected = inner.id;
   const rendered = view.render(cx);
-  assert.equal(byId(rendered, `${inner.id}/resume`), undefined);
-  assert.equal(byId(rendered, `${inner.id}/review`), undefined);
-  click(byId(rendered, `${inner.id}/remove`), cx);
-  view.enter(view.chosen(), cx);
-  assert.equal(state.overlays.length, 2);
-  assert.equal(jobs.length, 0);
+  assert.ok(byId(rendered, `${inner.id}/resume`));
+  const args = [];
+  view.cli = async values => {args.push(values); return "Done";};
+  click(byId(rendered, inner.id), cx);
+  await jobs.shift()(cx);
+  assert.deepEqual(args, [["select", "old task", "--tree", "loose"]]);
+  assert.equal(state.overlays.length, 0);
+});
+
+test("all merged and closed markers keep Resume primary alongside explicit Remove", async () => {
+  for (const [fields, mrState] of [[{merged:true}, null], [{mr_state:"merged"}, null],
+    [{mr_state:"closed"}, null], [{state:"finished"}, null], [{}, "merged"], [{}, "closed"], [{mr_state:"opened"}, "closed"]]) {
+    const mr = mrState ? {kind:"mr", state:mrState} : null;
+    const row = {kind:"tree", tree:"demo", task:"task", ...fields};
+    const {view, cx, jobs} = setup();
+    view.selected = "demo";
+    const actions = view.treeActions(theme(), row, mr, "demo");
+    assert.equal(actions[0].attributes.tooltip[0], "Resume agent");
+    assert.ok(actions.some(node => node.attributes.tooltip[0] === "Remove worktree"));
+    const args = [];
+    view.cli = async values => {args.push(values); return "Done";};
+    click(actions[0], cx);
+    await jobs.shift()(cx);
+    assert.deepEqual(args, [["select", "task", "--tree", "demo"]]);
+    assert.equal(state.overlays.length, 0);
+  }
 });
 
 test("CLI errors clean both streams and preserve zsh invocation and stdout on success", async () => {
@@ -891,7 +918,7 @@ test("loose ticket click and Enter toggle the shared accordion without opening a
   assert.deepEqual(state.execs, []);
 });
 
-test("loose worktree Resume and inner Enter select the open ticket, never the tree name", async () => {
+test("loose worktree Resume selects its ticket; inner Enter keeps removal as the primary action", async () => {
   const {view, cx, jobs} = setup();
   const row = view.rows().find(row => row.target === "DEMO-61");
   view.taskClick(row, cx);
@@ -907,8 +934,8 @@ test("loose worktree Resume and inner Enter select the open ticket, never the tr
   assert.deepEqual(args, [["select", "DEMO-61"]]);
   jobs.length = 0; view.loading = false;
   view.enter(view.chosen(), cx);
-  await jobs.shift()(cx);
-  assert.deepEqual(args.at(-1), ["select", "DEMO-61"]);
+  assert.equal(state.overlays.at(-1).props.form, "remove-tree");
+  assert.equal(jobs.length, 0);
   jobs.length = 0; view.loading = false;
   assert.ok(args.every(values => values[1] !== tree.row.tree));
   view.collapsed.delete("cleanup");
@@ -1195,7 +1222,7 @@ test("merged metadata offers explicit worktree removal without an MR child", () 
   const rendered = view.render(cx);
   assert.ok(text(byId(rendered, item.id)).includes("merged"));
   assert.equal(byId(rendered, "section-cleanup"), undefined);
-  assert.equal(byId(rendered, `${item.id}/resume`), undefined);
+  assert.ok(byId(rendered, `${item.id}/resume`));
   click(byId(rendered, `${item.id}/remove`), cx);
   assert.equal(state.overlays.at(-1).props.form, "remove-tree");
   assert.equal(jobs.length, 0);
@@ -2055,4 +2082,210 @@ test("spaces named by title or old id suppress Start work and focus the matching
     click(control, cx);
     assert.deepEqual(state.calls, [["space.select", {id:"existing-space"}]]);
   }
+});
+
+test("right click selects task, detail and loose rows without expanding or running actions", () => {
+  const tree = {id:"tree", kind:"tree", tree:"demo-tree", task:"demo", cwd:"/home/dev/demo"};
+  const agent = {id:"agent", kind:"agent", terminal:"pane"};
+  const mr = {id:"mr", kind:"mr", state:"opened", url:"https://gitlab.example/demo/-/merge_requests/1"};
+  const ticket = {id:"ticket", kind:"ticket", target:"DEMO-1", url:"https://jira.example/browse/DEMO-1"};
+  const task = {id:"task", kind:"task", task:"demo", title:"Demo", children:[tree, agent, mr, ticket]};
+  const {view, cx, jobs} = setup({data:{rows:[task]}});
+  const right = node => {
+    assert.equal(node.attributes.on_mouse_down[0], "right");
+    node.attributes.on_mouse_down[1]({}, cx);
+  };
+  right(view.taskRow(theme(), task));
+  assert.equal(view.selected, "task");
+  assert.equal(view.expanded, null);
+  assert.equal(state.overlays.at(-1).kind, "popup");
+  assert.equal(state.overlays.at(-1).at, "pointer");
+  assert.equal(state.overlays.at(-1).width, 220);
+  assert.equal(state.overlays.at(-1).height, undefined);
+  assert.equal(state.overlays.at(-1).props.form, "menu");
+  view.showDetails(task, cx);
+  for (const row of [tree, agent, mr]) {
+    const item = view.detailItems(task).find(item => item.row === row);
+    right(byId(view.detailRow(theme(), item), item.id));
+    assert.equal(view.selected, item.id);
+    assert.equal(state.overlays.at(-1).props.row, row);
+  }
+  for (const row of [tree, agent, mr, ticket]) {
+    right(view.looseRow(theme(), row, "cleanup"));
+    assert.equal(state.overlays.at(-1).props.row, row);
+  }
+  // Ticket attributes are inline links, rather than navigable detail wrappers.
+  right(view.externalLink(theme(), "inline-ticket", ticket));
+  view.render(cx);
+  assert.equal(view.selected, ticket.id);
+  assert.equal(view.chosen(), ticket);
+  assert.deepEqual(state.calls, []);
+  assert.deepEqual(state.execs, []);
+  assert.deepEqual(state.hcCalls, []);
+  assert.equal(jobs.length, 0);
+});
+
+test("headers and plain detail rows never open a menu", () => {
+  const {view, cx} = setup();
+  for (const item of [{kind:"header", id:"header"}, {kind:"section", id:"section"},
+    {kind:"detail", type:"main", id:"main"}, {kind:"detail", type:"action", id:"action"}]) {
+    view.openRowMenu(item, cx);
+    if (item.kind === "detail") assert.equal(view.innerRow(theme(), item).attributes.on_mouse_down, undefined);
+  }
+  assert.deepEqual(state.overlays, []);
+});
+
+test("Shift F10 and context-menu keys open the selected row menu outside text inputs", () => {
+  const task = {id:"task", kind:"task", task:"demo", title:"Demo"};
+  const {view, cx} = setup({data:{rows:[task]}});
+  for (const event of [{key:"f10", keystroke:"shift-f10"}, {key:"contextmenu"}, {key:"menu"}, {key:"apps"}]) {
+    view.key(event, cx);
+    assert.equal(state.overlays.at(-1).props.row, task);
+  }
+  assert.equal(state.overlays.length, 4);
+  view.searchFocused = true;
+  view.key({key:"f10", keystroke:"shift-f10"}, cx);
+  assert.equal(state.overlays.length, 4);
+});
+
+test("menu arrows wrap, Enter dispatches the highlighted item, and Escape only closes", () => {
+  const row = {kind:"agent", terminal:"pane"};
+  const {view, cx, key, jobs} = setup({props:{form:"menu", row, overlay:"menu"}});
+  key("up");
+  assert.equal(view.menuIndex, 2);
+  assert.ok(byId(view.render(cx), "menu-stop-agent").attributes.bg);
+  key("down"); assert.equal(view.menuIndex, 0);
+  key("down"); key("down"); key("enter");
+  assert.equal(state.overlays.at(-1).props.form, "stop-agent");
+  assert.deepEqual(state.hcCalls, []);
+  assert.equal(jobs.length, 0);
+  key("escape");
+  assert.deepEqual(state.calls.at(-1), ["closeOverlay", "menu"]);
+});
+
+test("active worktree menu dispatch opens the existing remove dialog without running done", () => {
+  const mr = {kind:"mr", label:"!1 Demo", state:"opened"};
+  const row = {id:"tree", kind:"tree", tree:"demo-tree", task:"demo", children:[mr]};
+  const rows = [{kind:"task", task:"demo"}];
+  const {view, cx, jobs} = setup({props:{form:"menu", row, mr, rows, overlay:"menu"}});
+  click(byId(view.render(cx), "menu-remove-tree"), cx);
+  assert.equal(state.overlays.at(-1).props.form, "remove-tree");
+  assert.equal(state.overlays.at(-1).props.tree, row);
+  assert.equal(state.overlays.at(-1).props.rows, rows);
+  assert.deepEqual(state.calls, [["closeOverlay", "menu"]]);
+  assert.equal(jobs.length, 0);
+});
+
+test("stop agent opens a confirmation and only its explicit confirm button calls hc kill", async () => {
+  const row = {kind:"agent", terminal:"pane"};
+  const menu = setup({props:{form:"menu", row, live:{address:"address"}, overlay:"menu"}});
+  menu.view.chooseMenu(menu.cx, "stop-agent");
+  const spec = state.overlays.at(-1);
+  assert.equal(spec.modal, true);
+  assert.equal(spec.props.terminal, "address");
+  assert.deepEqual(state.hcCalls, []);
+  const cancel = setup({props:{...spec.props, overlay:"confirm"}});
+  cancel.key("enter"); cancel.key("escape");
+  assert.deepEqual(state.hcCalls, []);
+  assert.equal(cancel.jobs.length, 0);
+  const confirm = setup({props:{...spec.props, overlay:"confirm"}});
+  click(byId(confirm.view.render(confirm.cx), "stop-agent"), confirm.cx);
+  assert.deepEqual(state.hcCalls, []);
+  await confirm.jobs.shift()(confirm.cx);
+  assert.deepEqual(state.hcCalls, [["kill", "address"]]);
+  assert.ok(state.calls.some(call => call[0] === "closeOverlay" && call[1] === "confirm"));
+});
+
+test("stop failures retain the dialog and show the hc error without retrying", async () => {
+  const {view, cx, jobs} = setup({props:{form:"stop-agent", terminal:"demo", overlay:"confirm"}});
+  state.hcResult = {code:1, stdout:"", stderr:"Terminal demo is unavailable"};
+  view.submitStopAgent(cx); view.submitStopAgent(cx);
+  await jobs.shift()(cx);
+  assert.deepEqual(state.hcCalls, [["kill", "demo"]]);
+  assert.ok(text(view.render(cx)).includes("Terminal demo is unavailable"));
+  assert.ok(!state.calls.some(call => call[0] === "closeOverlay"));
+});
+
+test("copy actions pass literal text through argv to pbcopy and show Copied on success", async () => {
+  const value = '-demo "quote" $(literal) `literal`\nnext';
+  for (const [row, id] of [
+    [{kind:"task", title:value}, "copy-title"],
+    [{kind:"tree", tree:"demo", cwd:value}, "copy-path"],
+    [{kind:"tree", tree:"demo", body:"/home/dev/demo\n +1"}, "copy-path"],
+    [{kind:"tree", tree:"demo", branch:value}, "copy-branch"],
+    [{kind:"agent", terminal:value}, "copy-terminal"],
+    [{kind:"mr", url:value}, "copy-link"],
+  ]) {
+    const {view, cx, jobs} = setup({props:{form:"menu", row, overlay:"menu"}});
+    view.chooseMenu(cx, id);
+    await jobs.shift()(cx);
+    assert.deepEqual(state.execs, [["/bin/sh", ["-c", 'printf %s "$1" | /usr/bin/pbcopy', "berbr-copy",
+      row.body ? "/home/dev/demo" : value]]]);
+    assert.equal(state.notices.at(-1).body, "Copied");
+    assert.deepEqual(state.calls.at(-1), ["closeOverlay", "menu"]);
+  }
+});
+
+test("copy and URL failures remain visible in the menu", async () => {
+  for (const id of ["copy-link", "url"]) {
+    const {view, cx, jobs} = setup({props:{form:"menu", row:{kind:"mr", url:"https://example.test/demo"}, overlay:"menu"}});
+    state.execResult = {code:1, stdout:"", stderr:"Example failure"};
+    view.chooseMenu(cx, id);
+    await jobs.shift()(cx);
+    assert.ok(text(view.render(cx)).includes("Example failure"));
+    assert.ok(!state.calls.some(call => call[0] === "closeOverlay"));
+    assert.equal(state.notices.length, 0);
+  }
+});
+
+test("rename menu opens a prefilled form and submits only berbr rename with literal argv", async () => {
+  const row = {kind:"task", task:"demo", title:"Demo title"};
+  const menu = setup({props:{form:"menu", row, overlay:"menu"}});
+  menu.view.chooseMenu(menu.cx, "rename");
+  const spec = state.overlays.at(-1);
+  assert.equal(spec.props.form, "rename");
+  assert.equal(spec.props.prefill.title, "Demo title");
+  const {view, cx, jobs} = setup({props:{...spec.props, overlay:"rename"}});
+  const calls = [];
+  view.cli = async args => {calls.push(args); return "Renamed";};
+  view.values.title = "  ";
+  click(byId(view.render(cx), "rename-task"), cx);
+  assert.equal(jobs.length, 0);
+  view.inputs.title.set_value('Demo "new" $(literal)');
+  view.inputs.title.emit("change", cx);
+  view.inputs.title.emit("submit", cx);
+  await jobs.shift()(cx);
+  assert.deepEqual(calls, [["rename", "demo", 'Demo "new" $(literal)']]);
+});
+
+test("task and tree menu actions reuse space, note, done, select and review flows", async () => {
+  const task = {kind:"task", task:"demo", title:"Demo", note:"/home/dev/demo.md"};
+  for (const id of ["space", "note", "done"]) {
+    const {view, cx} = setup({props:{form:"menu", row:task, overlay:"menu"}, liveSpaces:[{id:"space", name:"Demo"}]});
+    view.chooseMenu(cx, id);
+    if (id === "space") assert.deepEqual(state.calls.at(-1), ["space.select", {id:"space"}]);
+    else assert.equal(state.overlays.at(-1).props.form, id);
+  }
+  for (const [row, id, expected] of [
+    [task, "start", ["select", "demo"]],
+    [{kind:"tree", task:"demo", tree:"demo-tree", merged:true}, "resume", ["select", "demo", "--tree", "demo-tree"]],
+    [{kind:"tree", task:"demo", tree:"demo-tree"}, "review", ["review", "demo-tree"]],
+  ]) {
+    const {view, cx, jobs} = setup({props:{form:"menu", row, overlay:"menu"}});
+    const calls = [];
+    view.cli = async args => {calls.push(args); return "Done";};
+    view.chooseMenu(cx, id);
+    await jobs.shift()(cx);
+    assert.deepEqual(calls, [expected]);
+  }
+});
+
+test("tree confirmation states known blockers and that pushed unmerged commits may be removed", () => {
+  const {view, cx} = setup({props:{form:"remove-tree", tree:{kind:"tree", tree:"demo", body:"/home/dev/demo\n +2"},
+    mr:{kind:"mr", state:"opened"}}});
+  const rendered = text(view.render(cx));
+  assert.ok(rendered.includes("Removal will be refused: 2 uncommitted change(s)"));
+  assert.ok(rendered.includes("Removal will be refused: the MR is open"));
+  assert.ok(rendered.includes("Uncommitted files are never discarded here"));
+  assert.ok(rendered.includes("Unmerged commits already pushed to origin can be removed locally"));
 });

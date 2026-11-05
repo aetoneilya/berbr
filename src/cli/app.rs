@@ -65,6 +65,7 @@ fn row(table: &Table, node: &Node, owner: Option<&str>) -> Value {
             value["label"] = json!(format!("!{}  {}", m.mr.iid(), look::mr_title(m)));
             value["state"] = json!(m.mr.state().as_str());
             value["url"] = json!(m.mr.web_url());
+            value["branch"] = json!(m.mr.source_branch());
             value["body"] = json!(
                 look::review(m)
                     .iter()
@@ -205,6 +206,7 @@ mod tests {
                         let table = table(vec![], vec![], vec![m], vec![]);
                         let value = row(&table, &node, None);
                         assert!(value["body"].is_string());
+                        assert_eq!(value["branch"], "TEST-1-work");
                         if state != "opened" {
                             for field in [
                                 "ci",

@@ -58,7 +58,7 @@ fn first_worktree(
 
 /// `berbr select [<task | KEY>]`: back to existing work — focus its agent, or start
 /// the owning CLI in its worktree resuming the last session, restoring the worktree if
-/// it was removed.
+/// it was removed. An explicit `--tree` may name the first checkout of an empty task.
 pub(in crate::cli) fn cli_select(config: &Config, args: SelectArgs) -> Result<(), String> {
     select(config, args, &mut Terminal)
 }
@@ -101,8 +101,30 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
                 .collect()
         })
         .unwrap_or_default();
+    // Only a task with no worktrees or sessions can name its first checkout.
+    // Check before filtering sessions by agent or tree, so history cannot fall
+    // through to checkout creation or restoration for a missing named tree.
+    let first_checkout = row.is_some() && trees.is_empty() && sessions.is_empty();
+    let mut trees = trees;
+    if let Some(name) = &tree_name
+        && !first_checkout
+    {
+        trees.retain(|&i| &table.tree(i).wt.name() == name);
+        if trees.is_empty() {
+            return Err(format!(
+                "\"{space}\" has no worktree {name}; it may have been removed"
+            ));
+        }
+        if !table.tree(trees[0]).wt.path.is_dir() {
+            return Err(format!("worktree {name} is no longer on disk"));
+        }
+    }
+
     if !new_session && let Some(kind) = config.workflow.agent_override {
         sessions.retain(|s| AgentKind::from_session_key(&s.id) == kind);
+    }
+    if let Some(name) = &tree_name {
+        sessions.retain(|s| &s.worktree == name);
     }
     newest_first(&mut sessions, &table.sessions);
 
@@ -123,7 +145,11 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
             })
             .collect();
         let chosen = &sessions[ui.pick("Session", &items)?];
-        let tree = restore_worktree(config, row, &chosen.worktree, ui)?;
+        let tree = if tree_name.is_some() {
+            table.tree(trees[0]).wt.path.clone()
+        } else {
+            restore_worktree(config, row, &chosen.worktree, ui)?
+        };
         return resume(&table, space, chosen, &tree, note, bg, ui);
     }
 
@@ -155,13 +181,6 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
         return resume(&table, space, last, &tree, note, bg, ui);
     }
 
-    let mut trees = trees;
-    if let Some(name) = &tree_name {
-        trees.retain(|&i| &table.tree(i).wt.name() == name);
-        if trees.is_empty() {
-            return Err(format!("\"{space}\" has no worktree {name}"));
-        }
-    }
     // `berbr select DEMO-123` means that ticket's worktree
     if let Some(key) = &key
         && trees.iter().any(|&i| table.tree(i).keys.contains(key))
