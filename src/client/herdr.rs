@@ -319,6 +319,35 @@ pub fn name_agent_when_up(pane: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn rename_workspace(id: &str, label: &str) -> Result<()> {
+    run_herdr(&["workspace", "rename", id, label]).map(|_| ())
+}
+
+pub fn caller_tab() -> Result<Option<String>> {
+    if !available() {
+        return Ok(None);
+    }
+    if let Ok(id) = std::env::var("HERDR_TAB_ID")
+        && !id.trim().is_empty()
+    {
+        return Ok(Some(id));
+    }
+    let pane = std::env::var("HERDR_PANE_ID")
+        .or_else(|_| std::env::var("HC_TERMINAL_ID"))
+        .ok()
+        .filter(|s| !s.is_empty());
+    if let Some(pane) = pane {
+        if app::enabled() {
+            return app::tab_of(&pane);
+        }
+        return Ok(list_agents()?
+            .into_iter()
+            .find(|a| a.pane_id == pane)
+            .map(|a| a.tab_id));
+    }
+    Ok(None)
+}
+
 pub fn rename_tab(tab: &str, label: &str) -> Result<()> {
     run_herdr(&["tab", "rename", tab, label]).map(|_| ())
 }
@@ -364,7 +393,17 @@ pub fn focus_agent(target: &str) -> Result<()> {
 
 /// Starts the chosen CLI directly, bypassing shell wrappers, then names it.
 pub fn start_agent(kind: AgentKind, name: &str, pane: &str, args: &[&str]) -> Result<()> {
-    run_in_pane(pane, &kind.shell_command(args))?;
+    start_agent_with_label(kind, name, pane, name, args)
+}
+
+pub fn start_agent_with_label(
+    kind: AgentKind,
+    name: &str,
+    pane: &str,
+    label: &str,
+    args: &[&str],
+) -> Result<()> {
+    run_in_pane(pane, &kind.named_shell_command(label, args))?;
     name_agent_when_up(pane, name)
 }
 

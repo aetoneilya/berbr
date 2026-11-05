@@ -54,6 +54,27 @@ impl AgentKind {
         }
     }
 
+    pub fn named_shell_prefix(self, label: &str) -> String {
+        if self == Self::Claude {
+            format!(
+                "{} --name {}",
+                self.shell_prefix(),
+                super::herdr::shell_quote(label)
+            )
+        } else {
+            self.shell_prefix().to_string()
+        }
+    }
+
+    pub fn named_shell_command(self, label: &str, args: &[&str]) -> String {
+        let command = self.shell_command(args);
+        if self == Self::Claude && !args.contains(&"--name") {
+            command.replacen(self.shell_prefix(), &self.named_shell_prefix(label), 1)
+        } else {
+            command
+        }
+    }
+
     pub fn shell_command(self, args: &[&str]) -> String {
         let mut command = self.shell_prefix().to_string();
         for arg in args {
@@ -117,5 +138,26 @@ mod tests {
             assert!(command.contains("'\\''my note'\\''"));
             assert!(command.starts_with(&format!("{} '", kind.shell_prefix())));
         }
+    }
+}
+
+#[cfg(test)]
+mod display_name_tests {
+    use super::*;
+
+    #[test]
+    fn claude_display_names_are_literal_and_codex_has_no_name_flag() {
+        assert_eq!(
+            AgentKind::Claude.named_shell_command("Parser's task", &["prompt"]),
+            "command claude --name 'Parser'\\''s task' 'prompt'"
+        );
+        assert_eq!(
+            AgentKind::Claude.named_shell_command("default", &["--name", "explicit", "prompt"]),
+            "command claude '--name' 'explicit' 'prompt'"
+        );
+        assert_eq!(
+            AgentKind::Codex.named_shell_command("ignored", &["prompt"]),
+            "command codex --no-daemon 'prompt'"
+        );
     }
 }

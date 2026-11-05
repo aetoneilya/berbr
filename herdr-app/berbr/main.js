@@ -2,7 +2,7 @@ import { View, div, svg, image } from "gpui-kit";
 import { h_flex, v_flex, Input, InputState, TextView } from "gpui-base";
 import { appHome, exec, focused, spaces, agents, theme, run, props,
   openOverlay, closeOverlay, notify, shared, setShared, nextCommand, hc } from "herdr";
-import { walk, visibleRows, sectionLabels,
+import { walk, visibleRows, sectionLabels, taskSpace,
   normalizeTicketState, ticketTitle,
   worktreeNameCollision, cleanCliText, isClosedTicket,
   agentActivity, formatElapsed, blockedPrompt, mrFlags, jumpItems, matchJump, closePlan, PanelModel, treeMarks, isMergedTree, mergedPlan, backendClosePlan } from "./model.js";
@@ -133,7 +133,7 @@ export default class Berbr extends View {
         if (firstData) {
           const flat = walk(data.rows);
           const caller = (this.opening?.terminal && flat.find(row => row.terminal === this.opening.terminal))
-            || (this.opening?.space && flat.find(row => row.space === this.opening.space));
+            || (this.opening?.space && flat.find(row => taskSpace(row, spaces())?.id === this.opening.space));
           const task = caller && flat.find(row => row.kind === "task" && row.task === caller.task);
           this.selected = task?.id ?? this.expanded;
           if (task) this.setExpanded(task.id, cx);
@@ -527,7 +527,8 @@ export default class Berbr extends View {
     if (this.busy) return;
     if (row.kind === "section") this.toggleSection(row.section, cx);
     else if (row.kind === "task") {
-      if (spaces().some(space => space.id === row.space)) run("space.select", {id:row.space});
+      const space = taskSpace(row, spaces());
+      if (space) run("space.select", {id:space.id});
       else this.setExpanded(row.id, cx);
     } else if (row.kind === "detail" && row.type === "tree") row.action(cx);
     else this.taskClick(row, cx);
@@ -630,7 +631,7 @@ export default class Berbr extends View {
         .child(h_flex().gap(6).items_center().min_w(0)
           .child(div().flex_1().min_w(0).text_size(13).truncate().child(row.title ?? row.label ?? row.task ?? "Untitled task"))
           .when(Boolean(signal.liveSpace), el => el.child(iconButton(t, `task-space-${row.id}`, "monitor", "Go to space",
-            () => run("space.select", {id:row.space}), {size:20, disabled:this.busy}))))
+            () => run("space.select", {id:signal.liveSpace.id}), {size:20, disabled:this.busy}))))
         .when(secondLine, el => el.child(hints)))
       .when(expanded || this.hovered === row.id || selected, el => el.child(iconButton(t, `details-${row.id}`,
         expanded ? "chevron-down" : "chevron-right", expanded ? "Collapse task" : "Expand task",
@@ -670,7 +671,7 @@ export default class Berbr extends View {
           (cx, id) => key === "history" ? this.openUrl(row.url, cx, id) : this.openNote(row));
       }
     }
-    if (!detail.trees.length && !this.liveState().spaces.some(space => space.id === task.space))
+    if (!detail.trees.length && !taskSpace(task, this.liveState().spaces))
       add("action", "start", {label:"Start work", accent:true}, (cx, id) => this.open(task, cx, id));
     if (task.note) add("action", "note", {label:"Note"}, () => this.openNote(task));
     if (!task.done) add("action", "close", {label:"Close task", close:true}, () => this.formOverlay("done", {

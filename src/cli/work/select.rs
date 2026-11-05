@@ -3,9 +3,9 @@
 use super::brief::{brief_path, brief_text};
 use super::common::{
     Terminal, Ui, branch_name, choose_repo, err, fetch_issue, find_task, is_ticket_key,
-    name_from_issue, name_from_text, repo_with_worktree,
+    repo_with_worktree, work_name,
 };
-use super::launch::{Context, Open, launch, open_agent, open_work};
+use super::launch::{Context, Open, Space, launch, open_agent, open_work};
 use crate::cli::SelectArgs;
 use crate::cli::load;
 use crate::client::agent::AgentKind;
@@ -35,16 +35,7 @@ fn first_worktree(
     let task = &row.task;
     let key = task.tickets.first();
     let issue = key.map(|k| fetch_issue(config, k)).transpose()?;
-    let name = match (tree_name, &issue) {
-        (Some(name), _) => name,
-        (None, Some(issue)) => name_from_issue(issue),
-        (None, None) => name_from_text(&task.name).ok_or_else(|| {
-            format!(
-                "no latin worktree name comes out of \"{}\" — give one with --tree",
-                task.name
-            )
-        })?,
-    };
+    let name = work_name(task, tree_name, issue.as_ref());
     let main = choose_repo(config, ui)?;
     let branch = branch_name(config, key, &name);
     let tree = worktree::worktree_dir(&main, &name);
@@ -91,11 +82,11 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
     let (space, trees, row) = match work {
         Work::Task(i) => {
             let row = &table.tasks[i];
-            (row.task.name.clone(), row.trees.clone(), Some(row))
+            (Space::Task(&row.task), row.trees.clone(), Some(row))
         }
         Work::Ticket(i) => {
             let loose = &table.loose[i];
-            (loose.key.clone(), loose.trees.clone(), None)
+            (Space::Label(&loose.key), loose.trees.clone(), None)
         }
     };
 
@@ -133,7 +124,7 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
             .collect();
         let chosen = &sessions[ui.pick("Session", &items)?];
         let tree = restore_worktree(config, row, &chosen.worktree, ui)?;
-        return resume(&table, &space, chosen, &tree, note, bg, ui);
+        return resume(&table, space, chosen, &tree, note, bg, ui);
     }
 
     if trees.is_empty() {
@@ -148,19 +139,20 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
             let brief = brief_path(&tree)?;
             return launch(
                 config.workflow.agent,
-                &space,
+                space,
                 &tree,
                 &last.worktree,
                 Context {
                     note,
                     brief: &brief,
                     description: None,
+                    display_name: None,
                 },
                 !bg,
                 ui,
             );
         }
-        return resume(&table, &space, last, &tree, note, bg, ui);
+        return resume(&table, space, last, &tree, note, bg, ui);
     }
 
     let mut trees = trees;
@@ -214,19 +206,20 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
             return Ok(());
         }
         if let Some(last) = sessions.iter().find(|s| s.worktree == tree.wt.name()) {
-            return resume(&table, &space, last, &tree.wt.path, note, bg, ui);
+            return resume(&table, space, last, &tree.wt.path, note, bg, ui);
         }
     }
     let brief = brief_path(&tree.wt.path)?;
     launch(
         config.workflow.agent,
-        &space,
+        space,
         &tree.wt.path,
         &tree.wt.name(),
         Context {
             note,
             brief: &brief,
             description: None,
+            display_name: None,
         },
         !bg,
         ui,
@@ -247,7 +240,7 @@ fn newest_first(sessions: &mut [SessionRef], transcripts: &HashMap<String, Sessi
 /// Claude's deleted transcript falls back to a fresh conversation.
 fn resume(
     table: &Table,
-    space: &str,
+    space: Space<'_>,
     session: &SessionRef,
     tree: &Path,
     note: Option<&Path>,
@@ -285,6 +278,7 @@ fn resume(
                 note,
                 brief: &brief,
                 description: None,
+                display_name: None,
             },
             !bg,
             ui,

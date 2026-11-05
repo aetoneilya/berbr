@@ -230,7 +230,7 @@ fn task_row(
 ) -> TaskRow {
     let space = workspaces
         .iter()
-        .find(|w| w.label.trim().eq_ignore_ascii_case(task.name.trim()))
+        .find(|w| crate::vault::task::task_space_matches(&task, &w.label))
         .map(|w| w.workspace_id.clone());
     let has_key = |keys: &[String]| keys.iter().any(|k| task.tickets.contains(k));
     let in_space = |tree: &Tree| {
@@ -242,9 +242,11 @@ fn task_row(
         let name = tree.wt.name();
         task.sessions.iter().any(|s| s.worktree == name)
     };
+    let saved_worktrees = task.note.strings("worktrees");
     let row_trees: Vec<usize> = (0..trees.len())
         .filter(|&i| {
             has_key(&trees[i].keys)
+                || saved_worktrees.contains(&trees[i].wt.name())
                 || in_space(&trees[i])
                 || from_session(&trees[i])
                 || (task.note.string("id").as_deref() == Some(task.name.as_str())
@@ -960,5 +962,47 @@ mod tests {
         assert_eq!(sessions, vec!["s0 a 2026-10-01", "s1 a 2026-10-08"]);
         // the table now matches the note: nothing more to write
         assert!(write_back(&mut table).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::*;
+    use crate::table::fixtures::*;
+    use crate::vault::task::task_space_matches;
+
+    #[test]
+    fn snapshot_matches_title_id_and_legacy_space_labels() {
+        for label in [" DEMO-0 ", " проверить PARSER "] {
+            let task = task_note(
+                "demo-0",
+                "id: demo-0\ntitle: Проверить Parser",
+                "2026-11-01",
+            );
+            assert!(task_space_matches(&task, label));
+            assert!(!task_space_matches(&task, "another"));
+            let mut input = inputs(vec![task], vec![], vec![], vec![]);
+            input.workspaces = vec![workspace("task-space", label)];
+            let table = assemble(input);
+            assert_eq!(table.tasks[0].space.as_deref(), Some("task-space"));
+        }
+        let legacy = task_note("Legacy title", "", "2026-11-01");
+        assert!(task_space_matches(&legacy, " legacy TITLE "));
+    }
+
+    #[test]
+    fn saved_title_slug_stays_attached_after_rename_without_agents_or_sessions() {
+        let task = task_note(
+            "demo-0",
+            "id: demo-0\ntitle: New title\nworktrees: [old-title]",
+            "2026-11-01",
+        );
+        let table = table(
+            vec![task],
+            vec![],
+            vec![],
+            vec![tree("old-title", "dev/old-title")],
+        );
+        assert_eq!(table.tasks[0].trees, vec![0]);
     }
 }

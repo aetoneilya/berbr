@@ -2041,3 +2041,18 @@ test("loose and Cleanup worktree marks spell out uncommitted counts without a pl
     }
   }
 });
+
+test("spaces named by title or old id suppress Start work and focus the matching space", () => {
+  for (const name of [" demo-4 ", " проверка PARSER "]) {
+    const task = {kind:"task", id:"demo", task:"demo-4", title:"Проверка Parser", children:[]};
+    const {view, cx, key} = setup({data:{rows:[task]}, liveSpaces:[{id:"existing-space", name, tabs:[]}]});
+    assert.ok(!view.detailItems(task).some(item => item.label === "Start work"));
+    key("enter");
+    assert.deepEqual(state.calls, [["space.select", {id:"existing-space"}]]);
+    const control = byId(view.render(cx), "task-space-demo");
+    assert.ok(control);
+    state.calls.length = 0;
+    click(control, cx);
+    assert.deepEqual(state.calls, [["space.select", {id:"existing-space"}]]);
+  }
+});

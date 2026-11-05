@@ -298,7 +298,7 @@ fn starts_each_cli_with_the_same_task_brief() {
         let prefix = if kind == "codex" {
             "command codex --no-daemon"
         } else {
-            "command claude"
+            "command claude '--name' 'task'"
         };
         assert!(command.starts_with(&format!("{prefix} ")), "{command}");
         assert!(
@@ -318,7 +318,7 @@ fn prepared_worktree_command_keeps_the_requested_cli() {
         let prefix = if kind == "codex" {
             "command codex --no-daemon"
         } else {
-            "command claude"
+            "command claude --name 'task'"
         };
         assert!(command.contains(&format!("&& {prefix} ")), "{command}");
         assert!(command.contains(" prepare "));
@@ -328,7 +328,7 @@ fn prepared_worktree_command_keeps_the_requested_cli() {
 #[test]
 fn resumes_the_owning_cli_even_when_native_ids_collide() {
     for (kind, expected) in [
-        ("claude", "command claude '--resume' 'shared'"),
+        ("claude", "command claude --name 'task' '--resume' 'shared'"),
         ("codex", "command codex --no-daemon 'resume' 'shared'"),
     ] {
         let fixture = Fixture::new("");
@@ -358,7 +358,10 @@ fn review_uses_the_chosen_cli_and_its_own_model_setting() {
     );
     fixture.tree();
     let configured = fixture.run(&["review", "task"]);
-    assert!(pane_command(&configured).starts_with("command claude '--model' 'claude-model'"));
+    assert!(
+        pane_command(&configured)
+            .starts_with("command claude --name 'task-review' '--model' 'claude-model'")
+    );
     let overridden = fixture.run(&["review", "task", "--agent", "codex"]);
     assert!(
         pane_command(&overridden).starts_with("command codex --no-daemon '--model' 'codex-model'")
@@ -419,7 +422,7 @@ fn new_session_bypasses_live_agents_and_saved_conversations() {
         let prefix = if kind == "codex" {
             "command codex --no-daemon"
         } else {
-            "command claude"
+            "command claude --name 'task'"
         };
         assert!(
             command.starts_with(&format!("{prefix} 'Context:")),
@@ -465,7 +468,7 @@ fn tui_n_can_start_either_cli_despite_the_project_default_and_live_agents() {
         let prefix = if kind == "codex" {
             "command codex --no-daemon"
         } else {
-            "command claude"
+            "command claude --name 'task'"
         };
         assert!(
             command.starts_with(&format!("{prefix} 'Context:")),

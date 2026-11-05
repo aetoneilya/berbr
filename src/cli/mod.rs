@@ -79,6 +79,16 @@ enum CliCommands {
         #[arg(trailing_var_arg = true, required = true)]
         text: Vec<String>,
     },
+    /// Rename a task's title and existing Herdr space; never renames worktrees
+    /// or branches. No prompts. Defaults to the current worktree/space's task.
+    Rename {
+        /// [<task ID or old title>] <new title>
+        #[arg(num_args = 1..=2, required = true)]
+        args: Vec<String>,
+        /// Also rename the calling terminal's tab; skip if it cannot be identified
+        #[arg(long)]
+        tab: Option<String>,
+    },
     /// Show or update task context as JSON (id, title, description, note, done).
     /// Defaults to the current worktree/space; pass an ID/title otherwise.
     /// Never prompts. Updates preserve other note fields and Agent notes.
@@ -124,7 +134,7 @@ pub(crate) struct StartArgs {
     /// With no task name, the agent generates a name from this text first
     #[arg(long)]
     pub(crate) description: Option<String>,
-    /// Worktree, tab and agent name; default: ticket summary, or task ID
+    /// Worktree, tab and agent name; default: ticket summary, title slug, or task ID
     #[arg(long, short = 'n')]
     pub(crate) name: Option<String>,
     /// Default: <branch_prefix><KEY>-<name>
@@ -289,6 +299,7 @@ pub fn run() -> Result<(), String> {
         CliCommands::Add(args) => work::cli_add(&config, args),
         CliCommands::Select(args) => work::cli_select(&config, args),
         CliCommands::Note { task, text } => work::cli_note(&config, task, text),
+        CliCommands::Rename { args, tab } => work::cli_rename(&config, args, tab),
         CliCommands::Task { command } => work::cli_task(&config, command),
         CliCommands::Prepare { spec } => work::cli_prepare(&spec),
         CliCommands::Attach { key, task } => work::cli_attach(&config, &key, task),

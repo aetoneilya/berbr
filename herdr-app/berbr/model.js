@@ -1,3 +1,14 @@
+export function taskSpaceMatches(row, label) {
+  const key = String(label ?? "").trim().toLowerCase();
+  return Boolean(key) && [row?.task, row?.title].some(value =>
+    String(value ?? "").trim().toLowerCase() === key);
+}
+
+export function taskSpace(row, liveSpaces = []) {
+  return liveSpaces.find(space => row?.space && space.id === row.space)
+    ?? liveSpaces.find(space => taskSpaceMatches(row, space.name));
+}
+
 export function walk(rows = []) {
   return (rows ?? []).flatMap(row => [row, ...walk(row.children)]);
 }
@@ -92,7 +103,7 @@ export function closePlan(row, liveSpaces = [], related = walk(row?.children)) {
   const jira = [...new Set(related.filter(item => item.kind === "ticket" && !isClosedTicket(item))
     .map(ticket => ticket.target).filter(Boolean))];
   const also = ["Marks the note done"];
-  if (row?.space && liveSpaces.some(space => space.id === row.space)) also.push("Closes the Herdr space");
+  if (taskSpace(row, liveSpaces)) also.push("Closes the Herdr space");
   // Snapshots have no merge timestamps. MR iid is the stable fallback order.
   const merged = mrs.filter(mr => mr.state?.toLowerCase() === "merged").sort((a, b) =>
     Number(b.label?.match(/!(\d+)/)?.[1] ?? 0) - Number(a.label?.match(/!(\d+)/)?.[1] ?? 0));
@@ -346,7 +357,7 @@ export function taskSignals(row, liveAgents = [], liveSpaces = [], related = wal
     mrs, mrKey: mrs[0]?.label?.match(/!\d+/)?.[0] ?? "",
     mrFlag: flags.worst, mrNeedsYou:Boolean(attentionMr),
     trees: related.filter(item => item.kind === "tree"),
-    liveSpace: liveSpaces.find(space => space.id === row.space),
+    liveSpace: taskSpace(row, liveSpaces),
   };
 }
 
@@ -473,7 +484,7 @@ export function backendClosePlan(plan) {
 export class PanelModel {
   update(data, liveAgents = [], liveSpaces = [], options = {}) {
     const key = liveAgents.map(agent => `${agent.address}:${agent.status}:${agent.seq}:${agent.pane}`).join("|") + "/" +
-      liveSpaces.map(space => `${space.id}:${space.active}:${(space.tabs ?? []).map(tab => `${tab.id}:${tab.working_since}`).join(",")}`).join("|");
+      liveSpaces.map(space => `${space.id}:${space.name}:${space.active}:${(space.tabs ?? []).map(tab => `${tab.id}:${tab.working_since}`).join(",")}`).join("|");
     if (this.data !== data || !this.related) {
       this.data = data; this.related = new Map(); this.search = new Map();
       this.trees = []; const treeKeys = new Set();

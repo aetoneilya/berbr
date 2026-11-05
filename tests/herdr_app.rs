@@ -79,7 +79,7 @@ if kind=='herdr-app':
  if a==['status']: out={'space':'sp-caller','tab':'tb-caller','focused_pane':'p-caller'}
  elif a==['ls']:
   if os.environ.get('BERBR_TEST_DOWN'): sys.exit(1)
-  out={'spaces':[{'id':'sp-local','name':'test-0','machine':None,'tabs':[{'id':'tb-local','name':'local','terminals':[{'terminal':'t1','pane':'p1','app':'codex','status':'idle'}]}]}, {'id':'prod/sp-remote','name':'remote','machine':'prod','tabs':[{'id':'prod/tb-remote','terminals':[{'terminal':'prod/t2','app':'codex','status':'working'}]}]}]}
+  out={'spaces':[{'id':'sp-local','name':os.environ.get('BERBR_TEST_SPACE_NAME','test-0'),'machine':None,'tabs':[{'id':'tb-local','name':'local','terminals':[{'terminal':'t1','pane':'p1','app':'codex','status':'idle'}]}]}, {'id':'prod/sp-remote','name':'remote','machine':'prod','tabs':[{'id':'prod/tb-remote','terminals':[{'terminal':'prod/t2','app':'codex','status':'working'}]}]}]}
  elif a[:2]==['do','space.new']: out={'space':'sp-created','tab':'tb-created','terminal':'t7'}
  elif a[:2]==['do','tab.new']: out={'tab':'tb-created','terminal':'t7'}
  elif a[:2]==['do','pane.split']: out={'terminal':'t7'}
@@ -694,4 +694,211 @@ fn done_dry_run_preserves_notes_worktrees_branches_and_caches() {
             .iter()
             .all(|c| c[1][0] == "ls" || c[1][0] == "get" || c[1][0] == "status")
     );
+}
+
+#[test]
+fn start_uses_title_slug_and_claude_display_name_in_prepare_and_main_checkout() {
+    for no_worktree in [false, true] {
+        let f = Fixture::new();
+        let mut cmd = f.command();
+        cmd.args([
+            "start",
+            "Parser: исправить repeated calls with cache",
+            "--bg",
+        ]);
+        if no_worktree {
+            cmd.arg("--no-worktree");
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let calls = f.calls();
+        let create = calls.iter().find(|c| c[1][1] == "space.new").unwrap();
+        let args: Value = serde_json::from_str(create[1][2].as_str().unwrap()).unwrap();
+        assert_eq!(args["name"], "Parser: исправить repeated calls with cache");
+        let tab = calls.iter().find(|c| c[1][1] == "tab.rename").unwrap();
+        let args: Value = serde_json::from_str(tab[1][2].as_str().unwrap()).unwrap();
+        assert_eq!(args["name"], "parser-repeated-calls-with");
+        let send = calls
+            .iter()
+            .find(|c| c[0] == "hc" && c[1][0] == "send")
+            .unwrap();
+        let command = send[1][2].as_str().unwrap();
+        let label = if no_worktree {
+            "Parser: исправить repeated calls with cache"
+        } else {
+            "parser-repeated-calls-with"
+        };
+        let flag = if no_worktree { "'--name'" } else { "--name" };
+        assert!(command.contains(&format!("{flag} '{label}'")), "{command}");
+        if !no_worktree {
+            let spec_path = f.root.join("home/Library/Caches/berbr/prepare-t7.json");
+            // Cache root differs on Linux and macOS.
+            let spec_path = if spec_path.exists() {
+                spec_path
+            } else {
+                f.root.join("cache/berbr/prepare-t7.json")
+            };
+            let spec: Value = serde_json::from_slice(&fs::read(spec_path).unwrap()).unwrap();
+            assert_eq!(spec["name"], "parser-repeated-calls-with");
+            assert_eq!(spec["branch"], "parser-repeated-calls-with");
+        }
+    }
+}
+
+#[test]
+fn rename_preserves_identity_body_and_branches_and_renames_existing_space_and_caller_tab() {
+    for legacy in [false, true] {
+        let f = Fixture::new();
+        let path = f.root.join("vault/tasks/test-0.md");
+        let header = if legacy { "" } else { "id: test-0\n" };
+        fs::write(&path, format!("---\n{header}title: Old title\ntags: [keep]\n---\nKeep body\n\n## Agent notes\nKeep finding\n")).unwrap();
+        let branches = f.git(&f.root.join("repo"), &["branch", "--list"]);
+        let out = f
+            .command()
+            .env("HERDR_TAB_ID", "tb-caller")
+            .env(
+                "BERBR_TEST_SPACE_NAME",
+                if legacy { "OLD TITLE" } else { "test-0" },
+            )
+            .args(["rename", "test-0", "New title", "--tab", "new-tab"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 3);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("title: New title"));
+        assert!(text.contains("tags: [keep]"));
+        assert!(text.ends_with("Keep body\n\n## Agent notes\nKeep finding\n"));
+        assert_eq!(text.contains("id:"), !legacy);
+        assert!(!path.with_file_name("New title.md").exists());
+        assert_eq!(f.git(&f.root.join("repo"), &["branch", "--list"]), branches);
+        let calls = f.calls();
+        for (command, id, name) in [
+            ("space.rename", "sp-local", "New title"),
+            ("tab.rename", "tb-caller", "new-tab"),
+        ] {
+            assert!(calls.iter().any(|c| c[1][1] == command
+                && serde_json::from_str::<Value>(c[1][2].as_str().unwrap()).unwrap()
+                    == serde_json::json!({"id":id,"name":name})));
+        }
+    }
+}
+
+#[test]
+fn rename_resolves_current_worktree_and_caller_terminal_and_can_skip_unknown_tab() {
+    let f = Fixture::new();
+    let tree = f.root.join("repo/.claude/worktrees/friendly-name");
+    f.git(
+        &f.root.join("repo"),
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "friendly-name",
+            tree.to_str().unwrap(),
+        ],
+    );
+    let path = f.root.join("vault/tasks/test-0.md");
+    fs::write(
+        &path,
+        "---\nid: test-0\ntitle: Old title\nworktrees: [friendly-name]\n---\nBody\n",
+    )
+    .unwrap();
+    let out = f
+        .command()
+        .current_dir(&tree)
+        .env_remove("HERDR_TAB_ID")
+        .env_remove("HERDR_PANE_ID")
+        .env("HC_TERMINAL_ID", "t1")
+        .args(["rename", "New title", "--tab", "caller-label"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("tab: tb-local — caller-label"));
+    let out = f
+        .command()
+        .current_dir(&tree)
+        .env_remove("HERDR_TAB_ID")
+        .env_remove("HERDR_PANE_ID")
+        .env_remove("HC_TERMINAL_ID")
+        .args(["rename", "Another title", "--tab", "unknown"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("tab: skipped"));
+    assert_eq!(f.git(&tree, &["branch", "--show-current"]), "friendly-name");
+}
+
+#[test]
+fn select_names_first_tree_from_title_and_reuses_title_or_id_space() {
+    for space_name in ["test-0", "TASK \"QUOTES\""] {
+        let f = Fixture::new();
+        let out = f
+            .command()
+            .env("BERBR_TEST_SPACE_NAME", space_name)
+            .args(["select", "test-0", "--bg"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let calls = f.calls();
+        assert!(!calls.iter().any(|c| c[1][1] == "space.new"));
+        assert!(calls.iter().any(|c| c[1][1] == "tab.new" && serde_json::from_str::<Value>(c[1][2].as_str().unwrap()).unwrap() == serde_json::json!({"space":"sp-local", "name":"task-quotes", "folder":f.root.join("repo")})));
+    }
+}
+
+#[test]
+fn rename_validates_title_and_shares_note_update_with_task_update() {
+    let f = Fixture::new();
+    let path = f.root.join("vault/tasks/test-0.md");
+    let before = fs::read(&path).unwrap();
+    for title in [" ", "two\nlines"] {
+        let out = f
+            .command()
+            .args(["rename", "test-0", title])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("non-empty single line"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+    let out = f
+        .command()
+        .args(["task", "update", "test-0", "--title", "Shared title"])
+        .output()
+        .unwrap();
+    assert_eq!(success(out)["title"], "Shared title");
+    let out = f
+        .command()
+        .env("BERBR_TEST_SPACE_NAME", "unrelated")
+        .args(["rename", "test-0", "Final title"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 1);
+    assert!(path.exists());
+    assert!(!f.calls().iter().any(|c| c[1][1] == "space.rename"));
 }

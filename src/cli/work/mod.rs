@@ -19,4 +19,4 @@ pub(super) use select::cli_select;
 pub(crate) use select::select;
 pub(crate) use start::{add, start};
 pub(super) use start::{cli_add, cli_start};
-pub(super) use task::{cli_note, cli_task};
+pub(super) use task::{cli_note, cli_rename, cli_task};

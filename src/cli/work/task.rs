@@ -34,44 +34,7 @@ pub(in crate::cli) fn cli_task(config: &Config, command: TaskCommand) -> Result<
         if title.is_none() && description.is_none() {
             return Err("supply --title, --description or --description-file".into());
         }
-        if title
-            .as_ref()
-            .is_some_and(|s| s.trim().is_empty() || s.chars().any(char::is_control))
-        {
-            return Err("title must be a non-empty single line".into());
-        }
-        if description.as_ref().is_some_and(|s| s.trim().is_empty()) {
-            return Err("description must not be empty".into());
-        }
-        let _lock = crate::vault::lock().map_err(err)?;
-        let mut saved = false;
-        for _ in 0..3 {
-            task.note.reload().map_err(err)?;
-            // Re-read under the lock, so another agent's first update wins.
-            task = Task::from_note(task.note);
-            if let Some(title) = &title
-                && (!fill_empty || task.title().is_none())
-            {
-                task.note
-                    .set("title", serde_yaml::Value::String(title.trim().into()));
-            }
-            if let Some(description) = &description
-                && (!fill_empty || task.note.description().is_empty())
-            {
-                task.note.set_description(description);
-            }
-            match task.note.save() {
-                Ok(_) => {
-                    saved = true;
-                    break;
-                }
-                Err(NoteError::Changed(_)) => continue,
-                Err(e) => return Err(err(e)),
-            }
-        }
-        if !saved {
-            return Err("task keeps changing, not written".into());
-        }
+        task = update_context(task, title.as_deref(), description.as_deref(), fill_empty)?;
     }
     println!(
         "{}",
@@ -83,6 +46,94 @@ pub(in crate::cli) fn cli_task(config: &Config, command: TaskCommand) -> Result<
             "done": task.done,
         })
     );
+    Ok(())
+}
+
+/// Shared by task update and rename; never changes the identity or file path.
+fn update_context(
+    mut task: Task,
+    title: Option<&str>,
+    description: Option<&str>,
+    fill_empty: bool,
+) -> Result<Task, String> {
+    if title.is_some_and(|s| s.trim().is_empty() || s.chars().any(char::is_control)) {
+        return Err("title must be a non-empty single line".into());
+    }
+    if description.is_some_and(|s| s.trim().is_empty()) {
+        return Err("description must not be empty".into());
+    }
+    let _lock = crate::vault::lock().map_err(err)?;
+    let mut saved = false;
+    for _ in 0..3 {
+        task.note.reload().map_err(err)?;
+        // Re-read under the lock, so another agent's first update wins.
+        task = Task::from_note(task.note);
+        if let Some(title) = title
+            && (!fill_empty || task.title().is_none())
+        {
+            task.note
+                .set("title", serde_yaml::Value::String(title.trim().into()));
+        }
+        if let Some(description) = description
+            && (!fill_empty || task.note.description().is_empty())
+        {
+            task.note.set_description(description);
+        }
+        match task.note.save() {
+            Ok(_) => {
+                saved = true;
+                break;
+            }
+            Err(NoteError::Changed(_)) => continue,
+            Err(e) => return Err(err(e)),
+        }
+    }
+    if !saved {
+        return Err("task keeps changing, not written".into());
+    }
+    Ok(task)
+}
+
+pub(in crate::cli) fn cli_rename(
+    config: &Config,
+    args: Vec<String>,
+    tab: Option<String>,
+) -> Result<(), String> {
+    let (target, title) = match args.as_slice() {
+        [title] => (None, title.as_str()),
+        [task, title] => (Some(task.as_str()), title.as_str()),
+        _ => return Err("berbr rename [<task>] \"<new title>\"".into()),
+    };
+    let mut task = tool_task(config, target)?;
+    // Resolve before updating: the existing space can still carry the old title.
+    let spaces = if herdr::available() {
+        herdr::list_workspaces().map_err(err)?
+    } else {
+        Vec::new()
+    };
+    let matched: Vec<_> = spaces
+        .iter()
+        .filter(|space| crate::vault::task::task_space_matches(&task, &space.label))
+        .collect();
+    task = update_context(task, Some(title), None, false)?;
+    println!(
+        "note: {} — title: {}",
+        task.note.path.display(),
+        task.space_name()
+    );
+    for space in matched {
+        herdr::rename_workspace(&space.workspace_id, &task.space_name()).map_err(err)?;
+        println!("space: {} — {}", space.workspace_id, task.space_name());
+    }
+    if let Some(label) = tab {
+        match herdr::caller_tab().map_err(err)? {
+            Some(id) => {
+                herdr::rename_tab(&id, &label).map_err(err)?;
+                println!("tab: {id} — {label}");
+            }
+            None => println!("tab: skipped — cannot determine the calling terminal's tab"),
+        }
+    }
     Ok(())
 }
 

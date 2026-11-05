@@ -3,9 +3,9 @@
 use super::brief::brief_text;
 use super::common::{
     Terminal, Ui, branch_name, choose_repo, err, fetch_issue, find_task, is_ticket_key, list,
-    name_from_issue, resolve_task,
+    name_from_issue, resolve_task, work_name,
 };
-use super::launch::{Context, Open, launch, open_added_work, open_work};
+use super::launch::{Context, Open, Space, launch, open_added_work, open_work};
 use crate::cli::{AddArgs, StartArgs, load};
 use crate::client::jira::JiraIssue;
 use crate::client::worktree;
@@ -161,9 +161,7 @@ fn start_with(
     let main = choose_repo(config, ui)?;
     if no_worktree {
         // The agent in the main checkout, its brief in berbr's cache
-        let label = tree_name
-            .or_else(|| issue.as_ref().map(name_from_issue))
-            .unwrap_or_else(|| task.name.clone());
+        let label = work_name(&task, tree_name, issue.as_ref());
         let branch = worktree::current_branch(&main).unwrap_or_default();
         let text = brief_text(
             &main,
@@ -182,24 +180,21 @@ fn start_with(
         std::fs::write(&brief, text).map_err(err)?;
         return launch(
             config.workflow.agent,
-            &task.name,
+            Space::Task(&task),
             &main,
             &label,
             Context {
                 note: Some(&task.note.path),
                 brief: &brief,
                 description: description.as_deref(),
+                display_name: Some(&task.space_name()),
             },
             !bg,
             ui,
         );
     }
 
-    let wt_name = match (tree_name, &issue) {
-        (Some(name), _) => name,
-        (None, Some(issue)) => name_from_issue(issue),
-        (None, None) => task.name.clone(),
-    };
+    let wt_name = work_name(&task, tree_name, issue.as_ref());
     let branch = branch.unwrap_or_else(|| branch_name(config, keys.first(), &wt_name));
     let tree = worktree::worktree_dir(&main, &wt_name);
     let brief = brief_text(

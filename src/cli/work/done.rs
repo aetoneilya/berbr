@@ -209,7 +209,10 @@ impl TaskPlan {
         );
         steps.push("mark the note done".to_string());
         if row.space.is_some() {
-            steps.push(format!("close herdr workspace \"{}\"", row.task.name));
+            steps.push(format!(
+                "close herdr workspace \"{}\"",
+                row.task.space_name()
+            ));
         }
         steps
     }

@@ -142,13 +142,7 @@ impl Opening {
             candidates
                 .iter()
                 .copied()
-                .filter(|&i| {
-                    table.tasks[i]
-                        .task
-                        .name
-                        .trim()
-                        .eq_ignore_ascii_case(label.trim())
-                })
+                .filter(|&i| crate::vault::task::task_space_matches(&table.tasks[i].task, label))
                 .collect(),
         )
     }
@@ -236,6 +230,20 @@ mod tests {
         }));
         assert_eq!(selected(&opening, &table), Some("beta"));
         assert_eq!(selected(&Opening::default(), &table), None);
+    }
+
+    #[test]
+    fn workspace_labels_accept_titles_as_well_as_stable_ids() {
+        let task = crate::table::fixtures::task_note(
+            "demo-0",
+            "id: demo-0\ntitle: Проверить Parser",
+            "2026-11-01",
+        );
+        let table = table(vec![task], vec![], vec![], vec![]);
+        for label in [" DEMO-0 ", " проверить PARSER "] {
+            let opening = Opening::from_context(&serde_json::json!({"workspace_label":label}));
+            assert_eq!(selected(&opening, &table), Some("demo-0"));
+        }
     }
 
     #[test]

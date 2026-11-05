@@ -2,26 +2,43 @@
 //! `berbr prepare`.
 
 use super::brief::{agent_prompt, write_brief};
-use super::common::{Ui, err, same_name};
+use super::common::{Ui, err};
 use crate::cli::progress;
 use crate::client::agent::AgentKind;
 use crate::client::herdr::shell_quote;
 use crate::client::{herdr, worktree};
-use crate::vault::task::Task;
+use crate::vault::task::{Task, same_name, task_space_matches};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy)]
+pub(super) enum Space<'a> {
+    Task(&'a Task),
+    Label(&'a str),
+}
+
+impl fmt::Display for Space<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Task(task) => f.write_str(&task.space_name()),
+            Self::Label(label) => f.write_str(label),
+        }
+    }
+}
 
 pub(super) struct Context<'a> {
     pub note: Option<&'a Path>,
     pub brief: &'a Path,
     pub description: Option<&'a str>,
+    pub display_name: Option<&'a str>,
 }
 
 /// A fresh agent in the task's workspace: reads its context, then works on
 /// a supplied description, or waits for a command.
 pub(super) fn launch(
     kind: AgentKind,
-    space: &str,
+    space: Space<'_>,
     cwd: &Path,
     label: &str,
     context: Context<'_>,
@@ -29,7 +46,12 @@ pub(super) fn launch(
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
     let prompt = agent_prompt(context.note, context.brief, context.description);
-    let args: Vec<&str> = prompt.as_deref().into_iter().collect();
+    let mut args: Vec<&str> = prompt.as_deref().into_iter().collect();
+    if kind == AgentKind::Claude
+        && let Some(name) = context.display_name
+    {
+        args.splice(0..0, ["--name", name]);
+    }
     open_agent(kind, space, cwd, label, &args, focus, ui)
 }
 
@@ -79,7 +101,17 @@ pub(super) fn open_work(
         kind,
         description,
     } = open;
-    let (space, note) = (task.name.as_str(), Some(task.note.path.as_path()));
+    if task.tickets.is_empty() {
+        let _lock = crate::vault::lock().map_err(err)?;
+        let mut note = crate::vault::note::Note::read(&task.note.path).map_err(err)?;
+        let mut names = note.strings("worktrees");
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.to_string());
+            note.set("worktrees", super::common::list(&names));
+            note.save().map_err(err)?;
+        }
+    }
+    let (space, note) = (Space::Task(task), Some(task.note.path.as_path()));
     let dir = worktree::worktree_dir(main, name);
     if !herdr::available() {
         let dir = worktree::create_worktree(main, name, branch).map_err(err)?;
@@ -90,7 +122,7 @@ pub(super) fn open_work(
             ui.say(format!(
                 "not in herdr — run it yourself: cd {} && {}",
                 shell_quote(&dir.to_string_lossy()),
-                kind.shell_command(&[&prompt])
+                kind.named_shell_command(name, &[&prompt])
             ));
         }
         return Ok(());
@@ -128,7 +160,7 @@ pub(super) fn open_work(
     if agent.is_some() {
         command.push_str(&format!(
             " && {agent_command} \"$(cat {prompt}; rm -f {prompt})\"",
-            agent_command = kind.shell_prefix(),
+            agent_command = kind.named_shell_prefix(name),
             prompt = shell_quote(&prompt.to_string_lossy()),
         ));
     }
@@ -159,10 +191,10 @@ pub(super) fn open_added_work(
 ) -> Result<(), String> {
     let brief = write_brief(dir, &brief)?;
     let prompt = agent_prompt(Some(&task.note.path), &brief, open.description.as_deref());
-    let (tab, pane) = open_tab(&task.name, dir, name)?;
+    let (tab, pane) = open_tab(Space::Task(task), dir, name)?;
     let agent = free_agent_name(name);
     let args: Vec<&str> = prompt.as_deref().into_iter().collect();
-    herdr::start_agent(open.kind, &agent, &pane, &args).map_err(err)?;
+    herdr::start_agent_with_label(open.kind, &agent, &pane, name, &args).map_err(err)?;
     if open.focus {
         herdr::focus_tab(&tab).map_err(err)?;
     }
@@ -232,7 +264,7 @@ fn prompt_path(spec_path: &Path) -> PathBuf {
 /// is false.
 pub(super) fn open_agent(
     kind: AgentKind,
-    space: &str,
+    space: Space<'_>,
     cwd: &Path,
     label: &str,
     agent_args: &[&str],
@@ -243,13 +275,13 @@ pub(super) fn open_agent(
         ui.say(format!(
             "not in herdr — run it yourself: cd {} && {}",
             shell_quote(&cwd.to_string_lossy()),
-            kind.shell_command(agent_args)
+            kind.named_shell_command(label, agent_args)
         ));
         return Ok(());
     }
     let (tab, pane) = open_tab(space, cwd, label)?;
     let agent = free_agent_name(label);
-    herdr::start_agent(kind, &agent, &pane, agent_args).map_err(err)?;
+    herdr::start_agent_with_label(kind, &agent, &pane, label, agent_args).map_err(err)?;
     if focus {
         let _ = herdr::focus_tab(&tab);
     }
@@ -261,15 +293,18 @@ pub(super) fn open_agent(
 
 /// A new tab `label` in the herdr workspace `space`, created when missing;
 /// returns the tab and its pane.
-fn open_tab(space: &str, cwd: &Path, label: &str) -> Result<(String, String), String> {
+fn open_tab(space: Space<'_>, cwd: &Path, label: &str) -> Result<(String, String), String> {
     let existing = herdr::list_workspaces()
         .map_err(err)?
         .into_iter()
-        .find(|w| same_name(&w.label, space));
+        .find(|w| match space {
+            Space::Task(task) => task_space_matches(task, &w.label),
+            Space::Label(label) => same_name(&w.label, label),
+        });
     match existing {
         Some(ws) => herdr::create_tab(&ws.workspace_id, cwd, label).map_err(err),
         None => {
-            let (tab, pane) = herdr::create_workspace(space, cwd).map_err(err)?;
+            let (tab, pane) = herdr::create_workspace(&space.to_string(), cwd).map_err(err)?;
             herdr::rename_tab(&tab, label).map_err(err)?;
             Ok((tab, pane))
         }

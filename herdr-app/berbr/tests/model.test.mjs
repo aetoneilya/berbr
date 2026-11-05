@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { walk, groupSections, taskSignals, visibleSections, visibleRows, parseMrFlags,
+import { taskSpace, taskSpaceMatches, walk, groupSections, taskSignals, visibleSections, visibleRows, parseMrFlags,
   normalizeTicketState, isClosedTicket, cleanObsidian, stripFrontmatter, obsidianUri, matchesFilter, ticketTitle, rowState, taskDetail, looseReason, worktreeNameCollision, cleanCliText, parseTreeMarks, looseWhy,
   agentActivity, formatElapsed, classifyBlocked, closePlan } from "../model.js";
 
@@ -611,4 +611,16 @@ test("task excerpts stop before machine sections, including when they are the wh
   assert.equal(taskDetail({body:"## Sessions overview\nHuman criteria"}).excerpt, "Sessions overview Human criteria");
   assert.ok(taskDetail({body:"```markdown\n## Sessions\n```\nHuman criteria"}).excerpt.includes("Human criteria"));
   assert.ok(taskDetail({body:"~~~markdown\n## Agent notes\n~~~\nHuman criteria"}).excerpt.includes("Human criteria"));
+});
+
+test("task spaces accept title, stable id and legacy names without case sensitivity", () => {
+  const row = {task:"demo-4", title:"Проверить Parser"};
+  for (const label of [" DEMO-4 ", " проверить PARSER "]) assert.equal(taskSpaceMatches(row, label), true);
+  for (const label of ["", null, "other"]) assert.equal(taskSpaceMatches(row, label), false);
+  const titleSpace = {id:"title-space", name:"Проверить Parser"};
+  assert.equal(taskSpace(row, [titleSpace]), titleSpace);
+  assert.equal(taskSpace({task:"Legacy title"}, [{id:"legacy", name:"legacy TITLE"}]).id, "legacy");
+  const explicit = {id:"known", name:"Custom label"};
+  assert.equal(taskSpace({...row, space:"known"}, [titleSpace, explicit]), explicit);
+  assert.equal(taskSignals({...row, children:[]}, [], [titleSpace]).liveSpace, titleSpace);
 });

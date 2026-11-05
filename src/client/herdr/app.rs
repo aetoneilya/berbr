@@ -5,7 +5,16 @@ use serde_json::{Value, json};
 use std::process::Command;
 
 pub(super) fn enabled() -> bool {
-    std::env::var("BERBR_BACKEND").is_ok_and(|s| s == "herdr-app")
+    enabled_from_env(
+        std::env::var("BERBR_BACKEND").ok().as_deref(),
+        std::env::var("HC_TERMINAL_SOCKET").ok().as_deref(),
+        std::env::var("HERDR_ENV").ok().as_deref(),
+    )
+}
+
+fn enabled_from_env(backend: Option<&str>, socket: Option<&str>, herdr_env: Option<&str>) -> bool {
+    backend == Some("herdr-app")
+        || (socket.is_some_and(|s| !s.is_empty()) && herdr_env != Some("1"))
 }
 
 fn output_of(bin: &str, args: &[&str]) -> Result<Vec<u8>> {
@@ -83,6 +92,19 @@ fn agent(target: &str) -> Result<Value> {
             "agent {target}: missing or ambiguous"
         ))),
     }
+}
+
+pub(super) fn tab_of(address: &str) -> Result<Option<String>> {
+    for space in spaces()? {
+        for tab in tabs(&space) {
+            if terminals(tab)
+                .any(|term| text(term, "terminal") == address || text(term, "pane") == address)
+            {
+                return Ok(Some(text(tab, "id").to_string()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn pane_of(address: &str) -> Result<String> {
@@ -206,6 +228,7 @@ pub(super) fn output(args: &[&str]) -> Result<Vec<u8>> {
         }
         ["workspace", "focus", id] => act("space.select", json!({"id":id}))?,
         ["tab", "focus", id] => act("tab.select", json!({"id":id}))?,
+        ["workspace", "rename", id, label] => act("space.rename", json!({"id":id,"name":label}))?,
         ["tab", "rename", id, label] => act("tab.rename", json!({"id":id,"name":label}))?,
         ["workspace", "close", id] => act("space.close", json!({"id":id,"confirmed":true}))?,
         ["tab", "close", id] => act("tab.close", json!({"id":id,"confirmed":true}))?,
@@ -217,4 +240,30 @@ pub(super) fn output(args: &[&str]) -> Result<Vec<u8>> {
         }
     };
     Ok(serde_json::to_vec(&json!({"result":result}))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enabled_from_env;
+
+    #[test]
+    fn backend_detection_supports_manual_app_terminals_and_preserves_legacy_tui() {
+        for (backend, socket, herdr_env, expected) in [
+            (None, None, None, false),
+            (None, Some(""), None, false),
+            (None, Some("/tmp/demo-core.sock"), None, true),
+            (None, Some("/tmp/demo-core.sock"), Some("0"), true),
+            (None, Some("/tmp/demo-core.sock"), Some("1"), false),
+            (None, None, Some("1"), false),
+            (Some("other"), None, None, false),
+            (Some("herdr-app"), None, None, true),
+            (Some("herdr-app"), Some(""), Some("1"), true),
+        ] {
+            assert_eq!(
+                enabled_from_env(backend, socket, herdr_env),
+                expected,
+                "backend={backend:?}, socket={socket:?}, HERDR_ENV={herdr_env:?}"
+            );
+        }
+    }
 }

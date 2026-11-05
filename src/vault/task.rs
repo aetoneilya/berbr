@@ -100,7 +100,20 @@ fn link_target(link: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// Labels are compared the same way in the CLI, snapshots and space lookup.
+pub fn same_name(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
+}
+
+pub fn task_space_matches(task: &Task, label: &str) -> bool {
+    same_name(&task.name, label) || task.title().is_some_and(|title| same_name(&title, label))
+}
+
 impl Task {
+    pub fn space_name(&self) -> String {
+        self.title().unwrap_or_else(|| self.name.clone())
+    }
+
     /// Stable identity is the note's file name; titles never move the note.
     pub fn title(&self) -> Option<String> {
         self.note

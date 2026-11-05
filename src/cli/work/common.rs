@@ -62,8 +62,17 @@ pub(crate) fn is_ticket_key(text: &str) -> bool {
     ticket_keys(text).first().is_some_and(|k| k == text)
 }
 
-pub(super) fn same_name(a: &str, b: &str) -> bool {
-    a.trim().to_lowercase() == b.trim().to_lowercase()
+pub(super) use crate::vault::task::same_name;
+
+pub(super) fn work_name(
+    task: &Task,
+    explicit: Option<String>,
+    issue: Option<&JiraIssue>,
+) -> String {
+    explicit
+        .or_else(|| issue.map(name_from_issue))
+        .or_else(|| task.title().as_deref().and_then(name_from_text))
+        .unwrap_or_else(|| task.name.clone())
 }
 
 pub(super) fn fetch_issue(config: &Config, key: &str) -> Result<JiraIssue, String> {
@@ -327,4 +336,39 @@ pub(super) fn resolve_tree(
     }
     let names: Vec<String> = trees.iter().map(|t| t.wt.name()).collect();
     ui.pick("Worktree", &names)
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::*;
+    use crate::table::fixtures::task_note;
+
+    #[test]
+    fn work_names_use_title_then_identity_and_respect_explicit_and_ticket_names() {
+        let mut task = task_note(
+            "demo-0",
+            "id: demo-0\ntitle: 'Parser: исправить repeated calls with cache'",
+            "2026-11-01",
+        );
+        assert_eq!(work_name(&task, None, None), "parser-repeated-calls-with");
+        let issue: JiraIssue = serde_json::from_value(serde_json::json!({
+            "key":"DEMO-42", "fields":{"summary":"Ticket summary", "created":"2026-11-01T00:00:00Z"}
+        }))
+        .unwrap();
+        assert_eq!(work_name(&task, None, Some(&issue)), "ticket-summary");
+        assert_eq!(
+            work_name(&task, Some("chosen".into()), Some(&issue)),
+            "chosen"
+        );
+        task.note
+            .set("title", Value::String("Только кириллица".into()));
+        assert_eq!(work_name(&task, None, None), "demo-0");
+        assert_eq!(work_name(&task, Some("chosen".into()), None), "chosen");
+        let issue: JiraIssue = serde_json::from_value(serde_json::json!({
+            "key":"DEMO-42", "fields":{"summary":"Только кириллица", "created":"2026-11-01T00:00:00Z"}
+        })).unwrap();
+        assert_eq!(work_name(&task, None, Some(&issue)), "demo-42");
+        let legacy = task_note("Legacy title", "", "2026-11-01");
+        assert_eq!(work_name(&legacy, None, None), "legacy-title");
+    }
 }
