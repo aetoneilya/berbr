@@ -3,9 +3,9 @@ import { h_flex, v_flex, Input, InputState, TextView } from "gpui-base";
 import { appHome, exec, focused, spaces, agents, theme, run, props,
   openOverlay, closeOverlay, notify, shared, setShared, nextCommand, hc } from "herdr";
 import { walk, visibleRows, sectionLabels,
-  normalizeTicketState, ticketTitle, parseMrFlags,
+  normalizeTicketState, ticketTitle,
   worktreeNameCollision, cleanCliText, isClosedTicket,
-  agentActivity, formatElapsed, classifyBlocked, closePlan, PanelModel, treeMarks, isMergedTree, mergedPlan, backendClosePlan } from "./model.js";
+  agentActivity, formatElapsed, blockedPrompt, mrFlags, jumpItems, matchJump, closePlan, PanelModel, treeMarks, isMergedTree, mergedPlan, backendClosePlan } from "./model.js";
 import { icon, iconButton, button, chip, sectionHeader, statusMark, kbd } from "./ui.js";
 import { formView, initNote, noteKey } from "./forms.js";
 
@@ -20,6 +20,7 @@ export default class Berbr extends View {
     this.filter = ""; this.all = false; this.selected = null; this.hovered = null;
     this.expanded = null; this.busyAction = null;
     this.blockedReasons = new Map(); this.panelModel = new PanelModel();
+    this.jumpIndex = 0; this.jumpQuery = "";
     if (this.form === "done") this.closePlan = p.plan ?? closePlan(p.row, spaces());
     if (this.form === "remove-merged") this.bulkPlan = mergedPlan(p.trees);
     this.history = new Set(); this.subtasks = new Set(); this.closedTickets = new Set();
@@ -43,7 +44,7 @@ export default class Berbr extends View {
     this.handle.focus();
     if (this.form === "note") { initNote(this, cx); return; }
     this.inputs = {}; this.values = {}; this.searchFocused = false;
-    const placeholders = { search: "Filter tasks", title: "What are you working on?",
+    const placeholders = { search: this.form === "jump" ? "Jump to…" : "Filter tasks", title: "What are you working on?",
       ticket: "DEMO-123", branch: "Automatic", name: "Automatic" };
     for (const key of Object.keys(placeholders)) {
       const value = p.prefill?.[key] ?? "";
@@ -52,9 +53,11 @@ export default class Berbr extends View {
       input.on("change", (_event, cx) => {
         this.values[key] = input.value();
         if (key === "search") this.filter = input.value();
+        if (key === "search" && this.form === "jump") { this.jumpQuery = input.value(); this.jumpIndex = 0; }
         cx.notify();
       });
       input.on("submit", (_event, cx) => {
+        if (this.form === "jump" && key === "search") this.chooseJump(cx);
         if (this.form === "new" && ["title", "ticket"].includes(key)) this.submitNew(cx);
         if (this.form === "ticket" && key === "ticket") this.submitTicket(cx, true);
       });
@@ -69,6 +72,7 @@ export default class Berbr extends View {
     this.advanced = false;
     if (!this.form) {
       this.refresh(cx, true);
+      cx.timer.every(1000, cx => this.syncBlocked(visibleRows(this.sections()), cx));
       cx.timer.every(30000, cx => {
         this.refresh(cx, true);
         if (visibleRows(this.sections()).some(row => row.kind === "task" && this.signal(row).working)) cx.notify();
@@ -80,10 +84,14 @@ export default class Berbr extends View {
           if (command === "refresh") this.refresh(cx, true);
           if (command === "new") this.formOverlay("new");
           if (command === "details" && this.chosen()) this.showDetails(this.chosen(), cx);
-          if (command === "focus") this.handle.focus();
+          if (command === "focus") { this.handle.focus(); this.receiveJump(cx); }
+          if (command === "jump") this.openJump();
+          if (command === "navigate") this.receiveJump(cx);
           cx.notify();
         }
       });
+    } else if (this.form === "jump") {
+      this.jumpEntries = jumpItems(p.snapshot, p.agents ?? []); this.inputs.search.focus();
     } else if (this.form === "new") this.inputs.title.focus();
     else if (this.form === "ticket") this.inputs.ticket.focus();
     if (["done", "remove-merged"].includes(this.form)) this.loadClosePlan(cx);
@@ -108,6 +116,7 @@ export default class Berbr extends View {
     const desired = shared("berbr.project");
     if (desired && desired !== this.project) { this.switchProject(desired, cx); return; }
     this.loading = true;
+    this.syncBlocked(visibleRows(this.sections()), cx, true);
     const requestedProject = this.project;
     cx.spawn(async cx => {
       try {
@@ -131,7 +140,7 @@ export default class Berbr extends View {
           if ((task ?? flat.find(row => row.id === this.expanded))?.done) this.all = true;
         }
       } catch (error) { this.error = String(error.message ?? error); }
-      this.loading = false; cx.notify();
+      this.loading = false; this.syncBlocked(visibleRows(this.sections()), cx); cx.notify();
       if (cached && !this.didOnline) { this.didOnline = true; this.refresh(cx); }
     });
   }
@@ -167,29 +176,110 @@ export default class Berbr extends View {
     return {text:activity.text, elapsed:formatElapsed(activity.since == null ? null : Date.now() - activity.since)};
   }
 
-  syncBlocked(rows, cx) {
+  syncBlocked(rows, cx, force = false) {
     const live = this.liveState();
     for (const [address, entry] of this.blockedReasons) {
-      if (!live.agents.some(agent => agent.address === address && agent.status === "blocked" && agent.seq === entry.seq))
+      if (!live.agents.some(agent => agent.address === address && agent.status === "blocked" && (entry.busy || agent.seq === entry.seq)))
         this.blockedReasons.delete(address);
     }
     const blocked = new Map(rows.filter(row => row.kind === "task").flatMap(row => this.signal(row).agents)
       .filter(agent => agent.status === "blocked" && agent.address).map(agent => [agent.address, agent]));
     for (const [address, agent] of blocked) {
-      if (this.blockedReasons.get(address)?.seq === agent.seq && this.blockedReasons.has(address)) continue;
-      const entry = {seq:agent.seq, reason:{kind:"waiting"}};
+      const previous = this.blockedReasons.get(address);
+      if (previous?.busy || previous?.loading || (!force && previous && previous.seq === agent.seq)) continue;
+      const entry = {seq:agent.seq, reason:{kind:"waiting"}, choices:[], loading:true};
       this.blockedReasons.set(address, entry);
       cx.spawn(async cx => {
-        let reason = {kind:"waiting"};
         try {
-          const result = await hc(["read", address, "--lines", "40"]);
-          if (result.code === 0) reason = classifyBlocked(result.stdout);
+          const [info, screen] = await Promise.all([hc(["get", address]), hc(["read", address])]);
+          let status;
+          try { if (info.code === 0) status = JSON.parse(info.stdout).status; } catch (_) { /* Older cores may not report a message. */ }
+          Object.assign(entry, blockedPrompt(status, screen.code === 0 ? screen.stdout : ""));
         } catch (_) { /* An unreadable prompt still needs the person. */ }
         const current = agents().find(agent => agent.address === address);
         if (this.blockedReasons.get(address) !== entry || current?.status !== "blocked" || current.seq !== entry.seq) return;
-        entry.reason = reason; cx.notify();
+        entry.loading = false; cx.notify();
       });
     }
+  }
+
+  waitingItems(task) {
+    if (task.done) return [];
+    return this.signal(task).agents.filter(agent => agent.status === "blocked" && agent.address).map(agent => ({
+      id:`${task.id}/waiting/${agent.address}`, kind:"waiting", parent:task, agent,
+    }));
+  }
+
+  replyTo(item, cx) {
+    const entry = this.blockedReasons.get(item.agent.address);
+    if (!entry || entry.busy || this.busy) return;
+    this.selected = item.id;
+    if (!entry.input) {
+      entry.input = InputState.new({value:"", placeholder:"Reply to agent"});
+      entry.input.on("submit", (_event, cx) => this.answerAgent(item, entry.input.value(), cx, true));
+      entry.input.on("focus", () => { this.replyFocused = item.id; });
+      entry.input.on("blur", () => { this.replyFocused = null; });
+    }
+    entry.reply = true; entry.input.focus(); cx.notify();
+  }
+
+  answerAgent(item, value, cx, reply = false) {
+    const address = item.agent.address, entry = this.blockedReasons.get(address);
+    const current = agents().find(agent => agent.address === address);
+    if (!entry || entry.busy || entry.loading || this.busy || !String(value).trim() ||
+        current?.status !== "blocked" || current.seq !== entry.seq ||
+        (!reply && !entry.choices.some(choice => choice.key === value))) return;
+    entry.busy = true; entry.feedback = null; cx.notify();
+    cx.spawn(async cx => {
+      try {
+        const result = await hc([reply ? "send" : "keys", address, value]);
+        if (result.code !== 0) throw new Error(result.stderr?.trim() || "Could not answer agent");
+        await cx.sleep(1000);
+        const info = await hc(["get", address]);
+        if (info.code !== 0) throw new Error("Could not check answer — go to agent");
+        const status = JSON.parse(info.stdout).status;
+        if (!status?.state || (status.state === "blocked" && typeof status.msg !== "string"))
+          throw new Error("Could not check answer — go to agent");
+        if (this.blockedReasons.get(address) !== entry) return;
+        if (status?.state === "blocked" && status.msg === entry.msg) {
+          entry.seq = agents().find(agent => agent.address === address)?.seq;
+          entry.feedback = "Not answered — go to agent";
+        } else if (status?.state === "blocked") {
+          const screen = await hc(["read", address]);
+          Object.assign(entry, blockedPrompt(status, screen.code === 0 ? screen.stdout : ""));
+          entry.seq = agents().find(agent => agent.address === address)?.seq;
+          entry.reply = false;
+        } else this.blockedReasons.delete(address);
+        if (reply && entry.input.value() === value) entry.input.set_value("");
+      } catch (error) { entry.feedback = String(error.message ?? error); }
+      entry.busy = false;
+      if (reply && this.replyFocused === item.id) { this.replyFocused = null; this.handle.focus(); }
+      cx.notify();
+    });
+  }
+
+  waitingCard(t, item) {
+    const entry = this.blockedReasons.get(item.agent.address);
+    if (!entry || (!entry.question && !entry.feedback)) return div();
+    const disabled = this.busy || entry.busy || entry.loading;
+    const selected = this.panelFocused() && this.selected === item.id;
+    const small = (id, label, action) => button(t, `${item.id}/${id}`, label, action, "ghost", disabled)
+      .h(24).px(6).min_w(0).max_w("100%").truncate();
+    return v_flex().id(item.id).mx(8).ml(28).mb(4).p(6).gap(4).min_w(0).rounded(6)
+      .border_1().border_color(selected ? t.accent : t.border)
+      .on_click((_event, cx) => {cx.stop_propagation(); this.selected = item.id; this.handle.focus(); cx.notify();})
+      .child(div().text_size(12).text_color(t.foreground).line_height(1.35).max_h(49).overflow_hidden()
+        .whitespace_normal().child(entry.question ?? ""))
+      .child(h_flex().gap(2).min_w(0).flex_wrap().children(entry.choices.map(choice =>
+        small(choice.key, `${choice.key} ${choice.label.length > 30 ? choice.label.slice(0, 29) + "…" : choice.label}`,
+          cx => this.answerAgent(item, choice.key, cx)).tooltip(choice.label)))
+        .child(small("reply", "Reply", cx => this.replyTo(item, cx)))
+        .child(small("focus", "Go to agent", () => run("agent.focus", {terminal:item.agent.address}))))
+      .when(Boolean(entry.reply), el => el.child(div().min_w(0)
+        .on_click((_event, cx) => cx.stop_propagation())
+        .child(Input.new(entry.input).h(26).w_full().min_w(0).px(6)
+          .text_size(12).bg(t.background).text_color(t.foreground))))
+      .when(Boolean(entry.feedback), el => el.child(div().text_size(11).text_color(t.dim).whitespace_normal().child(entry.feedback)));
   }
 
   attention(agent) {
@@ -207,11 +297,60 @@ export default class Berbr extends View {
   rows(sections = this.sections()) {
     return sections.flatMap(section => [
       {id:`section-${section.id}`, kind:"section", section:section.id},
-      ...(section.expanded ? section.rows.flatMap(row => [row, ...(row.id === this.expanded
-        ? (row.kind === "task" ? this.detailItems(row) : this.looseItems(row)).filter(item => item.action) : [])]) : []),
+      ...(section.expanded ? section.rows.flatMap(row => {
+        const waiting = row.kind === "task" ? this.waitingItems(row).filter(item => this.blockedReasons.get(item.agent.address)?.question) : [];
+        const details = row.id === this.expanded
+          ? (row.kind === "task" ? this.detailItems(row) : this.looseItems(row)).filter(item => item.action) : [];
+        if (!details.length) return [row, ...waiting];
+        return [row, ...details.flatMap(item => [item, ...waiting.filter(prompt => item.type === "agent" && item.live?.address === prompt.agent.address)])];
+      }) : []),
     ]);
   }
   chosen() { return this.rows().find(row => row.id === this.selected); }
+
+  openJump() {
+    if (!this.busy) this.formOverlay("jump", {snapshot:this.data, agents:agents()});
+  }
+
+  jumpMatches() { return matchJump(this.jumpEntries ?? [], this.jumpQuery); }
+
+  chooseJump(cx, item = this.jumpMatches()[this.jumpIndex]) {
+    if (!item || this.jumpChosen) return;
+    this.jumpChosen = true;
+    if (item.kind === "project") setShared("berbr.project", item.project.name);
+    else if (item.kind === "agent") run("agent.focus", {terminal:item.live?.address ?? item.row.terminal});
+    else if (["ticket", "mr"].includes(item.kind) && !item.task) this.openUrl(item.row.url, cx);
+    else {
+      setShared("berbr.jumpTarget", {project:this.project, task:item.task?.id, row:item.row.id,
+        parent:item.parent?.id, kind:item.kind});
+      run("berbr.navigate");
+    }
+    if (props()?.overlay) closeOverlay(props().overlay);
+  }
+
+  receiveJump(cx) {
+    const target = shared("berbr.jumpTarget");
+    if (!target || target.project !== this.project || !this.data) return;
+    setShared("berbr.jumpTarget", null);
+    const flat = walk(this.data.rows);
+    const parent = flat.find(row => row.id === (target.task ?? target.parent ?? target.row));
+    if (!parent) return;
+    this.filter = ""; this.inputs.search.set_value(""); this.values.search = "";
+    if (parent.done) this.all = true;
+    this.setExpanded(parent.id, cx);
+    for (const section of this.liveState().sections) if (section.rows.some(row => row.id === parent.id)) this.collapsed.delete(section.id);
+    if (parent.kind === "task" && target.kind === "mr" && this.liveState().detail(parent).history.some(item => item.row.id === target.row))
+      this.history.add(parent.id);
+    const subtask = parent.kind === "task" && this.liveState().detail(parent).subtasks
+      .find(row => walk([row]).some(child => child.id === target.row));
+    if (subtask) this.subtasks.add(parent.id);
+    const details = parent.kind === "task" ? this.detailItems(parent) : this.looseItems(parent);
+    const item = details.find(item => item.row?.id === target.row)
+      ?? details.find(item => item.type === "tree" && item.mr?.id === target.row)
+      ?? details.find(item => item.row?.id === subtask?.id);
+    this.selected = target.row === parent.id ? parent.id : item?.id ?? parent.id;
+    this.handle.focus(); cx.notify();
+  }
 
   toggleSection(id, cx, expanded = this.collapsed.has(id)) {
     if (this.busy) return;
@@ -288,8 +427,8 @@ export default class Berbr extends View {
     if (this.busy) return;
     const popup = ["projects", "attach-task"].includes(form);
     openOverlay({ mod:"berbr", kind: popup ? "popup" : "dialog",
-      width: ["done", "remove-merged"].includes(form) ? 520 : form === "projects" ? 220 : form === "attach-task" ? 300 : form === "new" ? 560 : form === "remove-tree" ? 440 : 480,
-      height: popup ? undefined : ["done", "remove-merged"].includes(form) ? 0.75 : form === "new" ? 380 : form === "remove-tree" ? 300 : 240,
+      width: ["done", "remove-merged"].includes(form) ? 520 : form === "projects" ? 220 : form === "attach-task" ? 300 : ["jump", "new"].includes(form) ? 560 : form === "remove-tree" ? 440 : 480,
+      height: popup ? undefined : form === "jump" ? 0.6 : ["done", "remove-merged"].includes(form) ? 0.75 : form === "new" ? 380 : form === "remove-tree" ? 300 : 240,
       modal: ["new", "remove-tree", "done", "remove-merged"].includes(form),
       ...(popup ? {at:"pointer"} : {}),
       props:{ form, project:this.project, binary:this.binary, agent:this.agent,
@@ -370,6 +509,7 @@ export default class Berbr extends View {
   taskClick(row, cx) {
     if (this.busy) return;
     this.selected = row.id; this.handle.focus();
+    if (row.kind === "waiting") { cx.notify(); return; }
     if (row.kind === "section") this.toggleSection(row.section, cx);
     else if (row.kind === "detail") { if (row.type !== "tree") row.action?.(cx); }
     else this.setExpanded(this.expanded === row.id ? null : row.id, cx);
@@ -395,6 +535,17 @@ export default class Berbr extends View {
 
   key(event, cx) {
     if (this.form === "note" && noteKey(this, event, cx)) return;
+    if (!this.form && this.panelFocused() && event.keystroke === "cmd-k") {
+      this.openJump(); cx.stop_propagation(); return;
+    }
+    if (this.form === "jump" && ["up", "down"].includes(event.key)) {
+      this.jumpIndex = Math.max(0, Math.min(this.jumpMatches().length - 1, this.jumpIndex + (event.key === "down" ? 1 : -1)));
+      cx.stop_propagation(); cx.notify(); return;
+    }
+    if (this.replyFocused) {
+      if (event.key === "escape") { this.replyFocused = null; this.handle.focus(); cx.stop_propagation(); }
+      return;
+    }
     if (event.key === "escape") {
       if (!this.form && this.searchFocused) {
         this.filter = ""; this.values.search = ""; this.inputs.search.set_value("");
@@ -413,7 +564,9 @@ export default class Berbr extends View {
     if (arrow || ["j", "k"].includes(event.key)) {
       const delta = ["down", "j"].includes(event.key) ? 1 : -1;
       this.selected = rows[Math.max(0, Math.min(rows.length - 1, index + delta))]?.id ?? null;
-    } else if (event.key === "enter" && this.chosen()) this.enter(this.chosen(), cx);
+    } else if (/^[1-9]$/.test(event.key) && this.chosen()?.kind === "waiting") this.answerAgent(this.chosen(), event.key, cx);
+    else if (event.key === "enter" && this.chosen()?.kind === "waiting") this.replyTo(this.chosen(), cx);
+    else if (event.key === "enter" && this.chosen()) this.enter(this.chosen(), cx);
     else if (event.key === "left" && this.chosen()) {
       const row = this.chosen();
       if (row.kind === "section") this.toggleSection(row.section, cx, false);
@@ -441,21 +594,22 @@ export default class Berbr extends View {
     const selected = this.panelFocused() && row.id === this.selected;
     const active = selected || signal.liveSpace?.active;
     const hints = h_flex().gap(10).items_center().min_w(0).text_size(11);
-    if (signal.working) {
+    const showMr = signal.mrNeedsYou || signal.mrFlag === "ready to merge";
+    if (signal.working && !showMr) {
       const activity = this.activity(signal.workingAgent, signal.workingTree?.tree ?? signal.workingTree?.label);
       hints.child(h_flex().min_w(0).gap(4).items_center().text_color(t.muted)
         .child(div().min_w(0).truncate().child(activity.text))
         .when(Boolean(activity.elapsed), el => el.child(div().flex_none().text_color(t.dim).child(activity.elapsed)))
         .when(signal.working > 1, el => el.child(div().flex_none().child(`+${signal.working - 1}`))));
-    } else if (["blocked", "done"].includes(signal.status)) hints.child(div().min_w(0).truncate()
+    } else if (["blocked", "done"].includes(signal.status) && signal.agents.some(agent => agent.status === signal.status)) hints.child(div().min_w(0).truncate()
       .text_color(t[signal.status]).child(this.attention(signal.agents.filter(agent => agent.status === signal.status)
         .reduce((latest, agent) => !latest || (agent.seq ?? 0) > (latest.seq ?? 0) ? agent : latest, null))));
-    if (!signal.working && signal.ticket) hints.child(div().min_w(0).truncate().text_color(t.muted)
+    if (!signal.working && !signal.mrNeedsYou && signal.ticket) hints.child(div().min_w(0).truncate().text_color(t.muted)
       .child(`${signal.ticket.target}${normalizeTicketState(signal.ticket.state) === "In review" ? " in review" : ""}`));
-    if (!signal.working && signal.mrs.length) hints.child(this.externalLink(t, `task-mr-${row.id}`, signal.mrs[0])
+    if ((!signal.working || showMr) && signal.mrs.length) hints.child(this.externalLink(t, `task-mr-${row.id}`, signal.mrs[0])
       .child(div().child(signal.mrKey))
       .when(Boolean(signal.mrFlag), el => el.child(div().min_w(0).truncate()
-        .text_color(signal.mrFlag === "draft" ? t.dim : t.blocked).child(signal.mrFlag)))
+        .text_color(signal.mrFlag === "ready to merge" ? t.accent : signal.mrFlag === "draft" ? t.dim : t.blocked).child(signal.mrFlag)))
       .when(signal.mrs.length > 1, el => el.child(div().text_color(t.dim).child(`+${signal.mrs.length - 1}`))));
     const hasSignal = Boolean(signal.attention || signal.ticket || signal.mrs.length);
     if (!hasSignal && signal.trees.length) hints.child(div().text_color(t.dim)
@@ -490,14 +644,14 @@ export default class Berbr extends View {
       items.push({id, kind:"detail", parent:task, type, ...values,
         action:action ? cx => action(cx, id) : null});
     };
-    for (const tree of detail.trees) {
-      add("tree", tree.row.id, tree, (cx, id) => this.enterTree(tree.row, tree.mr, cx, id));
-      for (const agent of tree.agents) add("agent", `${tree.row.id}/${agent.row.id}`, {...agent, tree:tree.row},
+    for (const [index, tree] of detail.trees.entries()) {
+      add("tree", tree.row.id, {...tree, groupStart:index > 0, hasAgents:tree.agents.length > 0}, (cx, id) => this.enterTree(tree.row, tree.mr, cx, id));
+      for (const agent of tree.agents) add("agent", `${tree.row.id}/${agent.row.id}`, {...agent, tree:tree.row, nested:true},
         cx => this.open(agent.row, cx));
     }
     if (detail.mainAgents.length) {
-      add("main", "header", {label:"Main checkout"});
-      for (const agent of detail.mainAgents) add("agent", agent.row.id, agent, cx => this.open(agent.row, cx));
+      add("main", "header", {label:"Main checkout", groupStart:detail.trees.length > 0, hasAgents:true});
+      for (const agent of detail.mainAgents) add("agent", agent.row.id, {...agent, nested:true}, cx => this.open(agent.row, cx));
     }
     for (const mr of detail.openMrs) add("mr", mr.row.id, mr, (cx, id) => this.openUrl(mr.row.url, cx, id));
     for (const [key, label, rows, expanded] of [
@@ -562,24 +716,26 @@ export default class Berbr extends View {
     this.formOverlay("new", {prefill:{title:ticketTitle(ticket), ticket:ticket.target ?? ""}});
   }
 
-  treeState(t, row, {compact = false, hideMerged = false} = {}) {
+  treeState(t, row, {compact = false, hideMerged = false, hideChanges = false} = {}) {
     const marks = treeMarks(row);
     const parts = [];
-    if (marks.changes) parts.push([`+${marks.changes}${compact ? "" : " uncommitted"}`, t.working,
-      `${marks.changes} uncommitted ${marks.changes === 1 ? "change" : "changes"}`]);
+    if (marks.changes && !hideChanges) parts.push([`${marks.changes} uncommitted`, t.working,
+      `${marks.changes} uncommitted ${marks.changes === 1 ? "file" : "files"}`]);
     if (marks.unpushed) parts.push([`↑${marks.unpushed}${compact ? "" : " unpushed"}`, t.blocked,
       `${marks.unpushed} unpushed ${marks.unpushed === 1 ? "commit" : "commits"}`]);
     if (marks.merged && !hideMerged) parts.push(["merged", t.dim, "merged"]);
     if (marks.quietDays !== null) parts.push([`${compact ? "" : "quiet "}${marks.quietDays}d`, t.dim, `quiet ${marks.quietDays}d`]);
     if (!parts.length) return null;
     return h_flex().min_w(0).gap(6).text_size(11).items_center().tooltip(parts.map(([, , label]) => label).join(" · "))
-      .children(parts.map(([label, tone]) => div().min_w(0).truncate().text_color(tone).child(label)));
+      .when(compact, el => el.flex_none())
+      .children(parts.map(([label, tone]) => div().when(compact, el => el.flex_none())
+        .when(!compact, el => el.min_w(0).truncate()).text_color(tone).child(label)));
   }
 
   innerRow(t, item) {
     const selected = this.panelFocused() && item.id === this.selected;
     const pending = this.busy && this.busyAction === item.id;
-    return h_flex().id(item.id).h(28).flex_none().px(6).gap(6).items_center().rounded(6)
+    return h_flex().id(item.id).h(item.type === "agent" ? 24 : 28).flex_none().px(6).gap(6).items_center().rounded(6)
       .min_w(0).text_size(12.5).text_color(t.foreground)
       .when(selected, el => el.bg(t.selected)).hover(el => el.bg(selected ? t.selected : t.hover))
       .opacity(this.busy && !pending && ![`${item.id}/review`, `${item.id}/resume`, `${item.id}/mr`, `${item.id}/ticket`].includes(this.busyAction) ? 0.4 : 1)
@@ -623,11 +779,13 @@ export default class Berbr extends View {
   }
 
   mrState(t, mr, historical = false, state = mr?.state?.toLowerCase()) {
-    const flags = parseMrFlags(mr?.body);
-    const flag = state === "merged" || state === "closed" ? state
+    const flags = mrFlags(mr);
+    const terminal = state === "merged" || state === "closed";
+    const flag = terminal ? state
       : flags.worst ?? (flags.ci === "running" ? "CI running" : "");
-    return div().min_w(0).truncate().text_size(11)
-      .text_color(!historical && ["CI failed", "conflict"].includes(flag) ? t.blocked : t.dim).child(flag);
+    return div().flex_none().text_size(11)
+      .text_color(historical || terminal ? t.dim : flags.needsYou ? t.blocked : flags.ready ? t.accent
+        : !historical && ["CI failed", "conflict"].includes(flag) ? t.blocked : t.dim).child(flag);
   }
 
   agentLine(t, line, item) {
@@ -641,13 +799,13 @@ export default class Berbr extends View {
       : icon("terminal", 14).text_color(t.dim);
     const label = activity ? activity.elapsed : !item.live ? "stopped"
       : status === "blocked" ? this.attention(item.live) : status === "done" ? "finished" : "";
-    return line.text_size(12).text_color(item.live ? t.foreground : t.dim)
+    return line.text_size(12).text_color(item.live ? t.muted : t.dim)
       .child(mark.flex_none().tooltip(program?.name || "Terminal").accessibility_label(program?.name || "Terminal"))
       .child(div().flex_1().min_w(0).truncate().when(Boolean(activity), el => el.text_color(t.muted)).child(title))
-      .child(h_flex().max_w("60%").min_w(0).gap(4).items_center().text_size(11)
+      .child(h_flex().flex_none().gap(4).items_center().text_size(11)
         .text_color(["blocked", "done"].includes(status) ? t[status] : t.dim)
         .child(activity ? icon("spinner", 11).text_color(t.working).spin(900) : statusMark(t, status))
-        .when(Boolean(label), el => el.child(div().min_w(0).truncate().tooltip(label).child(label))));
+        .when(Boolean(label), el => el.child(div().flex_none().tooltip(label).child(label))));
   }
 
   detailRow(t, item) {
@@ -656,20 +814,28 @@ export default class Berbr extends View {
     const mark = name => pending ? icon("spinner", 11).text_color(t.dim).spin(900) : icon(name, 12).text_color(t.dim);
     if (item.type === "tree") {
       line.child(mark("git-branch"))
-        .child(div().flex_1().min_w("45%").flex_shrink(0).truncate()
+        .child(div().flex_1().min_w(0).truncate()
           .text_color(isMergedTree(item.row) || ["merged", "closed"].includes(item.mr?.state?.toLowerCase()) ? t.muted : t.foreground)
           .child(item.row.label ?? item.row.tree ?? "Untitled"));
-      const right = h_flex().min_w(0).flex_shrink(1).gap(6).items_center();
-      if (item.loose && item.row.branch) right.child(div().min_w(0).truncate()
+      const right = h_flex().flex_none().gap(6).items_center();
+      if (item.loose && item.row.branch) right.child(div().flex_none()
         .text_size(11).text_color(t.dim).tooltip(item.row.branch).child(item.row.branch));
-      const state = this.treeState(t, item.row, {compact:true, hideMerged:Boolean(item.mr && !item.loose)});
+      const state = this.treeState(t, item.row, {compact:true, hideMerged:Boolean(item.mr && !item.loose), hideChanges:!item.loose});
       if (state) right.child(state);
       right.children(this.treeActions(t, item.row, item.mr, item.id, {loose:item.loose, ticket:item.ticket}));
-      if (item.mr && !item.loose) right.child(this.externalLink(t, `${item.id}/mr`, item.mr).flex_shrink(1)
-        .child(div().min_w(0).truncate().text_size(12).child(item.mr.label?.match(/!\d+/)?.[0] ?? "MR"))
+      if (item.mr && !item.loose) right.child(this.externalLink(t, `${item.id}/mr`, item.mr).flex_none()
+        .child(div().flex_none().text_size(12).child(item.mr.label?.match(/!\d+/)?.[0] ?? "MR"))
         .child(this.mrState(t, item.mr, false, isMergedTree(item.row) ? "merged"
           : item.row.mr_state ?? item.mr.state?.toLowerCase())));
-      else if (!item.loose) right.child(div().min_w(0).truncate().text_size(11).text_color(t.dim).child("no MR"));
+      else if (!item.loose) right.child(div().flex_none().text_size(11).text_color(t.dim).child("no MR"));
+      const changes = treeMarks(item.row).changes;
+      if (!item.loose && changes) right.child(div().flex_none().size(6).rounded(3).bg(t.working)
+        .tooltip(`${changes} uncommitted ${changes === 1 ? "file" : "files"}`)
+        .accessibility_label(`${changes} uncommitted ${changes === 1 ? "file" : "files"}`));
+      const diff = item.row.diff;
+      if (diff && (diff.adds > 0 || diff.dels > 0)) right.child(h_flex().flex_none().gap(4).text_size(11)
+        .child(div().flex_none().text_color(t.done ?? t.dim).child(`+${diff.adds}`))
+        .child(div().flex_none().text_color(t.blocked ?? t.dim).child(`−${diff.dels}`)));
       line.child(right);
     } else if (item.type === "ticket") {
       line.child(this.externalLink(t, `${item.id}/ticket`, item.row).flex_none().tooltip("Open in Jira")
@@ -679,10 +845,13 @@ export default class Berbr extends View {
     } else if (item.type === "agent") {
       this.agentLine(t, line, item);
     } else if (item.type === "mr") {
+      const iid = item.row.label?.match(/!\d+/)?.[0] ?? "MR";
+      const title = item.row.label?.replace(/^\s*!\d+\s*/, "") ?? "";
       line.text_color(item.historical ? t.dim : t.foreground).child(mark("git-compare"))
         .child(this.externalLink(t, `${item.id}/mr`, item.row).flex_1()
           .text_color(item.historical ? t.dim : t.foreground)
-          .child(div().min_w(0).truncate().child(item.row.label ?? "MR"))
+          .child(div().flex_none().child(iid))
+          .child(div().flex_1().min_w(0).truncate().child(title))
           .child(this.mrState(t, item.row, item.historical)))
         .when(Boolean(item.tickets.length), el => el.child(div().max_w("35%").min_w(0).truncate()
           .text_size(11).text_color(t.dim).child(item.tickets.join(" · "))));
@@ -696,7 +865,10 @@ export default class Berbr extends View {
       line.child(icon("folder", 12).text_color(t.dim))
         .child(div().text_size(12).text_color(t.muted).child(item.label));
     }
-    return div().child(line);
+    if (item.nested) return div().pl(12).border_l_1().border_color(t.border).ml(12).child(line);
+    return div().when(Boolean(item.groupStart), el => el.mt(4))
+      .when(Boolean(item.hasAgents), el => el.relative().child(div().absolute().left(12).bottom(0).h(8).w(1).bg(t.border)))
+      .child(line);
   }
 
   ticketsLine(t, task, detail) {
@@ -722,14 +894,29 @@ export default class Berbr extends View {
   }
 
   taskBlock(t, task) {
-    if (task.id !== this.expanded) return this.taskRow(t, task);
+    const waiting = this.waitingItems(task);
+    if (task.id !== this.expanded) {
+      if (!waiting.length) return this.taskRow(t, task);
+      const rows = this.liveState().detail(task);
+      return v_flex().child(this.taskRow(t, task)).children(waiting.map(item => {
+        const agent = rows.trees.flatMap(tree => tree.agents.map(agent => ({...agent, tree:tree.row})))
+          .concat(rows.mainAgents).find(agent => agent.live?.address === item.agent.address);
+        return v_flex().child(this.agentLine(t, h_flex().h(24).mx(28).gap(6).items_center().min_w(0), agent ?? {
+          row:{label:item.agent.title}, live:item.agent, status:"blocked",
+        })).child(this.waitingCard(t, item));
+      }));
+    }
     const detail = this.liveState().detail(task);
     const items = this.detailItems(task, detail);
     const body = v_flex().pl(28).pr(8).pb(4).min_w(0);
     if (detail.excerpt) body.child(div().pb(4).child(div().px(6).max_h(32).overflow_hidden().line_height(1.35)
       .whitespace_normal().text_size(12).text_color(t.muted).child(detail.excerpt)));
     body.child(div().px(6).child(this.ticketsLine(t, task, detail)))
-      .children(items.filter(item => item.type !== "action").map(item => this.detailRow(t, item)));
+      .children(items.filter(item => item.type !== "action").map(item => v_flex().child(this.detailRow(t, item))
+        .when(item.type === "agent" && item.live?.status === "blocked", el => {
+          const prompt = waiting.find(prompt => prompt.agent.address === item.live.address);
+          if (prompt) el.child(div().ml(12).border_l_1().border_color(t.border).child(this.waitingCard(t, prompt)));
+        })));
     body.child(this.actionRows(t, items));
     return this.expandedBlock(t, this.taskRow(t, task), body);
   }
@@ -821,7 +1008,6 @@ export default class Berbr extends View {
       .on_key_down((event, cx) => this.key(event, cx)).child(formView(this, t));
     const panelFocused = this.panelFocused();
     const sections = this.sections();
-    this.syncBlocked(visibleRows(sections), cx);
     const rows = this.rows(sections);
     if (!rows.some(row => row.id === this.selected))
       this.selected = rows.find(row => row.id === this.expanded)?.id ?? rows[0]?.id ?? null;
@@ -890,6 +1076,6 @@ export default class Berbr extends View {
         .child(div().id("toggle-done").text_size(11).text_color(this.all ? t.foreground : t.dim).cursor_pointer()
           .tooltip("Show completed tasks (d)").on_click((_event, cx) => {this.all = !this.all; cx.notify();}).child(`Done ${done}`))
         .child(div().flex_1())
-        .child(panelFocused ? kbd(t, "↑↓ move · → expand · ⏎ open · n new").min_w(0).truncate() : sources));
+        .child(panelFocused ? kbd(t, "⌘K jump · ↑↓ move · → expand · ⏎ open").min_w(0).truncate() : sources));
   }
 }

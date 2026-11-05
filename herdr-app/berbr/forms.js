@@ -345,6 +345,23 @@ function projectsForm(view, t, p) {
     .when(!p.projects?.length, el => el.child(div().p(10).text_size(12).text_color(t.dim).child("No projects available")));
 }
 
+function jumpForm(view, t) {
+  const matches = view.jumpMatches();
+  const start = Math.max(0, view.jumpIndex - 5);
+  const names = {task:"Task", tree:"Worktree", agent:"Agent", ticket:"Ticket", mr:"MR", project:"Project"};
+  return v_flex().p(6).gap(4).min_w(0).bg(t.popover).text_color(t.foreground)
+    .child(view.input("search"))
+    .child(v_flex().id("jump-results").children(matches.slice(start, start + 10).map((item, index) =>
+      h_flex().id(`jump-${item.id}`).h(30).flex_none().px(8).gap(6).items_center().min_w(0).rounded(6)
+        .when(start + index === view.jumpIndex, el => el.bg(t.selected)).cursor_pointer().hover(el => el.bg(t.hover))
+        .on_click((_event, cx) => view.chooseJump(cx, item))
+        .child(icon({task:"circle-check", tree:"git-branch", agent:"terminal", ticket:"file-text", mr:"git-compare", project:"folder"}[item.kind], 12).text_color(t.dim))
+        .child(div().flex_1().min_w(0).truncate().text_size(12).child(item.title))
+        .child(div().flex_none().text_size(11).text_color(t.dim).child(names[item.kind])))))
+    .when(!matches.length, el => el.child(div().p(10).text_size(12).text_color(t.dim).child("No matches")))
+    .child(kbd(t, "↑↓ move · ⏎ jump · esc close"));
+}
+
 function attachTaskForm(view, t, p) {
   return v_flex().p(4).bg(t.popover).text_color(t.foreground)
     .children((p.tasks ?? []).map(task => {
@@ -369,6 +386,7 @@ export function formView(view, t) {
   if (view.form === "new") return newForm(view, t);
   if (view.form === "ticket") return ticketForm(view, t, p);
   if (view.form === "projects") return projectsForm(view, t, p);
+  if (view.form === "jump") return jumpForm(view, t);
   if (view.form === "attach-task") return attachTaskForm(view, t, p);
   if (view.form === "remove-merged") return removeMergedForm(view, t);
   if (view.form === "remove-tree") return removeTreeForm(view, t, p);

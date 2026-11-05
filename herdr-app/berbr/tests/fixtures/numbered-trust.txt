@@ -1,0 +1,7 @@
+Accessing workspace:
+/home/dev/demo
+Is this a project you trust?
+❯ 1. Yes, I trust this folder
+  2. No, exit
+
+Enter to confirm · Esc to cancel

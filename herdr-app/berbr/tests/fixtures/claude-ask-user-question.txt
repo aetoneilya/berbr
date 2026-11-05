@@ -1,0 +1,27 @@
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Opus 5.5 with high effort · Claude Pro
+ ▝▝   ▝▝   /home/dev/demo
+
+
+❯ Use the AskUserQuestion tool to ask me which colour I prefer for the button: red, green or blue. Do nothing else.
+
+⏺ User answered Claude's questions:
+  ⎿  · Which colour do you prefer for the button? → what button?
+
+
+
+
+
+
+
+
+
+
+
+✢ Wrangling… (3s · ↓ 157 tokens)
+                                                                                                    ● high · /effort
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · esc to interrupt

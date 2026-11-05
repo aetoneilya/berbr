@@ -1,0 +1,11 @@
+Which colour do you prefer for the button?
+ ❯ 1. Red
+      Warm, high contrast
+
+   2. Green
+      Calm
+   3. Blue
+   4. Type something.
+      Enter a different colour
+
+Enter to select · Esc to cancel

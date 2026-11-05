@@ -51,7 +51,8 @@ export function statusMark(t, status) {
   const mark = h_flex().w(16).h(16).flex_none().items_center().justify_center();
   if (status === "working") return mark.child(icon("spinner", 12).text_color(t.working).spin(900));
   if (status === "closed") return mark.child(icon("check", 12).text_color(t.dim));
-  if (["blocked", "done"].includes(status)) return mark.child(div().size(8).rounded(4).bg(t[status]));
+  if (["blocked", "done"].includes(status)) return mark.child(div().size(8).rounded(4).bg(t[status])
+    .when(status === "blocked", el => el.loop("opacity", {from:0.35, to:1, period:1200})));
   return mark.child(div().size(8).rounded(4).border(1.5).border_color(["idea", "unknown"].includes(status) ? t.dim : t.muted));
 }
 

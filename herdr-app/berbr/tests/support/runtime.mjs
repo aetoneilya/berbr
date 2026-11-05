@@ -23,11 +23,13 @@ export const h_flex = div, v_flex = div;
 export const svg = path => Object.assign(div().child(path), {asset:{kind:"svg", path}});
 export const image = path => Object.assign(div().child(path), {asset:{kind:"image", path}});
 export class View {}
-export const Input = {new:() => div()};
+export const Input = {new:input => Object.assign(div(), {input})};
 export const Switch = {new:() => div()};
-export const InputState = {new:({value}) => ({
-  on() {}, focus() {}, value:() => value, set_value(next) {value = next;},
-})};
+export const InputState = {new:({value}) => {
+  const listeners = new Map();
+  return {on:(event, fn) => listeners.set(event, fn), focus() {}, value:() => value,
+    set_value(next) {value = next;}, emit:(event, cx) => listeners.get(event)?.({}, cx)};
+}};
 export const TextView = {html:(_id, text) => div().child(text), markdown:(_id, text) => div().child(text)};
 export const state = {props:{}, spaces:[], agents:[], shared:new Map(), calls:[], overlays:[], notices:[], execs:[]};
 export const appHome = () => "/test";
@@ -59,6 +61,7 @@ export const exec = async (...args) => {
 export const hc = async args => {
   state.hcCalls.push(args);
   if (state.hcError) throw state.hcError;
+  if (state.hcHandler) return state.hcHandler(args);
   return state.hcResult ?? {code:0, stdout:"", stderr:""};
 };
 export const settings = () => ({font_family:"Test Mono"});

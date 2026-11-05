@@ -1,0 +1,1 @@
+The claude-* captures are supplied samples, with paths replaced by /home/dev/demo. They contain no numbered prompt (the get captures report working); the folder dialog uses unnumbered choices. Keep these as negative cases. numbered-* are synthetic prompts for the numbered-choice contract.

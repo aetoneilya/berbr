@@ -19,11 +19,11 @@ function setup({data = snapshot, props = {}, saved = null, collapsed = null, liv
   if (saved) storage.set("berbr.expanded", JSON.stringify(saved));
   if (collapsed) storage.set("berbr.collapsed", JSON.stringify(collapsed));
   Object.assign(state, {props, spaces:liveSpaces, agents:[], shared:new Map(), calls:[], overlays:[], notices:[], execs:[], execResult:null,
-    reads:[], readResult:null, readError:null, watches:[], watchers:[], hcCalls:[], hcResult:null, hcError:null, files:null, writes:[], writeError:null, writeResult:null});
+    reads:[], readResult:null, readError:null, watches:[], watchers:[], hcCalls:[], hcResult:null, hcError:null, hcHandler:null, files:null, writes:[], writeError:null, writeResult:null});
   const jobs = [], timers = [];
   const handle = {focused:true, focus() {this.focused = true;}, is_focused() {return this.focused;}};
   const cx = {notify() {}, stop_propagation() {}, focus_handle:() => handle,
-    timer:{every:(ms, fn) => timers.push({ms, fn})}, spawn:fn => jobs.push(fn)};
+    timer:{every:(ms, fn) => timers.push({ms, fn})}, sleep:async ms => state.calls.push(["sleep", ms]), spawn:fn => jobs.push(fn)};
   const view = new Berbr();
   view.init({}, cx);
   if (!keepJobs && props.form !== "note") jobs.length = 0; // Skip the initial snapshot and infinite command listener.
@@ -201,11 +201,11 @@ test("task status columns keep rings for open tasks and ideas and meaningful act
 test("the existing 30 second refresh timer updates elapsed only for visible working tasks", () => {
   const task = {id:"clock", kind:"task", title:"Clock", children:[{kind:"agent", terminal:"agent"}]};
   const {view, cx, timers} = setup({data:{rows:[task]}});
-  assert.deepEqual(timers.map(timer => timer.ms), [30000, 300000]);
+  assert.deepEqual(timers.map(timer => timer.ms), [1000, 30000, 300000]);
   let refreshed = 0, notified = 0;
   view.refresh = (_cx, cached) => {assert.equal(cached, true); refreshed++;};
   cx.notify = () => notified++;
-  const tick = () => timers[0].fn(cx);
+  const tick = () => timers.find(timer => timer.ms === 30000).fn(cx);
   tick();
   assert.equal(notified, 0);
   state.agents = [{address:"agent", status:"working"}];
@@ -227,22 +227,22 @@ test("blocked reasons read once per address and seq, update both rows, and show 
   const agent = {address:"address", pane:"pane", status:"blocked", seq:1, title:"Agent"};
   state.agents = [agent];
   assert.ok(text(byId(view.render(cx), "task-blocked")).includes("Waiting for you"));
-  view.render(cx);
+  view.syncBlocked(view.liveState().rows, cx); view.render(cx);
   assert.equal(jobs.length, 1);
   assert.deepEqual(state.hcCalls, []);
   state.hcResult = {code:0, stdout:"$ npm test\nDo you want to proceed?\n1. Yes", stderr:""};
   await jobs.shift()(cx);
-  assert.deepEqual(state.hcCalls, [["read", "address", "--lines", "40"]]);
+  assert.deepEqual(state.hcCalls, [["get", "address"], ["read", "address"]]);
   assert.ok(text(byId(view.render(cx), "task-blocked")).includes("Asks permission · npm test"));
   view.showDetails(task, cx);
   assert.ok(text(view.render(cx)).includes("Asks permission · npm test"));
   assert.equal(jobs.length, 0);
   agent.seq++;
-  view.render(cx);
+  view.syncBlocked(view.liveState().rows, cx); view.render(cx);
   state.hcResult.stdout = "Old question?\nWhich branch should I use?\nEnter to send";
   await jobs.shift()(cx);
   assert.ok(text(view.render(cx)).includes("Asks: Which branch should I use?"));
-  assert.equal(state.hcCalls.length, 2);
+  assert.equal(state.hcCalls.length, 4);
   agent.status = "done"; agent.seq++;
   view.setExpanded(null, cx);
   assert.ok(text(view.render(cx)).includes("Finished · review"));
@@ -257,29 +257,29 @@ test("blocked reads skip hidden and unrelated agents, fail silently and ignore s
   const {view, cx, jobs} = setup({data:{rows:[task]}});
   state.agents = [{address:"agent", status:"blocked", seq:1}, {address:"other", status:"blocked", seq:2}];
   view.filter = "hidden";
-  view.render(cx);
+  view.syncBlocked(view.liveState().rows, cx); view.render(cx);
   assert.equal(jobs.length, 0);
   view.filter = "";
-  view.render(cx);
+  view.syncBlocked(view.liveState().rows, cx); view.render(cx);
   state.hcError = new Error("Cannot read terminal");
   await jobs.shift()(cx);
-  assert.equal(state.hcCalls.length, 1);
+  assert.equal(state.hcCalls.length, 2);
   assert.equal(view.error, null);
   assert.ok(text(view.render(cx)).includes("Waiting for you"));
   assert.equal(jobs.length, 0);
   state.hcError = null;
   state.agents[0].seq++;
   state.hcResult = {code:1, stdout:"Allow command?", stderr:"Failed"};
-  view.render(cx);
+  view.syncBlocked(view.liveState().rows, cx); view.render(cx);
   await jobs.shift()(cx);
   assert.ok(text(view.render(cx)).includes("Waiting for you"));
   let finish;
   state.agents[0].seq++;
   state.hcResult = new Promise(resolve => {finish = resolve;});
-  view.render(cx);
+  view.syncBlocked(view.liveState().rows, cx); view.render(cx);
   const pending = jobs.shift()(cx);
   state.agents[0].status = "working"; state.agents[0].seq++;
-  view.render(cx);
+  view.syncBlocked(view.liveState().rows, cx); view.render(cx);
   finish({code:0, stdout:"Allow command?", stderr:""});
   await pending;
   assert.equal(view.blockedReasons.size, 0);
@@ -975,20 +975,23 @@ test("worktree state is visible in task details, collapsed loose reasons and loo
   let rendered = view.render(cx);
   const item = view.detailItems(task).find(item => item.row === tree);
   const line = byId(rendered, item.id);
-  for (const [label, tone] of [["+1", "working"], ["↑3", "blocked"], ["merged", "dim"], ["35d", "dim"]]) {
+  for (const [label, tone] of [["↑3", "blocked"], ["merged", "dim"], ["35d", "dim"]]) {
     const part = nodes(line).find(node => text(node) === label);
     assert.ok(part, label);
     assert.equal(part.attributes.text_color[0], tone);
   }
-  assert.equal(line.nodes[1].attributes.min_w[0], "45%");
-  assert.equal(line.nodes[1].attributes.flex_shrink[0], 0);
-  assert.equal(line.nodes[2].attributes.flex_shrink[0], 1);
-  const state = nodes(line).find(node => node.attributes.tooltip?.[0].startsWith("1 uncommitted change"));
-  assert.equal(state.attributes.tooltip[0], "1 uncommitted change · 3 unpushed commits · quiet 35d");
+  assert.equal(line.nodes[1].attributes.min_w[0], 0);
+  assert.ok(line.nodes[1].attributes.flex_1);
+  assert.ok(line.nodes[2].attributes.flex_none);
+  const dot = nodes(line).find(node => node.attributes.tooltip?.[0] === "1 uncommitted file");
+  assert.equal(dot.attributes.size[0], 6);
+  assert.equal(dot.attributes.bg[0], "working");
+  const marks = nodes(line).find(node => node.attributes.tooltip?.[0].startsWith("3 unpushed commits"));
+  assert.equal(marks.attributes.tooltip[0], "3 unpushed commits · quiet 35d");
   assert.ok(!text(line).includes("uncommitted"));
   assert.ok(!text(line).includes("unpushed"));
   const header = byId(rendered, `loose-${loose.id}`);
-  assert.ok(text(header).includes("merged · worktree left · +1 uncommitted"));
+  assert.ok(text(header).includes("merged · worktree left · 1 uncommitted"));
   assert.ok(text(header).includes("↑3 unpushed"));
   view.taskClick(loose, cx);
   rendered = view.render(cx);
@@ -1570,7 +1573,7 @@ test("worktree terminal status appears once after the MR key, retaining other Gi
     const label = text(line);
     assert.equal((label.match(new RegExp(`\\b${expected}\\b`, "g")) ?? []).length, 1, label);
     assert.ok(label.indexOf("!42") < label.indexOf(expected), label);
-    for (const mark of ["+2", "↑3", "9d"]) assert.ok(label.includes(mark));
+    for (const mark of ["↑3", "9d"]) assert.ok(label.includes(mark));
     const marks = nodes(line).find(node => node.attributes.tooltip?.[0].startsWith("2 uncommitted"));
     assert.ok(!marks.attributes.tooltip[0].includes(expected));
   }
@@ -1601,5 +1604,356 @@ test("working task summaries contain only activity, elapsed and extra agent coun
     rendered = view.render(cx);
     for (const signal of ["DEMO-12", "In review", "!42", "CI failed"])
       assert.ok(text(rendered).includes(signal), signal);
+  }
+});
+
+async function waitingPanel({screen, status} = {}) {
+  const task = {id:"waiting-task", kind:"task", title:"Demo", children:[
+    {id:"tree", kind:"tree", tree:"demo", children:[{id:"agent", kind:"agent", terminal:"terminal"}]}]};
+  const panel = setup({data:{project:"demo", rows:[task]}});
+  panel.view.project = "demo";
+  state.agents = [{address:"address", pane:"terminal", status:"blocked", seq:1, title:"Choose a colour"}];
+  const promptStatus = status ?? {state:"blocked", kind:"question", msg:"answer: Which colour?"};
+  const promptScreen = screen ?? await readFile(new URL("fixtures/numbered-permission.txt", import.meta.url), "utf8");
+  state.hcHandler = async args => ({code:0, stderr:"", stdout:args[0] === "get" ? JSON.stringify({status:promptStatus}) : args[0] === "read" ? promptScreen : ""});
+  panel.timers.find(timer => timer.ms === 1000).fn(panel.cx);
+  await panel.jobs.shift()(panel.cx);
+  return {...panel, task, status:promptStatus, card:panel.view.waitingItems(task)[0]};
+}
+
+test("waiting cards render quiet prompts; keyboard 2 sends hc keys once and retains unanswered prompts", async () => {
+  const {view, cx, jobs, key, card} = await waitingPanel();
+  const rendered = view.render(cx), prompt = byId(rendered, card.id);
+  assert.ok(text(prompt).includes("Which colour?"));
+  assert.ok(!text(prompt).includes("answer:"));
+  assert.ok(text(prompt).includes("2 Yes, and don't ask again"));
+  assert.ok(view.rows().some(row => row.id === card.id));
+  const question = nodes(prompt).find(node => node.attributes.max_h?.[0] === 49);
+  assert.equal(question.attributes.text_color[0], "foreground");
+  assert.equal(question.attributes.text_size[0], 12);
+  view.selected = card.id;
+  state.hcCalls = [];
+  key("2");
+  key("2");
+  assert.equal(jobs.length, 1);
+  click(byId(view.render(cx), `${card.id}/1`), cx);
+  assert.equal(jobs.length, 1);
+  await jobs.shift()(cx);
+  assert.deepEqual(state.hcCalls, [["keys", "address", "2"], ["get", "address"]]);
+  assert.ok(state.calls.some(call => call[0] === "sleep" && call[1] === 1000));
+  assert.ok(text(byId(view.render(cx), card.id)).includes("Not answered — go to agent"));
+  click(byId(view.render(cx), `${card.id}/focus`), cx);
+  assert.deepEqual(state.calls.at(-1), ["agent.focus", {terminal:"address"}]);
+  assert.deepEqual(state.execs, []);
+});
+
+test("Reply input submits literal text via hc send and clears the answered card", async () => {
+  const {view, cx, jobs, key, card} = await waitingPanel();
+  click(byId(view.render(cx), `${card.id}/reply`), cx);
+  const entry = view.blockedReasons.get("address");
+  entry.input.emit("focus", cx);
+  entry.input.set_value("Use green; keep the label");
+  key("2");
+  assert.equal(jobs.length, 0);
+  state.hcHandler = async args => ({code:0, stdout:args[0] === "get" ? JSON.stringify({status:{state:"working"}}) : "", stderr:""});
+  state.hcCalls = [];
+  entry.input.emit("submit", cx);
+  await jobs.shift()(cx);
+  assert.deepEqual(state.hcCalls, [["send", "address", "Use green; keep the label"], ["get", "address"]]);
+  assert.equal(view.blockedReasons.has("address"), false);
+  assert.equal(view.replyFocused, null);
+});
+
+test("waiting card handles no choices, failed sends, changed prompts and stale seq without sending", async () => {
+  const {view, cx, jobs, card} = await waitingPanel({screen:"No numbered prompt"});
+  assert.equal(byId(view.render(cx), `${card.id}/1`), undefined);
+  view.answerAgent(card, "1", cx);
+  assert.equal(jobs.length, 0);
+  const entry = view.blockedReasons.get("address");
+  view.replyTo(card, cx); entry.input.set_value("Try again");
+  state.hcHandler = async () => ({code:1, stdout:"", stderr:"Terminal unavailable"});
+  view.answerAgent(card, "Try again", cx, true);
+  await jobs.shift()(cx);
+  assert.ok(text(byId(view.render(cx), card.id)).includes("Terminal unavailable"));
+  assert.equal(entry.busy, false);
+  state.agents[0].seq++;
+  state.hcCalls = [];
+  view.answerAgent(card, "Try again", cx, true);
+  assert.deepEqual(state.hcCalls, []);
+  entry.seq++;
+  state.hcHandler = async args => ({code:0, stderr:"", stdout:args[0] === "get"
+    ? JSON.stringify({status:{state:"blocked", kind:"question", msg:"answer: New question?"}}) : "1. New answer\n2. Other answer"});
+  view.answerAgent(card, "Try again", cx, true);
+  await jobs.shift()(cx);
+  assert.equal(entry.question, "New question?");
+  assert.equal(entry.choices[0].label, "New answer");
+  assert.equal(entry.feedback, null);
+});
+
+test("blocked fetches stay outside render and refresh can reload the same seq", async () => {
+  const {view, cx, jobs, timers} = await waitingPanel();
+  state.hcCalls = [];
+  view.render(cx); view.render(cx);
+  assert.deepEqual(state.hcCalls, []);
+  assert.equal(jobs.length, 0);
+  timers.find(timer => timer.ms === 1000).fn(cx);
+  assert.equal(jobs.length, 0);
+  view.syncBlocked(view.liveState().rows, cx, true);
+  await jobs.shift()(cx);
+  assert.deepEqual(state.hcCalls, [["get", "address"], ["read", "address"]]);
+});
+
+test("v3 MR action reasons, ready state and diff render while v2 labels stay unchanged", () => {
+  for (const [fields, expected, tone] of [[{ci:"failed"}, "CI failed", "blocked"], [{conflict:true}, "conflict", "blocked"],
+    [{unresolved:2}, "2 threads", "blocked"], [{ready:true}, "ready to merge", "accent"], [{draft:true}, "draft", "dim"],
+    [{ci:"running"}, "CI running", "dim"]]) {
+    const mr = {id:"mr", kind:"mr", label:"!123 Demo", state:"opened", ci:"success", conflict:false, unresolved:0, draft:false, ready:false, ...fields};
+    const tree = {id:"tree", kind:"tree", task:"Demo", label:"Demo tree", diff:{adds:214, dels:38, files:3}, children:[mr]};
+    const task = {id:"task", kind:"task", title:"Demo", children:[tree]};
+    const {view, cx} = setup({data:{version:3, rows:[task]}});
+    if (tone === "blocked") assert.equal(view.sections().find(section => section.id === "needs").rows[0], task);
+    if (fields.ready || tone === "blocked") assert.ok(text(byId(view.render(cx), "task-task")).includes(`!123 ${expected}`));
+    view.showDetails(task, cx);
+    const item = view.detailItems(task).find(item => item.type === "tree");
+    const line = byId(view.render(cx), item.id);
+    assert.ok(text(line).includes(expected));
+    assert.ok(nodes(line).some(node => node.nodes.includes(expected) && node.attributes.text_color?.[0] === tone));
+    assert.ok(text(line).includes("+214 −38"));
+    assert.ok(nodes(line).some(node => node.nodes.includes("+214") && node.attributes.text_color?.[0] === "done"));
+    tree.diff = {adds:0, dels:0};
+    assert.ok(!text(byId(view.render(cx), item.id)).includes("+0"));
+  }
+  const mr = {id:"mr", kind:"mr", label:"!123 Demo", state:"opened", body:"ci✗"};
+  const task = {id:"task", kind:"task", children:[mr]};
+  const {view, cx} = setup({data:{version:2, rows:[task]}});
+  assert.equal(view.sections()[0].id, "progress");
+  assert.ok(text(byId(view.render(cx), "task-task")).includes("CI failed"));
+});
+
+test("nested agent groups retain 28/24px rows, quiet text and border guides; only blocked marks breathe", () => {
+  const agent = {id:"agent", kind:"agent", terminal:"a"};
+  const task = {id:"task", kind:"task", children:[{id:"tree", kind:"tree", children:[agent]}, {...agent, id:"main", terminal:"b"}]};
+  const {view, cx} = setup({data:{rows:[task]}});
+  state.agents = [{address:"a", status:"blocked", seq:1}, {address:"b", status:"idle", seq:1}];
+  view.showDetails(task, cx);
+  const rendered = view.render(cx), items = view.detailItems(task);
+  assert.equal(byId(rendered, items.find(item => item.type === "tree").id).attributes.h[0], 28);
+  for (const item of items.filter(item => item.type === "agent")) {
+    const line = byId(rendered, item.id);
+    assert.equal(line.attributes.h[0], 24);
+    assert.equal(line.attributes.text_color[0], "muted");
+    assert.ok(nodes(rendered).some(node => node.nodes.includes(line) && node.attributes.border_l_1 && node.attributes.border_color[0] === "border"));
+  }
+  for (const node of nodes(rendered).filter(node => node.attributes.loop)) {
+    assert.equal(node.attributes.bg[0], "blocked");
+    assert.deepEqual(node.attributes.loop, ["opacity", {from:0.35, to:1, period:1200}]);
+  }
+  assert.ok(items.find(item => item.type === "main").groupStart);
+});
+
+test("cmd-k opens a centered dialog; task/tree/MR jumps reveal the section, expand the task and focus the selected row", () => {
+  const mr = {id:"mr", kind:"mr", label:"!123 Demo MR", state:"opened", url:"https://example.com/123"};
+  const tree = {id:"tree", kind:"tree", branch:"feature/button", children:[mr]};
+  const task = {id:"task", kind:"task", title:"Demo refactor", children:[tree]};
+  const data = {project:"demo", rows:[task], projects:[{name:"demo"}, {name:"other"}]};
+  for (const kind of ["task", "tree", "mr"]) {
+    const panel = setup({data}); panel.view.project = "demo";
+    panel.view.collapsed.add("progress");
+    panel.view.key({key:"k", keystroke:"cmd-k", modifiers:{platform:true}}, panel.cx);
+    const spec = state.overlays.at(-1);
+    assert.equal(spec.kind, "dialog"); assert.equal(spec.props.form, "jump");
+    assert.equal(spec.width, 560);
+    assert.equal(spec.height, 0.6);
+    assert.equal(spec.at, undefined);
+    const popup = setup({props:{...spec.props, overlay:"jump"}});
+    popup.view.inputs.search.set_value(kind === "task" ? "dm rfct" : kind === "tree" ? "btn" : "123");
+    popup.view.inputs.search.emit("change", popup.cx);
+    assert.ok(text(popup.view.render(popup.cx)).includes(kind === "task" ? "Demo refactor" : kind === "tree" ? "Worktree" : "!123 Demo MR"));
+    const target = popup.view.jumpMatches().findIndex(item => item.kind === kind);
+    for (let index = 0; index < target; index++) popup.key("down");
+    popup.view.inputs.search.emit("submit", popup.cx);
+    state.props = {};
+    panel.view.handle.focused = false;
+    panel.view.receiveJump(panel.cx);
+    assert.equal(panel.view.expanded, "task");
+    assert.equal(panel.view.selected, kind === "task" ? "task" : panel.view.detailItems(task).find(item => item.row?.id === "tree").id);
+    assert.equal(panel.view.collapsed.has("progress"), false);
+    assert.equal(panel.view.handle.is_focused(), true);
+    const rendered = panel.view.render(panel.cx);
+    assert.ok(byId(rendered, "berbr-tasks").attributes.overflow_y_scrollbar);
+    assert.ok(byId(rendered, kind === "task" ? "task-task" : panel.view.selected));
+    assert.ok(!state.calls.some(call => call[0] === "scroll"));
+    assert.deepEqual(state.execs, []);
+  }
+});
+
+test("jump opens loose links, focuses agents, switches projects and closes on Escape", async () => {
+  const data = {project:"demo", rows:[{kind:"ticket", id:"ticket", target:"DEMO-12", url:"https://example.com/ticket"},
+    {kind:"mr", id:"mr", label:"!123", url:"https://example.com/mr"}, {kind:"agent", id:"agent", terminal:"terminal"}], projects:[{name:"other"}]};
+  for (const kind of ["ticket", "mr", "agent", "project"]) {
+    const {view, cx, jobs, key} = setup({props:{form:"jump", project:"demo", snapshot:data, overlay:"jump"}});
+    const item = view.jumpMatches().find(item => item.kind === kind);
+    view.chooseJump(cx, item);
+    if (["ticket", "mr"].includes(kind)) {
+      await jobs.shift()(cx);
+      assert.deepEqual(state.execs, [["open", [item.row.url]]]);
+    } else if (kind === "agent") assert.ok(state.calls.some(call => call[0] === "agent.focus" && call[1].terminal === "terminal"));
+    else assert.equal(state.shared.get("berbr.project"), "other");
+    key("escape");
+    assert.deepEqual(state.calls.at(-1), ["closeOverlay", "jump"]);
+  }
+});
+
+test("an in-flight answer survives a newer seq and keeps same-message feedback after the deferred check", async () => {
+  const {view, cx, jobs, card} = await waitingPanel();
+  let finishDelay, started;
+  const sleeping = new Promise(resolve => {started = resolve;});
+  cx.sleep = () => new Promise(resolve => {finishDelay = resolve; started();});
+  view.answerAgent(card, "2", cx);
+  const pending = jobs.shift()(cx);
+  await sleeping;
+  state.agents[0].seq++;
+  view.syncBlocked(view.liveState().rows, cx);
+  assert.equal(jobs.length, 0);
+  finishDelay();
+  await pending;
+  const entry = view.blockedReasons.get("address");
+  assert.equal(entry.seq, 2);
+  assert.equal(entry.feedback, "Not answered — go to agent");
+  view.syncBlocked(view.liveState().rows, cx);
+  assert.equal(jobs.length, 0);
+});
+
+test("MR jumps reveal history rows and merged labels remain dim despite stale v3 flags", () => {
+  const mr = {id:"history", kind:"mr", state:"merged", ready:true, ci:"failed", label:"!123 Demo"};
+  const task = {id:"task", kind:"task", children:[mr]};
+  const {view, cx} = setup({data:{project:"demo", rows:[task]}});
+  view.project = "demo";
+  state.shared.set("berbr.jumpTarget", {project:"demo", task:"task", row:"history", kind:"mr"});
+  view.receiveJump(cx);
+  assert.ok(view.history.has("task"));
+  assert.equal(view.chosen().row.id, "history");
+  assert.equal(view.mrState(theme(), mr).attributes.text_color[0], "dim");
+});
+
+test("jumping to a subtask reveals its row inside the containing task without opening its note", () => {
+  const child = {kind:"task", id:"child", title:"Demo child", note:"/home/dev/demo/child.md"};
+  const task = {kind:"task", id:"task", title:"Demo parent", children:[child]};
+  const data = {project:"demo", rows:[task]};
+  const panel = setup({data}); panel.view.project = "demo";
+  const popup = setup({props:{form:"jump", project:"demo", snapshot:data, overlay:"jump"}});
+  popup.view.chooseJump(popup.cx, popup.view.jumpMatches().find(item => item.row?.id === "child"));
+  state.props = {};
+  panel.view.receiveJump(panel.cx);
+  assert.equal(panel.view.expanded, "task");
+  assert.equal(panel.view.chosen().row.id, "child");
+  assert.deepEqual(state.overlays, []);
+  assert.deepEqual(state.execs, []);
+});
+
+test("worktree MR numbers, flags and diffs stay fixed while only the worktree name truncates", () => {
+  const {view} = setup({data:{rows:[]}});
+  for (const [state, fields, flag] of [["opened", {ci:"running"}, "CI running"],
+    ["opened", {ready:true}, "ready to merge"], ["merged", {}, "merged"]]) {
+    const mr = {kind:"mr", label:"!12345 Demo change", state, ...fields};
+    const row = {kind:"tree", label:"demo-config-folder-with-a-long-name", task:"Demo", diff:{adds:468, dels:63}};
+    const line = byId(view.detailRow(theme(), {id:"tree-priority", type:"tree", row, mr}), "tree-priority");
+    const name = line.nodes[1], right = line.nodes[2];
+    const link = byId(line, "tree-priority/mr"), iid = link.nodes.find(node => text(node) === "!12345");
+    const flagText = link.nodes.find(node => text(node) === flag);
+    const diff = right.nodes.find(node => text(node) === "+468 −63");
+    assert.ok(iid.attributes.flex_none);
+    assert.equal(iid.attributes.truncate, undefined);
+    assert.ok(diff.attributes.flex_none);
+    assert.ok(diff.nodes.every(node => node.attributes.flex_none && !node.attributes.truncate));
+    assert.ok(flagText.attributes.flex_none);
+    assert.equal(flagText.attributes.truncate, undefined);
+    assert.equal(flagText.attributes.w, undefined);
+    assert.ok(right.attributes.flex_none);
+    assert.ok(link.attributes.flex_none);
+    assert.ok(nodes(right).every(node => !node.attributes.truncate && !node.attributes.flex_1));
+    assert.equal(right.attributes.max_w, undefined);
+    assert.ok(name.attributes.truncate);
+    assert.equal(name.attributes.min_w[0], 0);
+    assert.ok(name.attributes.flex_1);
+  }
+  const line = byId(view.detailRow(theme(), {id:"tree-no-mr", type:"tree", row:{kind:"tree", label:"Demo tree"}}), "tree-no-mr");
+  const noMr = line.nodes[2].nodes.find(node => text(node) === "no MR");
+  assert.ok(noMr.attributes.flex_none);
+  assert.equal(noMr.attributes.truncate, undefined);
+});
+
+test("Open MRs and History keep iid and state fixed while the separate title truncates", () => {
+  const {view} = setup({data:{rows:[]}});
+  for (const [historical, state, fields, flag] of [[false, "opened", {ci:"running"}, "CI running"],
+    [false, "opened", {ready:true}, "ready to merge"], [true, "merged", {}, "merged"], [true, "closed", {}, "closed"]]) {
+    const row = {kind:"mr", label:"!12345 Demo change with a long title", state, ...fields};
+    const rendered = view.detailRow(theme(), {id:"mr-fixed", type:"mr", row, historical, tickets:[]});
+    const link = byId(rendered, "mr-fixed/mr");
+    const iid = link.nodes.find(node => text(node) === "!12345");
+    const title = link.nodes.find(node => text(node) === "Demo change with a long title");
+    const status = link.nodes.find(node => text(node) === flag);
+    for (const node of [iid, status]) {
+      assert.ok(node.attributes.flex_none);
+      assert.equal(node.attributes.truncate, undefined);
+    }
+    assert.ok(title.attributes.flex_1);
+    assert.equal(title.attributes.min_w[0], 0);
+    assert.ok(title.attributes.truncate);
+  }
+});
+
+test("agent status stays fixed without a width cap while the name truncates", () => {
+  const {view} = setup({data:{rows:[]}});
+  for (const [status, label] of [["blocked", "Waiting for you"], ["done", "finished"], [null, "stopped"]]) {
+    const live = status ? {address:"demo", status, title:"Demo agent with a long name"} : null;
+    const rendered = view.detailRow(theme(), {id:"agent-fixed", type:"agent", row:{label:"Demo stopped agent"}, live, status});
+    const line = byId(rendered, "agent-fixed"), name = line.nodes[1], right = line.nodes[2];
+    const statusText = right.nodes.find(node => text(node) === label);
+    assert.ok(right.attributes.flex_none);
+    assert.equal(right.attributes.max_w, undefined);
+    assert.ok(statusText.attributes.flex_none);
+    assert.equal(statusText.attributes.truncate, undefined);
+    assert.ok(name.attributes.flex_1);
+    assert.equal(name.attributes.min_w[0], 0);
+    assert.ok(name.attributes.truncate);
+  }
+});
+
+test("uncommitted files use a 6px warning dot before the line diff, with singular and plural tooltips", () => {
+  const {view} = setup({data:{rows:[]}});
+  for (const count of [0, 1, 2]) for (const diff of [null, {adds:376, dels:38, files:4}]) {
+    const mr = {kind:"mr", label:"!12345 Demo change", state:"merged"};
+    const row = {kind:"tree", tree:"demo", body:`/home/dev/demo\n +${count} ↑3`, diff};
+    const rendered = view.detailRow(theme(), {id:"dirty-tree", type:"tree", row, mr});
+    const right = byId(rendered, "dirty-tree").nodes[2];
+    const tooltip = `${count} uncommitted ${count === 1 ? "file" : "files"}`;
+    const dot = right.nodes.find(node => node.attributes.tooltip?.[0] === tooltip);
+    assert.equal(Boolean(dot), count > 0);
+    assert.ok(!nodes(right).some(node => node.nodes.includes(`+${count}`)));
+    assert.ok(text(right).includes("↑3"));
+    if (!count) continue;
+    assert.equal(dot.attributes.size[0], 6);
+    assert.equal(dot.attributes.bg[0], "working");
+    assert.equal(dot.attributes.accessibility_label[0], tooltip);
+    assert.ok(dot.attributes.flex_none);
+    if (diff) assert.equal(text(right.nodes[right.nodes.indexOf(dot) + 1]), "+376 −38");
+  }
+});
+
+test("loose and Cleanup worktree marks spell out uncommitted counts without a plus sign", () => {
+  const {view} = setup({data:{rows:[]}});
+  for (const count of [1, 2]) {
+    const row = {kind:"tree", tree:"demo", body:`/home/dev/demo\n +${count} ↑3`};
+    const summary = view.looseContent(theme(), row, "worktree left");
+    const detail = view.detailRow(theme(), {id:"loose-dirty", type:"tree", row, loose:true});
+    for (const rendered of [summary, detail]) {
+      assert.ok(text(rendered).includes(`${count} uncommitted`));
+      assert.ok(!text(rendered).includes(`+${count}`));
+      assert.ok(text(rendered).includes("↑3"));
+      const mark = nodes(rendered).find(node => node.nodes.includes(`${count} uncommitted`));
+      assert.equal(mark.attributes.text_color[0], "working");
+      assert.ok(!nodes(rendered).some(node => node.attributes.size?.[0] === 6));
+    }
   }
 });

@@ -55,6 +55,30 @@ export function classifyBlocked(screenText) {
   return question ? {kind:"question", detail:question} : {kind:"waiting"};
 }
 
+export function blockedPrompt(status, screen) {
+  const msg = typeof status?.msg === "string" ? status.msg : "";
+  const question = msg.replace(/^(?:approve\s+|answer:\s*)/i, "");
+  const lines = String(screen ?? "").replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").split(/\r?\n/);
+  let choices = [], block = [], end = -1, numberColumn = -1;
+  for (const [index, line] of lines.entries()) {
+    const text = line.replace(/^([ \t]*)[│┃║]/u, "$1 ");
+    const option = text.match(/^(\s*[❯›>]?\s*)([1-9])\.\s+(.+?)\s*[│┃║]?\s*$/u);
+    if (option && (Number(option[2]) === block.length + 1 || option[2] === "1")) {
+      if (option[2] === "1") block = [];
+      block.push({key:option[2], label:option[3]});
+      choices = block; end = index; numberColumn = option[1].length;
+    } else if (!text.trim() || (!option && block.length && text.match(/^\s*/)[0].length > numberColumn)) {
+      // Descriptions belong to the previous option, but never become its label.
+      if (block.length) end = index;
+    } else {
+      block = [];
+      numberColumn = -1;
+    }
+  }
+  if (lines.slice(end + 1).some(line => line.trim() && !/^[\s─━│┃║]+$|\b(?:enter|esc|tab|arrow|select|confirm|cancel)\b|[↑↓]/i.test(line))) choices = [];
+  return {msg, question, choices, reason:msg ? {kind:status.kind ?? "waiting", detail:question} : classifyBlocked(screen)};
+}
+
 export function closePlan(row, liveSpaces = [], related = walk(row?.children)) {
   const unique = items => [...new Map(items.map(item => [item.url || item.cwd || item.id || item.target || item.tree || item, item])).values()];
   const mrs = unique(related.filter(item => item.kind === "mr"));
@@ -102,6 +126,55 @@ export function parseMrFlags(body = "") {
     ci, conflict, draft, age: age ? Number(age.slice(0, -1)) : null,
     worst: ci === "failed" ? "CI failed" : conflict ? "conflict" : draft ? "draft" : null,
   };
+}
+
+export function mrFlags(mr) {
+  const legacy = parseMrFlags(mr?.body);
+  const structured = mr && ["ci", "approvals", "unresolved", "draft", "merge_status", "conflict", "ready"]
+    .some(key => mr[key] !== undefined && mr[key] !== null);
+  if (!structured) return {...legacy, ready:false, needsYou:false};
+  const ci = mr.ci === undefined ? legacy.ci : mr.ci === "success" ? "passed" : ["running", "pending", "created", "preparing", "waiting_for_resource"].includes(mr.ci)
+    ? "running" : mr.ci ?? null;
+  const conflict = mr.conflict ?? legacy.conflict;
+  const draft = mr.draft ?? legacy.draft;
+  const unresolved = Math.max(0, Number(mr.unresolved) || 0);
+  const worst = ci === "failed" ? "CI failed" : conflict ? "conflict" : unresolved
+    ? `${unresolved} ${unresolved === 1 ? "thread" : "threads"}` : draft ? "draft" : mr.ready ? "ready to merge" : null;
+  return {ci, conflict, draft, unresolved, ready:Boolean(mr.ready), age:legacy.age, worst,
+    needsYou:ci === "failed" || Boolean(conflict) || unresolved > 0};
+}
+
+export function jumpItems(data, liveAgents = []) {
+  const items = [], seen = new Set();
+  const visit = (rows, task = null, parent = null) => {
+    for (const row of rows ?? []) {
+      const owner = row.kind === "task" ? task ?? row : task;
+      if (["task", "tree", "agent", "ticket", "mr"].includes(row.kind)) {
+        const live = row.kind === "agent" && liveAgents.find(agent => [agent.address, agent.pane].includes(row.terminal));
+        const key = `${row.kind}:${row.url || row.terminal || row.id}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          const title = live?.title || row.title || row.label || row.target || row.tree || row.task || row.kind;
+          items.push({id:key, kind:row.kind, title, row, task:owner, parent, live,
+            search:[title, row.target, row.branch, row.task, row.label, row.url?.match(/\d+\/?$/)?.[0]].filter(Boolean).join(" ").toLowerCase()});
+        }
+      }
+      visit(row.children, owner, row.kind === "header" ? parent : parent ?? row);
+    }
+  };
+  visit(data?.rows);
+  for (const project of data?.projects ?? []) if (project.name !== data.project)
+    items.push({id:`project:${project.name}`, kind:"project", title:project.name, project, search:project.name.toLowerCase()});
+  return items;
+}
+
+export function matchJump(items, query = "") {
+  const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  return items.filter(item => words.every(word => {
+    let index = 0;
+    for (const letter of item.search) if (letter === word[index]) index++;
+    return index === word.length;
+  }));
 }
 
 export function parseTreeMarks(body = "", state = "") {
@@ -248,7 +321,6 @@ export function taskSignals(row, liveAgents = [], liveSpaces = [], related = wal
   const working = taskAgents.filter(agent => agent.status === "working").length;
   const attention = taskAgents.some(agent => agent.status === "blocked") ? "blocked"
     : taskAgents.some(agent => agent.status === "done") ? "done" : null;
-  const status = row.done ? "closed" : attention ?? (working ? "working" : row.state === "idea" ? "idea" : "open");
   const workingAgent = taskAgents.filter(agent => agent.status === "working")
     .reduce((latest, agent) => !latest || (agent.seq ?? 0) > (latest.seq ?? 0) ? agent : latest, null);
   const seen = new Set();
@@ -257,6 +329,12 @@ export function taskSignals(row, liveAgents = [], liveSpaces = [], related = wal
     seen.add(item.id);
     return true;
   });
+  const attentionMr = mrs.find(mr => mrFlags(mr).needsYou);
+  const summaryMr = attentionMr ?? mrs.find(mr => mrFlags(mr).ready);
+  if (summaryMr) { mrs.splice(mrs.indexOf(summaryMr), 1); mrs.unshift(summaryMr); }
+  const flags = mrFlags(mrs[0]);
+  const status = row.done ? "closed" : attention === "blocked" || attentionMr ? "blocked"
+    : attention ?? (working ? "working" : row.state === "idea" ? "idea" : "open");
   return {
     status, working, agents:taskAgents,
     workingAgent,
@@ -266,7 +344,7 @@ export function taskSignals(row, liveAgents = [], liveSpaces = [], related = wal
       : working ? `${working} working` : "",
     ticket: related.find(item => item.kind === "ticket" && !isClosedTicket(item) && item.target),
     mrs, mrKey: mrs[0]?.label?.match(/!\d+/)?.[0] ?? "",
-    mrFlag: parseMrFlags(mrs[0]?.body).worst,
+    mrFlag: flags.worst, mrNeedsYou:Boolean(attentionMr),
     trees: related.filter(item => item.kind === "tree"),
     liveSpace: liveSpaces.find(space => space.id === row.space),
   };
