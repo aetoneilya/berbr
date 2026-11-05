@@ -201,11 +201,7 @@ export default class Berbr extends View {
   }
 
   sections() {
-    const live = this.liveState();
-    if (live.mergedTrees.length && !live.visible.some(section => section.id === "cleanup"))
-      return [...live.visible, {id:"cleanup", label:sectionLabels.cleanup, rows:[],
-        expanded:Boolean(this.filter.trim()) || !this.collapsed.has("cleanup"), collapsible:true}];
-    return live.visible;
+    return this.liveState().visible;
   }
 
   rows(sections = this.sections()) {

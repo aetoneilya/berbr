@@ -1191,6 +1191,7 @@ test("merged metadata offers explicit worktree removal without an MR child", () 
   view.selected = item.id;
   const rendered = view.render(cx);
   assert.ok(text(byId(rendered, item.id)).includes("merged"));
+  assert.equal(byId(rendered, "section-cleanup"), undefined);
   assert.equal(byId(rendered, `${item.id}/resume`), undefined);
   click(byId(rendered, `${item.id}/remove`), cx);
   assert.equal(state.overlays.at(-1).props.form, "remove-tree");
@@ -1199,7 +1200,8 @@ test("merged metadata offers explicit worktree removal without an MR child", () 
 
 test("Cleanup offers bulk removal for task-owned trees and confirms backend plans before done --merged", async () => {
   const tree = {id:"tree", kind:"tree", tree:"clean", cwd:"/home/dev/demo/clean", merged:true};
-  const {view, cx, jobs} = setup({data:{version:2, rows:[{id:"task", kind:"task", children:[tree, {...tree}]}]}});
+  const {view, cx, jobs} = setup({data:{version:2, rows:[{id:"task", kind:"task", children:[tree, {...tree}]},
+    {id:"closed-ticket", kind:"ticket", label:"Old ticket", state:"Closed"}]}});
   const rendered = view.render(cx);
   const header = byId(rendered, "section-cleanup");
   assert.ok(byId(header, "remove-merged"));
