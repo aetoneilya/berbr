@@ -192,6 +192,8 @@ pub struct Tree {
     pub finished: bool,
     /// Unix time of the branch's last commit.
     pub last_commit: Option<i64>,
+    /// Its lock-free `git status` was slow: the index needs writing back.
+    pub stale_index: bool,
 }
 
 impl Tree {

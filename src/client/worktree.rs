@@ -122,6 +122,19 @@ pub fn changed_files(path: &Path) -> Result<usize> {
     Ok(output.lines().filter(|l| !l.is_empty()).count())
 }
 
+/// A plain `git status`, detached: unlike the lock-free one it writes the
+/// refreshed index back. It takes the index lock only if it is free.
+pub fn refresh_index_in_background(path: &Path) {
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 #[derive(Debug, Default, serde::Serialize)]
 pub struct Diff {
     pub adds: usize,

@@ -110,6 +110,8 @@ fn repositories(config: &Config, refs: bool) -> (Vec<Repository>, Vec<String>) {
 struct ClosingScope {
     tickets: Vec<String>,
     branches: HashSet<(String, String)>,
+    /// The task's own checkouts: only they need `git status` to close it.
+    paths: HashSet<PathBuf>,
 }
 
 impl ClosingScope {
@@ -125,7 +127,12 @@ impl ClosingScope {
             .iter()
             .filter_map(|&i| Some((trees[i].project.clone()?, trees[i].wt.branch.clone()?)))
             .collect();
-        Self { tickets, branches }
+        let paths = owned.iter().map(|&i| trees[i].wt.path.clone()).collect();
+        Self {
+            tickets,
+            branches,
+            paths,
+        }
     }
 
     fn select(&self, mrs: Vec<Mr>) -> Vec<Mr> {
@@ -171,7 +178,7 @@ pub(super) fn fetch(config: &Config, tasks: Vec<Task>, options: Options) -> Inpu
     roots.retain(|root| seen.insert(root.clone()));
     let mains: Vec<_> = repos.iter().map(|r| r.main.clone()).collect();
     let early_herdr = closing.as_ref().map(|_| live_herdr());
-    let mut raw_trees = collect_trees(&repos, false, false);
+    let mut raw_trees = collect_trees(&repos, false, false, None);
     let early_sessions = closing
         .as_ref()
         .map(|_| load_sessions(&roots, &mains, &raw_trees, &tasks, false));
@@ -241,7 +248,12 @@ pub(super) fn fetch(config: &Config, tasks: Vec<Task>, options: Options) -> Inpu
             early_herdr.unwrap_or_else(|| trace::time("herdr", live_herdr))
         }));
         let trees = trace::time("git: worktrees", || {
-            collect_trees(&repos, online, with_diff)
+            collect_trees(
+                &repos,
+                online,
+                with_diff,
+                closing.as_ref().map(|scope| &scope.paths),
+            )
         });
         (
             joined(mine, "the fetch"),
@@ -258,6 +270,7 @@ pub(super) fn fetch(config: &Config, tasks: Vec<Task>, options: Options) -> Inpu
         )
     });
     let (agents, workspaces, mut warnings) = herdr;
+    refresh_stale_indexes(&trees, &agents);
     warnings.extend(repository_warnings);
     let (mrs, of_mrs) = match mrs {
         Ok((mrs, tickets)) => (Ok(mrs), tickets),
@@ -602,7 +615,14 @@ fn fetch_mrs(
 
 /// Linked worktrees of every configured repo; git status and the unpushed count
 /// take ~0.5s per worktree in a big repo, so they run in parallel.
-fn collect_trees(repos: &[Repository], with_status: bool, with_diff: bool) -> Vec<Tree> {
+/// `status_only`: run `git status` only in these checkouts (closing a task);
+/// the others keep `changes: None`, and the refs-based facts are read for all.
+fn collect_trees(
+    repos: &[Repository],
+    with_status: bool,
+    with_diff: bool,
+    status_only: Option<&HashSet<PathBuf>>,
+) -> Vec<Tree> {
     let found: Vec<_> = repos
         .iter()
         .flat_map(|repo| repo.trees.iter().map(move |wt| (repo, wt)))
@@ -610,24 +630,33 @@ fn collect_trees(repos: &[Repository], with_status: bool, with_diff: bool) -> Ve
     if !with_status && !with_diff {
         return found
             .iter()
-            .map(|(repo, wt)| inspect_tree(repo, wt, false, false))
+            .map(|(repo, wt)| inspect_tree(repo, wt, false, false, false))
             .collect();
     }
     parallel(&found, GIT_RUNS, |(repo, wt)| {
-        inspect_tree(repo, wt, with_status, with_diff)
+        let with_changes = with_status && status_only.is_none_or(|paths| paths.contains(&wt.path));
+        inspect_tree(repo, wt, with_status, with_changes, with_diff)
     })
     .into_iter()
     .flatten()
     .collect()
 }
 
-fn inspect_tree(repo: &Repository, wt: &Worktree, with_status: bool, with_diff: bool) -> Tree {
+fn inspect_tree(
+    repo: &Repository,
+    wt: &Worktree,
+    with_status: bool,
+    with_changes: bool,
+    with_diff: bool,
+) -> Tree {
     std::thread::scope(|scope| {
         let diff = (with_diff && wt.branch.is_some())
             .then(|| scope.spawn(|| worktree::diff(&wt.path, repo.default.as_deref()?).ok()));
-        let changes = with_status
+        let started = std::time::Instant::now();
+        let changes = with_changes
             .then(|| worktree::changed_files(&wt.path).ok())
             .flatten();
+        let stale_index = with_changes && started.elapsed() >= STALE_STATUS;
         let unpushed = with_status
             .then(|| {
                 repo.refs
@@ -659,8 +688,34 @@ fn inspect_tree(repo: &Repository, wt: &Worktree, with_status: bool, with_diff: 
             agents: Vec::new(),
             mr: None,
             finished: false,
+            stale_index,
         }
     })
+}
+
+/// A lock-free `git status` this slow means the index's stat data is stale: it
+/// never gets written back, so every later status rereads the changed files.
+const STALE_STATUS: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Starts a plain `git status` in the background in stale checkouts no agent is
+/// working or waiting in, so it writes the index and the next look is fast.
+/// A busy agent's own git commands refresh the index, and are not raced here.
+fn refresh_stale_indexes(trees: &[Tree], agents: &[herdr::Agent]) {
+    for tree in trees.iter().filter(|t| needs_refresh(t, agents)) {
+        let _span = trace::span(format!("refresh index {}", tree.wt.path.display()));
+        worktree::refresh_index_in_background(&tree.wt.path);
+    }
+}
+
+fn needs_refresh(tree: &Tree, agents: &[herdr::Agent]) -> bool {
+    tree.stale_index
+        && !agents.iter().any(|agent| {
+            !matches!(agent.agent_status.as_str(), "idle" | "done")
+                && agent
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|cwd| std::path::Path::new(cwd).starts_with(&tree.wt.path))
+        })
 }
 
 fn live_herdr() -> (Vec<herdr::Agent>, Vec<herdr::Workspace>, Vec<String>) {
@@ -692,6 +747,38 @@ mod tests {
             .iter()
             .map(|k| (k.to_string(), ticket(k, Category::New, false)))
             .collect())
+    }
+
+    fn agent_in(cwd: &str, status: &str) -> herdr::Agent {
+        serde_json::from_value(serde_json::json!({
+            "agent_status": status, "cwd": cwd, "pane_id": "p", "tab_id": "t", "workspace_id": "w",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_stale_index_is_refreshed_only_where_no_agent_is_busy() {
+        let mut stale = crate::table::fixtures::tree("stale", "demo/DEMO-1-a");
+        stale.stale_index = true;
+        let path = stale.wt.path.display().to_string();
+        assert!(needs_refresh(&stale, &[]));
+        assert!(needs_refresh(
+            &stale,
+            &[agent_in(&path, "idle"), agent_in(&path, "done")]
+        ));
+        // a sibling checkout sharing the name prefix is not this one
+        assert!(needs_refresh(
+            &stale,
+            &[agent_in(&format!("{path}-2"), "working")]
+        ));
+        for status in ["working", "blocked", "unknown"] {
+            assert!(!needs_refresh(
+                &stale,
+                &[agent_in(&format!("{path}/src"), status)]
+            ));
+        }
+        stale.stale_index = false;
+        assert!(!needs_refresh(&stale, &[]));
     }
 
     #[test]

@@ -95,6 +95,7 @@ pub fn tree(name: &str, branch: &str) -> Tree {
         mr: None,
         finished: false,
         last_commit: None,
+        stale_index: false,
     }
 }
 
