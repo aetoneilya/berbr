@@ -1,5 +1,6 @@
 use serde_yaml::{Mapping, Value};
 use std::fs;
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use thiserror::Error;
@@ -17,6 +18,9 @@ pub enum NoteError {
 
     #[error("{0}: changed while being updated, skipped")]
     Changed(PathBuf),
+
+    #[error("{0}: snapshot preview cannot be saved; reload the full note first")]
+    Preview(PathBuf),
 }
 
 pub(crate) type Result<T> = std::result::Result<T, NoteError>;
@@ -32,7 +36,11 @@ pub struct Note {
     text: String,
     modified: SystemTime,
     frontmatter: Mapping,
+    /// Snapshot-only notes are read-only, even when their body fits in full.
+    preview_truncated: Option<bool>,
 }
+
+pub const BODY_PREVIEW_BYTES: usize = 2048;
 
 impl Note {
     pub fn read(path: &Path) -> Result<Note> {
@@ -47,7 +55,32 @@ impl Note {
             text,
             modified,
             frontmatter,
+            preview_truncated: None,
         })
+    }
+
+    /// Read all metadata, but only a bounded prefix of the body. Used solely by
+    /// app snapshots; commands that edit notes and the TUI still use `read`.
+    pub fn read_preview(path: &Path) -> Result<Note> {
+        let io_err = |err| NoteError::Io(path.to_path_buf(), err);
+        let file = fs::File::open(path).map_err(io_err)?;
+        let modified = file.metadata().and_then(|m| m.modified()).map_err(io_err)?;
+        let (text, has_more) = preview_text(BufReader::new(file)).map_err(io_err)?;
+        let frontmatter = parse_frontmatter(&text).map_err(|e| NoteError::Yaml(path.into(), e))?;
+        let mut note = Note {
+            path: path.to_path_buf(),
+            text,
+            modified,
+            frontmatter,
+            preview_truncated: None,
+        };
+        let body_start = note.text.len() - note.body().len();
+        let (preview, truncated) = body_preview(note.body());
+        let end = body_start + preview.len();
+        note.text.truncate(end);
+        note.text.shrink_to_fit();
+        note.preview_truncated = Some(truncated || has_more);
+        Ok(note)
     }
 
     /// The text after the frontmatter.
@@ -59,6 +92,13 @@ impl Note {
             }
             None => &self.text,
         }
+    }
+
+    /// Human text before machine sections, at most 2 KiB of UTF-8. The flag
+    /// covers both the byte cap and omitted machine history.
+    pub fn body_preview(&self) -> (&str, bool) {
+        let (body, truncated) = body_preview(self.body());
+        (body, truncated || self.preview_truncated.unwrap_or(false))
     }
 
     /// The task's own text, before its append-only agent findings.
@@ -166,6 +206,20 @@ impl Note {
         Ok(())
     }
 
+    /// Promote a snapshot preview before a managed update, under the caller's
+    /// vault lock. Body edits are preserved; changed metadata invalidates the
+    /// facts derived from the preview, including identity and task ownership.
+    pub fn reload_preview_for_update(&mut self) -> Result<()> {
+        if self.preview_truncated.is_some() {
+            let full = Note::read(&self.path)?;
+            if full.frontmatter != self.frontmatter {
+                return Err(NoteError::Changed(self.path.clone()));
+            }
+            *self = full;
+        }
+        Ok(())
+    }
+
     /// Sets a top-level key in memory; `save` writes it.
     pub fn set(&mut self, key: &str, value: Value) {
         self.text = set_key(&self.text, key, &value);
@@ -176,6 +230,9 @@ impl Note {
     /// Writes the note if `set` changed it. Refuses when the file was modified
     /// since it was read; writes a temp file and renames it over the note.
     pub fn save(&mut self) -> Result<bool> {
+        if self.preview_truncated.is_some() {
+            return Err(NoteError::Preview(self.path.clone()));
+        }
         let parsed =
             parse_frontmatter(&self.text).map_err(|e| NoteError::Yaml(self.path.clone(), e))?;
         if parsed != self.frontmatter {
@@ -205,6 +262,167 @@ impl Note {
 }
 
 const AGENT_NOTES: &str = "## Agent notes";
+
+/// Frontmatter is needed in full for task/session/worktree identity. Stop body
+/// IO after 2 KiB plus UTF-8 lookahead, even for a single enormous history line.
+fn preview_text(mut reader: impl BufRead) -> io::Result<(String, bool)> {
+    let mut opening = Vec::new();
+    reader.by_ref().take(5).read_until(b'\n', &mut opening)?;
+    let has_frontmatter = opening == b"---\n" || opening == b"---\r\n";
+    let mut reader = io::Cursor::new(opening).chain(reader);
+    let mut text = String::new();
+    if has_frontmatter {
+        reader.read_line(&mut text)?;
+        loop {
+            let start = text.len();
+            if reader.read_line(&mut text)? == 0 || text[start..].trim_end() == "---" {
+                break;
+            }
+        }
+    }
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take((BODY_PREVIEW_BYTES + 4) as u64)
+        .read_to_end(&mut bytes)?;
+    let has_more = !reader.fill_buf()?.is_empty();
+    if let Err(error) = std::str::from_utf8(&bytes) {
+        if has_more && error.error_len().is_none() {
+            bytes.truncate(error.valid_up_to());
+        } else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, error));
+        }
+    }
+    text.push_str(std::str::from_utf8(&bytes).expect("validated UTF-8"));
+    Ok((text, has_more))
+}
+
+fn body_preview(body: &str) -> (&str, bool) {
+    let mut end = body.len().min(BODY_PREVIEW_BYTES);
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let prefix = &body[..end];
+    for (offset, level, title) in markdown_headings(prefix) {
+        let machine = level >= 2
+            && matches!(
+                title.to_lowercase().as_str(),
+                "agent notes" | "sessions" | "сессии"
+            );
+        // A heading cut mid-line may be the start of a machine section. Leave
+        // it out rather than publishing a misleading fragment of its title.
+        let partial = end < body.len() && !prefix[offset..].contains('\n');
+        if machine || partial {
+            end = offset;
+            break;
+        }
+    }
+    (body[..end].trim_end(), end < body.len())
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    #[test]
+    fn previews_stop_at_machine_headings_outside_fences() {
+        for heading in ["## Agent notes", "   ### SESSIONS ###", "###### СЕССИИ"] {
+            let body = format!("Human requirements.\r\n\r\n{heading}\r\nMachine history");
+            assert_eq!(body_preview(&body), ("Human requirements.", true));
+            assert_eq!(body_preview(&format!("{heading}\nHistory")), ("", true));
+        }
+        for fence in ["```", "~~~~"] {
+            let human = format!(
+                "Example:\n{fence}md\n## Agent notes\n### Sessions\n{fence}\nHuman criteria."
+            );
+            let body = format!("{human}\n\n## Agent notes\nMachine history");
+            assert_eq!(body_preview(&body), (human.as_str(), true));
+        }
+        for body in [
+            "## Sessions overview\nHuman criteria",
+            "    ## Agent notes\nIndented code",
+            "# Sessions\nHuman heading",
+        ] {
+            assert_eq!(body_preview(body), (body, false));
+        }
+    }
+
+    #[test]
+    fn preview_cap_is_utf8_safe_and_reports_omissions() {
+        for body in [
+            "a".repeat(BODY_PREVIEW_BYTES),
+            "я".repeat(1500),
+            "🙂".repeat(1000),
+            format!("a{}", "🙂".repeat(1000)),
+        ] {
+            let mut reader = io::Cursor::new(body.as_bytes());
+            let (prefix, more) = preview_text(&mut reader).unwrap();
+            let (preview, truncated) = body_preview(&prefix);
+            assert!(preview.len() <= BODY_PREVIEW_BYTES);
+            assert!(body.starts_with(preview));
+            assert_eq!(truncated || more, body.len() > BODY_PREVIEW_BYTES);
+            assert!(reader.position() <= (BODY_PREVIEW_BYTES + 4) as u64);
+        }
+        let body = format!(
+            "{}\n## Agent notes\nHistory",
+            "x".repeat(BODY_PREVIEW_BYTES - 7)
+        );
+        let (preview, truncated) = body_preview(&body);
+        assert_eq!(preview, "x".repeat(BODY_PREVIEW_BYTES - 7));
+        assert!(truncated);
+        assert!(preview_text(io::Cursor::new(b"invalid \xff UTF-8")).is_err());
+    }
+
+    #[test]
+    fn snapshot_reader_bounds_body_io_preserves_metadata_and_refuses_saves() {
+        let header = "---\r\nid: demo-1\r\ntitle: Demo\r\ntickets: [DEMO-1]\r\nsessions: ['codex:demo demo-tree 2026-01-01']\r\nworktrees: [/home/dev/demo]\r\n---\r\n";
+        for body in [
+            format!(
+                "Requirements.\n\n## Agent notes\n{}",
+                "x".repeat(256 * 1024)
+            ),
+            "x".repeat(256 * 1024),
+        ] {
+            let source = format!("{header}{body}");
+            let mut reader = io::Cursor::new(source.as_bytes());
+            let (prefix, more) = preview_text(&mut reader).unwrap();
+            assert!(more);
+            assert!(prefix.len() <= header.len() + BODY_PREVIEW_BYTES + 4);
+            assert!(reader.position() <= (header.len() + BODY_PREVIEW_BYTES + 4) as u64);
+
+            let dir = crate::table::fixtures::temp_dir();
+            let path = dir.join("demo-1.md");
+            fs::write(&path, &source).unwrap();
+            let mut note = Note::read_preview(&path).unwrap();
+            assert_eq!(note.string("id").as_deref(), Some("demo-1"));
+            assert_eq!(
+                note.strings("sessions"),
+                ["codex:demo demo-tree 2026-01-01"]
+            );
+            assert_eq!(note.strings("worktrees"), ["/home/dev/demo"]);
+            assert!(note.text.len() <= header.len() + BODY_PREVIEW_BYTES);
+            assert!(note.body_preview().1);
+            note.set("title", Value::String("Changed".into()));
+            assert!(matches!(note.save(), Err(NoteError::Preview(_))));
+            assert_eq!(fs::read_to_string(&path).unwrap(), source);
+            note.reload().unwrap();
+            assert_eq!(note.body(), body);
+            assert!(note.preview_truncated.is_none());
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn short_preview_is_complete_but_still_read_only() {
+        let dir = crate::table::fixtures::temp_dir();
+        let path = dir.join("demo-2.md");
+        fs::write(&path, "---\ntitle: Demo\n---\nShort requirements.\n").unwrap();
+        let mut note = Note::read_preview(&path).unwrap();
+        assert_eq!(note.body_preview(), ("Short requirements.", false));
+        assert!(matches!(note.save(), Err(NoteError::Preview(_))));
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
 
 /// ATX headings outside backtick/tilde fences (up to three leading spaces).
 fn markdown_headings(body: &str) -> Vec<(usize, usize, &str)> {
@@ -494,6 +712,7 @@ mod tests {
             text: "---\ndone: false\n---\nGoal.\n\n## Agent notes\n- a\n".into(),
             modified: SystemTime::now(),
             frontmatter: Mapping::new(),
+            preview_truncated: None,
         };
         note.append_line("2026-10-13: mine");
         assert_eq!(
@@ -548,6 +767,7 @@ mod regressions {
             text: text.into(),
             modified: SystemTime::now(),
             frontmatter: Mapping::new(),
+            preview_truncated: None,
         };
         note.set_description("New description");
         assert_eq!(
@@ -602,6 +822,7 @@ mod preservation_tests {
                 text: body,
                 modified: SystemTime::now(),
                 frontmatter: Mapping::new(),
+                preview_truncated: None,
             };
             assert!(note.description().ends_with("Still description"));
         }

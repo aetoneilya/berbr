@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 pub(super) fn snapshot(projects: &[Config], chosen: usize, cached: bool) -> Result<(), String> {
     let config = &projects[chosen];
-    let (tasks, skipped) = crate::vault::task::load(config)?;
+    let (tasks, skipped) = crate::vault::task::load_previews(config);
     let mut table = table::build_app(config, tasks, cached);
     table
         .warnings
@@ -46,7 +46,10 @@ fn row(table: &Table, node: &Node, owner: Option<&str>) -> Value {
             value["label"] = json!(r.task.display_name());
             value["state"] = json!(r.row_state().map(|s| s.as_str()));
             value["done"] = json!(r.task.done);
-            value["body"] = json!(r.task.note.body());
+            // Keep `body` for older mods; only task bodies change semantics.
+            let (body, truncated) = r.task.note.body_preview();
+            value["body"] = json!(body);
+            value["body_truncated"] = json!(truncated);
             value["note"] = json!(r.task.note.path);
             value["tags"] = json!(r.task.tags);
             value["space"] = json!(r.space);
@@ -152,6 +155,159 @@ mod tests {
     use super::*;
     use crate::client::gitlab::MrReview;
     use crate::table::fixtures::{mr, table, task, tree};
+
+    #[test]
+    fn preview_write_back_preserves_full_body_and_bounded_snapshot_json() {
+        use crate::vault::{
+            note::{BODY_PREVIEW_BYTES, Note},
+            task::{SessionRef, Task, TaskState},
+        };
+        let dir = crate::table::fixtures::temp_dir();
+        let path = dir.join("demo-1.md");
+        let header = "---\nid: demo-1\ntitle: Demo\ntickets: ['[[DEMO-1]]']\ntags: [demo]\nstate: idea\nsessions: ['s0 demo-tree 2026-01-01']\n---\n";
+        let body = format!(
+            "Human requirements.\n\n{}\n\n## Agent notes\nMachine history.\n",
+            "More human context. ".repeat(400)
+        );
+        std::fs::write(&path, format!("{header}{body}")).unwrap();
+        let preview = Task::from_note(Note::read_preview(&path).unwrap());
+        let mut table = table(
+            vec![preview],
+            vec![],
+            vec![],
+            vec![tree("demo-tree", "DEMO-1-DEMO-2")],
+        );
+        assert_eq!(table.tasks[0].state, Some(TaskState::Active));
+        assert_eq!(table.tasks[0].found_tickets, ["DEMO-2"]);
+        table.tasks[0].new_sessions.push(SessionRef {
+            id: "codex:s1".into(),
+            worktree: "demo-tree".into(),
+            date: "2026-01-02".into(),
+        });
+        // An editor can change the body after the preview was loaded. Reload
+        // under write_back's lock must preserve that current body byte-for-byte.
+        let latest_body = format!("{body}\nLatest human edit.\n");
+        std::fs::write(&path, format!("{header}{latest_body}")).unwrap();
+        assert_eq!(table::write_back(&mut table), ["demo-1"]);
+        assert!(table.warnings.is_empty(), "{:?}", table.warnings);
+        let saved = Task::from_note(Note::read(&path).unwrap());
+        assert_eq!(saved.note.body().as_bytes(), latest_body.as_bytes());
+        assert_eq!(saved.state, Some(TaskState::Active));
+        assert_eq!(saved.note.strings("tickets"), ["[[DEMO-1]]", "DEMO-2"]);
+        assert_eq!(
+            saved.note.strings("sessions"),
+            ["s0 demo-tree 2026-01-01", "codex:s1 demo-tree 2026-01-02"]
+        );
+        assert_eq!(saved.tags, ["demo"]);
+        assert_eq!(table.tasks[0].task.note.body(), latest_body);
+        assert!(table.tasks[0].found_tickets.is_empty());
+        assert!(table.tasks[0].new_sessions.is_empty());
+        let node = Node {
+            id: "task:demo-1".into(),
+            kind: Kind::Task(0),
+            children: vec![],
+        };
+        let value = row(&table, &node, None);
+        assert!(value["body"].as_str().unwrap().len() <= BODY_PREVIEW_BYTES);
+        assert_eq!(value["body_truncated"], true);
+        assert!(serde_json::to_vec(&value).unwrap().len() < 3000);
+        assert!(table::write_back(&mut table).is_empty());
+        assert!(table.warnings.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn three_hundred_large_notes_load_as_bounded_snapshot_previews() {
+        use crate::config::{VaultConfig, WorkflowConfig};
+        let dir = crate::table::fixtures::temp_dir();
+        std::fs::create_dir(dir.join("tasks")).unwrap();
+        let history = "x".repeat(256 * 1024);
+        for i in 0..300 {
+            std::fs::write(dir.join(format!("tasks/demo-{i}.md")), format!(
+                "---\nid: demo-{i}\ntitle: Demo {i}\ntickets: [DEMO-{}]\ntags: [demo]\nsessions: ['codex:demo demo-tree 2026-01-01']\n---\nHuman requirements.\n\n## Agent notes\n{history}", i + 1
+            )).unwrap();
+        }
+        let config = Config {
+            name: "demo".into(),
+            jira: None,
+            gitlab: None,
+            workflow: WorkflowConfig::default(),
+            repos: vec![],
+            vault: VaultConfig {
+                path: dir.clone(),
+                task_dirs: vec!["tasks".into()],
+                new_task_dir: "tasks".into(),
+            },
+        };
+        let (tasks, errors) = crate::vault::task::load_previews(&config);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(tasks.len(), 300);
+        for task in &tasks {
+            assert_eq!(task.note.body_preview(), ("Human requirements.", true));
+            assert_eq!(task.sessions.len(), 1);
+            assert_eq!(task.tags, ["demo"]);
+            assert_eq!(task.tickets.len(), 1);
+        }
+        let table = table(tasks, vec![], vec![], vec![]);
+        let roots = view::build(
+            &table,
+            &view::Options {
+                all: true,
+                ..Default::default()
+            },
+        );
+        let rows: Vec<_> = roots.iter().map(|n| row(&table, n, None)).collect();
+        // 75 MiB of synthetic history must not leak into JSON. Short previews
+        // leave room for metadata while staying under 512 bytes per task.
+        assert!(serde_json::to_vec(&rows).unwrap().len() < 300 * 512);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_task_payload_is_bounded_for_large_human_and_machine_sections() {
+        use crate::vault::{
+            note::{BODY_PREVIEW_BYTES, Note},
+            task::Task,
+        };
+        let dir = crate::table::fixtures::temp_dir();
+        let path = dir.join("demo-1.md");
+        let node = Node {
+            id: "task:demo-1".into(),
+            kind: Kind::Task(0),
+            children: vec![],
+        };
+        for body in [
+            "x".repeat(256 * 1024),
+            format!(
+                "Human requirements.\n\n## Agent notes\n{}",
+                "x".repeat(256 * 1024)
+            ),
+        ] {
+            std::fs::write(
+                &path,
+                format!("---\nid: demo-1\ntitle: Demo\ntags: [demo]\n---\n{body}"),
+            )
+            .unwrap();
+            // Bound serialization even if a future caller supplies full notes.
+            for read in [Note::read, Note::read_preview] {
+                let table = table(
+                    vec![Task::from_note(read(&path).unwrap())],
+                    vec![],
+                    vec![],
+                    vec![],
+                );
+                let value = row(&table, &node, None);
+                assert!(value["body"].as_str().unwrap().len() <= BODY_PREVIEW_BYTES);
+                assert_eq!(value["body_truncated"], true);
+                assert_eq!(value["tags"], json!(["demo"]));
+                assert!(serde_json::to_vec(&value).unwrap().len() < 3000);
+                if body.starts_with("Human") {
+                    assert_eq!(value["body"], "Human requirements.");
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn snapshot_review_fields_and_each_readiness_blocker() {

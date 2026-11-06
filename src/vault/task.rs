@@ -270,13 +270,18 @@ impl Task {
         tickets: &mut Vec<String>,
         sessions: &mut Vec<SessionRef>,
     ) -> Result<bool, NoteError> {
-        let mut changed = false;
+        let state_changed = state.is_some_and(|state| self.state != Some(state));
+        if !state_changed && tickets.is_empty() && sessions.is_empty() {
+            return Ok(false);
+        }
+        // write_back holds the vault lock. A preview must be re-read and its
+        // metadata checked before any managed fields are changed in memory.
+        self.note.reload_preview_for_update()?;
         if let Some(state) = state
-            && self.state != Some(state)
+            && state_changed
         {
             self.note
                 .set("state", Value::String(state.as_str().to_string()));
-            changed = true;
         }
         if !tickets.is_empty() {
             let entries = self
@@ -287,7 +292,6 @@ impl Task {
                 .map(Value::String)
                 .collect();
             self.note.set("tickets", Value::Sequence(entries));
-            changed = true;
         }
         if !sessions.is_empty() {
             let entries = self
@@ -297,9 +301,8 @@ impl Task {
                 .map(|s| Value::String(s.entry()))
                 .collect();
             self.note.set("sessions", Value::Sequence(entries));
-            changed = true;
         }
-        if !changed || !self.note.save()? {
+        if !self.note.save()? {
             return Ok(false);
         }
         if state.is_some() {
@@ -320,12 +323,24 @@ pub fn load(config: &Config) -> Result<(Vec<Task>, Vec<NoteError>), String> {
 /// Task notes under the configured folders; notes whose frontmatter does not
 /// parse are reported and left alone.
 pub fn load_tasks(vault: &VaultConfig) -> (Vec<Task>, Vec<NoteError>) {
+    load_with(vault, Note::read)
+}
+
+/// App snapshots need metadata and bounded human previews, never editable notes.
+pub fn load_previews(config: &Config) -> (Vec<Task>, Vec<NoteError>) {
+    load_with(&config.vault, Note::read_preview)
+}
+
+fn load_with(
+    vault: &VaultConfig,
+    read: fn(&Path) -> Result<Note, NoteError>,
+) -> (Vec<Task>, Vec<NoteError>) {
     let mut tasks = Vec::new();
     let mut errors = Vec::new();
     let added = git_added(vault);
     for dir in &vault.task_dirs {
         for path in markdown_files(&vault.path.join(dir)) {
-            match Note::read(&path) {
+            match read(&path) {
                 Ok(note) => {
                     let mut task = Task::from_note(note);
                     task.created = path
@@ -410,6 +425,72 @@ fn markdown_files(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_preview_record_does_not_read_the_full_file() {
+        let dir = crate::table::fixtures::temp_dir();
+        let path = dir.join("demo-1.md");
+        std::fs::write(
+            &path,
+            "---\nid: demo-1\nstate: idea\n---\nHuman requirements.\n",
+        )
+        .unwrap();
+        let mut task = Task::from_note(Note::read_preview(&path).unwrap());
+        std::fs::remove_file(&path).unwrap();
+        let _lock = crate::vault::lock().unwrap();
+        assert!(
+            !task
+                .record(Some(TaskState::Idea), &mut vec![], &mut vec![])
+                .unwrap()
+        );
+        assert!(matches!(task.note.save(), Err(NoteError::Preview(_))));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn preview_write_back_rejects_changed_frontmatter_before_mutating_anything() {
+        let dir = crate::table::fixtures::temp_dir();
+        let path = dir.join("demo-1.md");
+        let source = "---\nid: demo-1\nproject: demo\nstate: idea\ntickets: [DEMO-1]\nsessions: []\ndone: false\n---\nHuman requirements.\n\n## Agent notes\nHistory.\n";
+        for (old, new) in [
+            ("id: demo-1", "id: demo-2"),
+            ("project: demo", "project: other-demo"),
+            ("state: idea", "state: review"),
+            ("tickets: [DEMO-1]", "tickets: [DEMO-3]"),
+            (
+                "sessions: []",
+                "sessions: ['codex:other demo-tree 2026-01-01']",
+            ),
+            ("done: false", "done: true"),
+        ] {
+            std::fs::write(&path, source).unwrap();
+            let preview = Task::from_note(Note::read_preview(&path).unwrap());
+            let mut table = crate::table::fixtures::table(vec![preview], vec![], vec![], vec![]);
+            table.tasks[0].state = Some(TaskState::Active);
+            table.tasks[0].found_tickets.push("DEMO-2".into());
+            table.tasks[0].new_sessions.push(SessionRef {
+                id: "codex:demo".into(),
+                worktree: "demo-tree".into(),
+                date: "2026-01-02".into(),
+            });
+            let current = source.replace(old, new);
+            std::fs::write(&path, &current).unwrap();
+            assert!(crate::table::write_back(&mut table).is_empty());
+            assert_eq!(
+                table.warnings,
+                [NoteError::Changed(path.clone()).to_string()]
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), current);
+            assert_eq!(table.tasks[0].task.state, Some(TaskState::Idea));
+            assert_eq!(table.tasks[0].found_tickets, ["DEMO-2"]);
+            assert_eq!(table.tasks[0].new_sessions.len(), 1);
+            assert!(matches!(
+                table.tasks[0].task.note.save(),
+                Err(NoteError::Preview(_))
+            ));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn extracts_keys_once() {

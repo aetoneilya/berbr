@@ -1172,7 +1172,8 @@ export default class Berbr extends View {
     const items = this.detailItems(task, detail);
     const body = v_flex().pl(28).pr(8).pb(4).min_w(0);
     if (detail.excerpt) body.child(div().pb(4).child(div().px(6).max_h(32).overflow_hidden().line_height(1.35)
-      .whitespace_normal().text_size(12).text_color(t.muted).child(detail.excerpt)));
+      .whitespace_normal().text_size(12).text_color(t.muted)
+      .tooltip("Task preview · open Note for the full text").child(detail.excerpt)));
     body.child(div().px(6).child(this.ticketsLine(t, task, detail)))
       .children(items.filter(item => item.type !== "action").map(item => v_flex().child(this.detailRow(t, item))
         .when(item.type === "agent" && item.live?.status === "blocked", el => {

@@ -136,6 +136,11 @@ The desktop version has a native task list in the right panel, alongside Files
 and Changes. See [Herdr App installation and behavior](herdr-app/README.md).
 
 `berbr app-snapshot [--cached]` emits snapshot version 3, retaining all v1/v2 fields.
+Task `body` is a human preview capped at 2 KiB of UTF-8, before fenced-code-aware
+Agent notes / Sessions / Сессии sections. `body_truncated` marks omitted text.
+The mod searches previews and reads the full file on demand for Note viewing and
+editing. Older mods can still read `body`; newer mods also accept older full-body
+snapshots. MR and worktree `body` fields keep their existing meanings.
 Worktree rows retain `merged` and `mr_state`, with the known MR as a child even when
 merged or closed. Task subtrees include done work. Loose sections include clean
 merged checkouts and open MRs even without a ticket or local checkout; only

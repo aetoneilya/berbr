@@ -690,6 +690,28 @@ test("task excerpts stop before machine sections, including when they are the wh
   assert.ok(taskDetail({body:"~~~markdown\n## Agent notes\n~~~\nHuman criteria"}).excerpt.includes("Human criteria"));
 });
 
+test("task search indexes preview text, descendant previews and legacy bodies without machine history", () => {
+  for (const fields of [{body:"Human acceptance criteria.", body_truncated:true},
+    {body:"Human acceptance criteria.\n\n## Agent notes\nMachine history"}]) {
+    const child = {kind:"task", id:"task:demo-2", task:"demo-2", title:"Subtask", body:"Nested requirement"};
+    const row = {kind:"task", id:"task:demo-1", task:"demo-1", title:"Demo", tags:["tagged"], children:[child], ...fields};
+    const model = new PanelModel(), data = {version:3, rows:[row]};
+    for (const query of ["HUMAN ACCEPTANCE", "nested requirement", "tagged", "demo-1"]) {
+      model.update(data, [], [], {query});
+      assert.ok(model.rows.includes(row), query);
+    }
+    model.update(data, [], [], {query:"Machine history"});
+    assert.equal(model.rows.length, 0);
+  }
+});
+
+test("task details mark truncated snapshots as previews and accept older complete bodies", () => {
+  assert.equal(taskDetail({body:"Human criteria.", body_truncated:true}).excerpt, "Human criteria.…");
+  assert.equal(taskDetail({body:"Human criteria.", body_truncated:false}).excerpt, "Human criteria.");
+  assert.equal(taskDetail({body:"Human criteria.\n\n## Sessions\nMachine history"}).excerpt, "Human criteria.");
+  assert.equal(taskDetail({body:"", body_truncated:true}).excerpt, "");
+});
+
 test("task spaces accept title, stable id and legacy names without case sensitivity", () => {
   const row = {task:"demo-4", title:"Проверить Parser"};
   for (const label of [" DEMO-4 ", " проверить PARSER "]) assert.equal(taskSpaceMatches(row, label), true);

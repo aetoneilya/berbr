@@ -379,7 +379,8 @@ export function taskDetail(row, liveAgents = [], liveByTerminal = new Map(liveAg
     openMrs:[...loose.values()].filter(item => item.row.state?.toLowerCase() === "opened"),
     history:[...loose.values()].filter(item => ["merged", "closed"].includes(item.row.state?.toLowerCase())),
     subtasks:children.filter(item => item.kind === "task"),
-    excerpt:paragraph.length > 240 ? `${paragraph.slice(0, 239).trimEnd()}…` : paragraph,
+    excerpt:paragraph && (paragraph.length > 240 || row?.body_truncated)
+      ? `${paragraph.slice(0, 239).trimEnd()}…` : paragraph,
   };
 }
 
@@ -567,7 +568,8 @@ export class PanelModel {
       this.trees = []; const treeKeys = new Set();
       const visit = row => {
         const children = [];
-        let search = [row.title, row.label, row.task, row.target, row.branch, ...(row.tags ?? [])].filter(Boolean).join(" ").toLowerCase();
+        let search = [row.title, row.label, row.task, row.target, row.branch, ...(row.tags ?? []),
+          row.kind === "task" ? beforeMachineSection(row.body) : null].filter(Boolean).join(" ").toLowerCase();
         for (const child of row.children ?? []) {
           visit(child); children.push(child, ...this.related.get(child));
           search += " " + this.search.get(child);

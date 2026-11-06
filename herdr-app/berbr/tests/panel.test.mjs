@@ -1295,6 +1295,37 @@ test("task Note opens a keyed Herdr window without executing open", () => {
   assert.equal(jobs.length, 0);
 });
 
+test("snapshot previews lead to full note viewing and editing, including machine history", async () => {
+  const path = "/home/dev/notes/demo-1.md";
+  const task = {id:"task:demo-1", kind:"task", task:"demo-1", title:"Demo", note:path,
+    body:"Human criteria.", body_truncated:true};
+  const panel = setup({data:{version:3, rows:[task]}});
+  panel.view.showDetails(task, panel.cx);
+  const rendered = panel.view.render(panel.cx);
+  assert.ok(text(rendered).includes("Human criteria.…"));
+  assert.ok(nodes(rendered).some(node => node.attributes.tooltip?.[0] === "Task preview · open Note for the full text"));
+  panel.view.openNote(task);
+  const form = state.overlays.at(-1).props;
+  assert.equal(form.path, path);
+  assert.equal("body" in form, false);
+
+  const source = `---\ntitle: Demo\n---\nHuman criteria.\n\n${"Long human text. ".repeat(300)}\n\n## Agent notes\nFull machine history.\n\n## Sessions\nFull session log.`;
+  const {view, cx, jobs} = setup({props:form});
+  state.files = new Map([[path, source]]);
+  await jobs.shift()(cx);
+  assert.deepEqual(state.reads, [path]);
+  assert.ok(text(view.render(cx)).includes("Full machine history."));
+  assert.ok(text(view.render(cx)).includes("Full session log."));
+  assert.equal(view.note.source, source);
+  click(byId(view.render(cx), "note-edit"), cx);
+  assert.equal(view.note.editor.value(), source);
+  view.note.editor.edit(source + "\nHuman edit.", cx);
+  click(byId(view.render(cx), "note-save"), cx);
+  await jobs.pop()(cx);
+  assert.equal(state.writes.at(-1).expected, source);
+  assert.equal(state.files.get(path), source + "\nHuman edit.");
+});
+
 test("note window loads selectable markdown and wires title bar controls and Escape", async () => {
   const path = "/notes/My task #1.md";
   const {view, cx, jobs, key} = setup({props:{form:"note", path, title:"My task", overlay:"note-window"}});
