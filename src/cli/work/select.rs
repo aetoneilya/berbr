@@ -2,8 +2,7 @@
 
 use super::brief::{brief_path, brief_text};
 use super::common::{
-    Terminal, Ui, branch_name, choose_repo, err, fetch_issue, find_task, is_ticket_key,
-    repo_with_worktree, work_name,
+    Terminal, Ui, branch_name, err, fetch_issue, find_task, find_worktree, is_ticket_key, work_name,
 };
 use super::launch::{Context, Open, Space, launch, open_agent, open_work};
 use crate::cli::SelectArgs;
@@ -30,15 +29,28 @@ fn first_worktree(
     row: &TaskRow,
     tree_name: Option<String>,
     bg: bool,
+    mains: &[PathBuf],
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
+    if let Some(name) = &tree_name {
+        worktree::validate_name(name).map_err(err)?;
+    }
     let task = &row.task;
     let key = task.tickets.first();
     let issue = key.map(|k| fetch_issue(config, k)).transpose()?;
-    let name = work_name(task, tree_name, issue.as_ref());
-    let main = choose_repo(config, ui)?;
+    let desired = work_name(task, tree_name, issue.as_ref());
+    let main = super::common::choose_discovered_repo(mains, ui)?;
+    let name = worktree::reserve_name(
+        &main,
+        &config.workflow.worktree_dir,
+        &desired,
+        &task.name,
+        &config.workflow.branch_prefix,
+        key.map(String::as_str),
+    )
+    .map_err(err)?;
     let branch = branch_name(config, key, &name);
-    let tree = worktree::worktree_dir(&main, &name);
+    let tree = worktree::worktree_dir(&main, &config.workflow.worktree_dir, &name);
     let brief = brief_text(
         &tree,
         &branch,
@@ -48,6 +60,7 @@ fn first_worktree(
         None,
     );
     let open = Open {
+        directory: config.workflow.worktree_dir.clone(),
         kind: config.workflow.agent,
         agent: true,
         focus: !bg,
@@ -64,6 +77,7 @@ pub(in crate::cli) fn cli_select(config: &Config, args: SelectArgs) -> Result<()
 }
 
 pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Result<(), String> {
+    let _operation = herdr::operation();
     let SelectArgs {
         target,
         tree: tree_name,
@@ -82,6 +96,7 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
     let (space, trees, row) = match work {
         Work::Task(i) => {
             let row = &table.tasks[i];
+            super::common::check_task_identity(&table, &row.task.name)?;
             (Space::Task(&row.task), row.trees.clone(), Some(row))
         }
         Work::Ticket(i) => {
@@ -109,7 +124,12 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
     if let Some(name) = &tree_name
         && !first_checkout
     {
-        trees.retain(|&i| &table.tree(i).wt.name() == name);
+        trees.retain(|&i| {
+            &table.tree(i).wt.name() == name || table.tree(i).wt.path == Path::new(name)
+        });
+        if trees.len() > 1 {
+            return Err(format!("worktree {name} is ambiguous; use its full path"));
+        }
         if trees.is_empty() {
             return Err(format!(
                 "\"{space}\" has no worktree {name}; it may have been removed"
@@ -124,7 +144,13 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
         sessions.retain(|s| AgentKind::from_session_key(&s.id) == kind);
     }
     if let Some(name) = &tree_name {
-        sessions.retain(|s| &s.worktree == name);
+        sessions.retain(|s| {
+            if Path::new(name).is_absolute() {
+                s.matches_tree(Path::new(name))
+            } else {
+                s.tree_name() == name
+            }
+        });
     }
     newest_first(&mut sessions, &table.sessions);
 
@@ -148,7 +174,7 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
         let tree = if tree_name.is_some() {
             table.tree(trees[0]).wt.path.clone()
         } else {
-            restore_worktree(config, row, &chosen.worktree, ui)?
+            restore_worktree(config, row, chosen, &table, ui)?
         };
         return resume(&table, space, chosen, &tree, note, bg, ui);
     }
@@ -156,18 +182,18 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
     if trees.is_empty() {
         let Some(last) = sessions.first() else {
             return match row {
-                Some(row) => first_worktree(config, row, tree_name, bg, ui),
+                Some(row) => first_worktree(config, row, tree_name, bg, &table.mains, ui),
                 None => Err(format!("\"{space}\" has neither worktrees nor sessions")),
             };
         };
-        let tree = restore_worktree(config, row, &last.worktree, ui)?;
+        let tree = restore_worktree(config, row, last, &table, ui)?;
         if new_session {
             let brief = brief_path(&tree)?;
             return launch(
                 config.workflow.agent,
                 space,
                 &tree,
-                &last.worktree,
+                last.tree_name(),
                 Context {
                     note,
                     brief: &brief,
@@ -207,24 +233,19 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
     };
 
     if !new_session {
-        if let Some(agent) = tree
-            .agents
-            .iter()
-            .find(|a| {
-                config
-                    .workflow
-                    .agent_override
-                    .is_none_or(|kind| a.kind == Some(kind))
-            })
-            .map(|a| a.name.as_str())
-        {
+        if let Some(agent) = tree.agents.iter().find(|a| {
+            config
+                .workflow
+                .agent_override
+                .is_none_or(|kind| a.kind == Some(kind))
+        }) {
             if !bg {
-                herdr::focus_agent(agent).map_err(err)?;
+                herdr::focus_known(&agent.workspace, &agent.tab, &agent.pane).map_err(err)?;
             }
-            ui.say(format!("→ {agent}"));
+            ui.say(format!("→ {}", agent.name));
             return Ok(());
         }
-        if let Some(last) = sessions.iter().find(|s| s.worktree == tree.wt.name()) {
+        if let Some(last) = sessions.iter().find(|s| s.matches_tree(&tree.wt.path)) {
             return resume(&table, space, last, &tree.wt.path, note, bg, ui);
         }
     }
@@ -292,7 +313,7 @@ fn resume(
             kind,
             space,
             tree,
-            &session.worktree,
+            session.tree_name(),
             Context {
                 note,
                 brief: &brief,
@@ -312,7 +333,15 @@ fn resume(
         .unwrap_or_else(|| tree.to_path_buf());
     let args = kind.resume_args(&session.id);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    open_agent(kind, space, &launch_dir, &session.worktree, &args, !bg, ui)
+    open_agent(
+        kind,
+        space,
+        &launch_dir,
+        session.tree_name(),
+        &args,
+        !bg,
+        ui,
+    )
 }
 
 /// The worktree directory, recreated at the same path from its branch if it was
@@ -320,16 +349,89 @@ fn resume(
 fn restore_worktree(
     config: &Config,
     row: Option<&TaskRow>,
-    name: &str,
+    session: &SessionRef,
+    table: &Table,
     ui: &mut dyn Ui,
 ) -> Result<PathBuf, String> {
-    if let Some(main) = repo_with_worktree(config, name) {
-        return Ok(worktree::worktree_dir(&main, name));
-    }
-    let main = choose_repo(config, ui)?;
+    let name = session.worktree.as_str();
+    let transcript = table.sessions.get(&session.id);
+    let mains = &table.mains;
+    // Legacy names can recover their original directory from the transcript.
+    let inferred = transcript
+        .into_iter()
+        .flat_map(|s| &s.cwds)
+        .flat_map(|(cwd, _)| Path::new(cwd).ancestors())
+        .find(|path| {
+            path.file_name().is_some_and(|part| part == name)
+                && path.parent().is_some_and(|parent| {
+                    parent.ends_with(&config.workflow.worktree_dir)
+                        || parent.ends_with(worktree::LEGACY_DIRECTORY)
+                })
+        })
+        .map(|p| p.to_string_lossy().into_owned());
+    let reference = inferred.as_deref().unwrap_or(name);
+    let name = Path::new(reference)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("worktree has no name")?;
+    worktree::validate_name(name).map_err(err)?;
+    let saved: Vec<PathBuf> = if Path::new(reference).is_absolute() {
+        vec![reference.into()]
+    } else {
+        row.into_iter()
+            .flat_map(|r| r.task.note.strings("worktrees"))
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute() && p.file_name().is_some_and(|n| n == name))
+            .collect()
+    };
+    let mut directory = config.workflow.worktree_dir.clone();
+    let main = match saved.as_slice() {
+        [path] => {
+            if path.exists() {
+                let main = worktree::main_checkout(path).map_err(err)?;
+                if worktree::worktree_root(path).map_err(err)? != *path
+                    || !mains.contains(&main)
+                    || !table
+                        .trees
+                        .iter()
+                        .any(|t| t.repo == main && t.wt.path == *path)
+                {
+                    return Err("saved worktree is not the expected linked checkout".into());
+                }
+                return Ok(path.clone());
+            }
+            let main = mains
+                .iter()
+                .find(|main| {
+                    worktree::worktree_roots(main, &config.workflow.worktree_dir)
+                        .iter()
+                        .any(|root| root.join(name) == *path)
+                })
+                .cloned()
+                .ok_or("removed worktree is outside the configured worktree roots")?;
+            directory = path
+                .parent()
+                .and_then(|p| p.strip_prefix(&main).ok())
+                .ok_or("invalid worktree root")?
+                .to_path_buf();
+            main
+        }
+        [] => {
+            if let Some(path) = find_worktree(config, mains, name)? {
+                return Ok(path);
+            }
+            super::common::choose_discovered_repo(mains, ui)?
+        }
+        _ => {
+            return Err(format!(
+                "{name} is ambiguous in the task's saved repository paths"
+            ));
+        }
+    };
     let keys: Vec<String> = row.map(|r| r.task.tickets.clone()).unwrap_or_default();
-    let candidates: Vec<String> = worktree::all_branches(&main)
+    let candidates: Vec<String> = worktree::Refs::read(&main)
         .map_err(err)?
+        .branches()
         .into_iter()
         .filter(|b| b.ends_with(name))
         .filter(|b| keys.is_empty() || keys.iter().any(|k| b.contains(k.as_str())))
@@ -343,7 +445,7 @@ fn restore_worktree(
         [only] => only.clone(),
         many => many[ui.pick("Worktree branch", many)?].clone(),
     };
-    let dir = worktree::create_worktree(&main, name, &branch).map_err(err)?;
+    let dir = worktree::create_worktree(&main, &directory, name, &branch).map_err(err)?;
     ui.say(format!("restored worktree {} ({branch})", dir.display()));
     Ok(dir)
 }

@@ -1,7 +1,6 @@
 use super::agent::AgentKind;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -70,7 +69,10 @@ fn slug(path: &Path) -> String {
 struct Entry {
     len: u64,
     mtime: u64,
-    session: Session,
+    identity: (u64, u64),
+    offset: u64,
+    fingerprint: u64,
+    aggregate: Aggregate,
 }
 
 /// Parsed transcripts keyed by file, reused while a file's size and mtime stay
@@ -80,11 +82,13 @@ pub struct Cache {
     entries: HashMap<String, Entry>,
     dirty: bool,
     codex: Option<Vec<Session>>,
+    #[cfg(test)]
+    bytes_read: usize,
 }
 
 impl Cache {
     fn path() -> PathBuf {
-        crate::config::cache_dir().join("sessions-v3.json")
+        crate::config::cache_dir().join("sessions-v4.json")
     }
 
     pub fn load() -> Cache {
@@ -96,6 +100,8 @@ impl Cache {
             entries,
             dirty: false,
             codex: None,
+            #[cfg(test)]
+            bytes_read: 0,
         }
     }
 
@@ -124,41 +130,67 @@ impl Cache {
     }
 
     fn session(&mut self, file: &Path, kind: AgentKind) -> Option<Session> {
-        let meta = std::fs::metadata(file).ok()?;
+        let mut input = std::fs::File::open(file).ok()?;
+        let meta = input.metadata().ok()?;
         let len = meta.len();
         let mtime = meta
             .modified()
             .ok()?
             .duration_since(UNIX_EPOCH)
             .ok()?
-            .as_secs();
-        let key = file.to_string_lossy().to_string();
+            .as_nanos() as u64;
+        let file_id = identity(&meta);
+        let key = file.to_string_lossy().into_owned();
         if let Some(entry) = self.entries.get(&key)
+            && entry.identity == file_id
             && entry.len == len
             && entry.mtime == mtime
         {
-            return Some(Session {
-                modified: mtime,
-                ..entry.session.clone()
-            });
-        }
-        let session = Session {
-            modified: mtime,
-            ..match kind {
-                AgentKind::Claude => parse_claude(file)?,
-                AgentKind::Codex => parse_codex(file)?,
+            #[cfg(test)]
+            {
+                self.bytes_read = 0;
             }
-        };
+            return entry.aggregate.session(kind, mtime / 1_000_000_000);
+        }
+        let previous = self.entries.remove(&key).filter(|entry| {
+            entry.identity == file_id
+                && len > entry.len
+                && entry.offset <= len
+                && fingerprint(&mut input, entry.offset).ok() == Some(entry.fingerprint)
+        });
+        let (offset, mut aggregate) = previous.map_or_else(
+            || (0, Aggregate::default()),
+            |entry| (entry.offset, entry.aggregate),
+        );
+        if matches!(kind, AgentKind::Claude) {
+            aggregate.id = Some(file.file_stem()?.to_string_lossy().into_owned());
+        }
+        let (offset, read_bytes) = read_records(&mut input, offset, &mut aggregate, kind).ok()?;
+        #[cfg(test)]
+        {
+            self.bytes_read = read_bytes;
+        }
+        #[cfg(not(test))]
+        let _ = read_bytes;
+        let hash = fingerprint(&mut input, offset).ok()?;
+        let session = aggregate.session(kind, mtime / 1_000_000_000);
         self.entries.insert(
             key,
             Entry {
                 len,
                 mtime,
-                session: session.clone(),
+                identity: file_id,
+                offset,
+                fingerprint: hash,
+                aggregate,
             },
         );
         self.dirty = true;
-        Some(session)
+        Some(session?).filter(|_| {
+            input
+                .metadata()
+                .is_ok_and(|end| identity(&end) == file_id && end.len() >= len)
+        })
     }
 }
 
@@ -232,101 +264,164 @@ fn rollout_files(root: &Path) -> Vec<PathBuf> {
     found
 }
 
-fn parse_codex(file: &Path) -> Option<Session> {
-    let reader = std::io::BufReader::new(std::fs::File::open(file).ok()?);
-    let (mut id, mut date) = (None, None);
-    let (mut first_cwd, mut last_cwd) = (None, None);
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for line in reader.lines() {
-        let line = line.ok()?;
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let payload = &record["payload"];
-        match record["type"].as_str() {
-            Some("session_meta") => {
-                // Review/implementation children duplicate the parent's work;
-                // they are not user conversations to resume from a task note.
-                if payload["source"].get("subagent").is_some() {
-                    return None;
+#[derive(Default, Clone, Serialize, Deserialize)]
+struct Aggregate {
+    id: Option<String>,
+    date: Option<String>,
+    counts: HashMap<String, usize>,
+    first_cwd: Option<String>,
+    last_cwd: Option<String>,
+    excluded: bool,
+}
+
+impl Aggregate {
+    fn line(&mut self, bytes: &[u8], kind: AgentKind) {
+        if self.excluded {
+            return;
+        }
+        #[derive(Deserialize)]
+        struct Fields {
+            cwd: Option<String>,
+            timestamp: Option<String>,
+            id: Option<String>,
+            session_id: Option<String>,
+            source: Option<serde_json::Value>,
+        }
+        #[derive(Deserialize)]
+        struct Record<'a> {
+            #[serde(rename = "type")]
+            kind: Option<&'a str>,
+            timestamp: Option<String>,
+            #[serde(borrow)]
+            payload: Option<&'a serde_json::value::RawValue>,
+        }
+        let fields = match kind {
+            AgentKind::Claude => serde_json::from_slice::<Fields>(bytes).ok(),
+            AgentKind::Codex => {
+                let Ok(record) = serde_json::from_slice::<Record<'_>>(bytes) else {
+                    return;
+                };
+                if !matches!(record.kind, Some("session_meta" | "turn_context")) {
+                    return;
                 }
-                id = payload["id"]
-                    .as_str()
-                    .or_else(|| payload["session_id"].as_str())
-                    .map(str::to_string);
-                date = payload["timestamp"]
-                    .as_str()
-                    .or_else(|| record["timestamp"].as_str())
-                    .and_then(|t| t.get(..10))
-                    .map(str::to_string);
+                let Some(payload) = record.payload else {
+                    return;
+                };
+                let Ok(mut fields) = serde_json::from_str::<Fields>(payload.get()) else {
+                    return;
+                };
+                if record.kind == Some("session_meta") {
+                    if fields
+                        .source
+                        .as_ref()
+                        .is_some_and(|s| s.get("subagent").is_some())
+                    {
+                        self.excluded = true;
+                        return;
+                    }
+                    self.id = fields.id.take().or_else(|| fields.session_id.take());
+                    fields.timestamp = fields.timestamp.or(record.timestamp);
+                }
+                Some(fields)
             }
-            Some("turn_context") => {}
-            _ => continue,
+        };
+        let Some(fields) = fields else { return };
+        if self.date.is_none() {
+            self.date = fields
+                .timestamp
+                .as_deref()
+                .and_then(|t| t.get(..10))
+                .map(str::to_string);
         }
-        if let Some(cwd) = payload["cwd"].as_str() {
-            *counts.entry(cwd.to_string()).or_default() += 1;
-            first_cwd.get_or_insert_with(|| cwd.to_string());
-            last_cwd = Some(cwd.to_string());
+        if let Some(cwd) = fields.cwd {
+            *self.counts.entry(cwd.clone()).or_default() += 1;
+            self.first_cwd.get_or_insert_with(|| cwd.clone());
+            self.last_cwd = Some(cwd);
         }
     }
-    let mut cwds: Vec<_> = counts.into_iter().collect();
-    cwds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    Some(Session {
-        id: AgentKind::Codex.session_key(&id?),
-        date: date?,
-        cwds,
-        first_cwd,
-        last_cwd,
-        modified: 0,
-    })
-}
 
-fn parse_claude(file: &Path) -> Option<Session> {
-    let id = file.file_stem()?.to_string_lossy().to_string();
-    let bytes = std::fs::read(file).ok()?;
-    let text = String::from_utf8_lossy(&bytes);
-
-    // transcripts start with metadata lines; the first timestamp is a message's
-    let date = field_values(&text, "timestamp")
-        .first()
-        .and_then(|ts| ts.get(..10))?
-        .to_string();
-
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    let all_cwds = field_values(&text, "cwd");
-    let first_cwd = all_cwds.first().map(|c| c.to_string());
-    let mut last_cwd = None;
-    for cwd in all_cwds {
-        *counts.entry(cwd).or_default() += 1;
-        last_cwd = Some(cwd);
-    }
-    let mut cwds: Vec<(String, usize)> = counts
-        .into_iter()
-        .map(|(cwd, n)| (cwd.to_string(), n))
-        .collect();
-    cwds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
-    Some(Session {
-        id,
-        date,
-        cwds,
-        first_cwd,
-        last_cwd: last_cwd.map(str::to_string),
-        modified: 0,
-    })
-}
-
-/// Values of `"<name>":"…"` string fields, in order. Paths and timestamps carry
-/// no escaped quotes, so the value ends at the next quote.
-fn field_values<'a>(text: &'a str, name: &str) -> Vec<&'a str> {
-    let pattern = format!("\"{name}\":\"");
-    text.match_indices(&pattern)
-        .filter_map(|(pos, _)| {
-            let start = pos + pattern.len();
-            let len = text[start..].find('"')?;
-            Some(&text[start..start + len])
+    fn session(&self, kind: AgentKind, modified: u64) -> Option<Session> {
+        if self.excluded {
+            return None;
+        }
+        let mut cwds: Vec<_> = self.counts.iter().map(|(p, n)| (p.clone(), *n)).collect();
+        cwds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Some(Session {
+            id: kind.session_key(self.id.as_deref()?),
+            date: self.date.clone()?,
+            cwds,
+            first_cwd: self.first_cwd.clone(),
+            last_cwd: self.last_cwd.clone(),
+            modified,
         })
-        .collect()
+    }
+}
+
+fn identity(meta: &std::fs::Metadata) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (meta.dev(), meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        (
+            0,
+            meta.created()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos() as u64),
+        )
+    }
+}
+
+/// Fingerprints the beginning and the previous complete-line boundary, without
+/// reading the historical transcript again on an append.
+fn fingerprint(file: &mut std::fs::File, offset: u64) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut hash = 0xcbf29ce484222325u64;
+    for start in [0, offset.saturating_sub(4096)] {
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = vec![0; (offset - start).min(4096) as usize];
+        file.read_exact(&mut bytes)?;
+        for byte in bytes {
+            hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    Ok(hash)
+}
+
+fn read_records(
+    file: &mut std::fs::File,
+    offset: u64,
+    aggregate: &mut Aggregate,
+    kind: AgentKind,
+) -> std::io::Result<(u64, usize)> {
+    use std::io::{BufRead, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(offset))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut bytes = Vec::new();
+    let mut complete = offset;
+    let mut read = 0;
+    loop {
+        bytes.clear();
+        let n = reader.read_until(b'\n', &mut bytes)?;
+        read += n;
+        if n == 0 || bytes.last() != Some(&b'\n') {
+            break;
+        }
+        aggregate.line(&bytes, kind);
+        complete += n as u64;
+    }
+    Ok((complete, read))
+}
+
+#[cfg(test)]
+fn parse_codex(path: &Path) -> Option<Session> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut aggregate = Aggregate::default();
+    read_records(&mut file, 0, &mut aggregate, AgentKind::Codex).ok()?;
+    aggregate.session(AgentKind::Codex, 0)
 }
 
 #[cfg(test)]
@@ -337,9 +432,9 @@ mod tests {
     fn slug_matches_claude_project_dirs() {
         assert_eq!(
             slug(Path::new(
-                "/home/demo/projects/demoapp/.claude/worktrees/a2i-config"
+                "/home/dev/projects/demo/.claude/worktrees/a2i-config"
             )),
-            "-home-demo-projects-demoapp--claude-worktrees-a2i-config"
+            "-home-dev-projects-demo--claude-worktrees-a2i-config"
         );
     }
 
@@ -368,7 +463,11 @@ mod tests {
     fn forgets_deleted_transcripts() {
         let dir = crate::table::fixtures::temp_dir();
         let kept = dir.join("kept.jsonl");
-        std::fs::write(&kept, r#"{"cwd":"/a","timestamp":"2026-10-08T10:00:00Z"}"#).unwrap();
+        std::fs::write(
+            &kept,
+            "{\"cwd\":\"/a\",\"timestamp\":\"2026-10-08T10:00:00Z\"}\n",
+        )
+        .unwrap();
         let mut cache = Cache::default();
         assert!(
             cache
@@ -376,7 +475,11 @@ mod tests {
                 .is_some_and(|s| s.modified > 0)
         );
         let gone = dir.join("gone.jsonl");
-        std::fs::write(&gone, r#"{"cwd":"/b","timestamp":"2026-10-09T10:00:00Z"}"#).unwrap();
+        std::fs::write(
+            &gone,
+            "{\"cwd\":\"/b\",\"timestamp\":\"2026-10-09T10:00:00Z\"}\n",
+        )
+        .unwrap();
         cache.session(&gone, AgentKind::Claude).unwrap();
         std::fs::remove_file(&gone).unwrap();
         cache.dirty = false;
@@ -433,9 +536,96 @@ mod tests {
     }
 
     #[test]
-    fn reads_string_fields() {
-        let text = r#"{"cwd":"/a","timestamp":"2026-10-08T10:00:00Z"}
-{"cwd":"/b/c"}"#;
-        assert_eq!(field_values(text, "cwd"), vec!["/a", "/b/c"]);
+    fn reads_spaced_and_escaped_json_fields_without_message_contents() {
+        let mut aggregate = Aggregate {
+            id: Some("demo".into()),
+            ..Default::default()
+        };
+        aggregate.line(br#"{"cwd": "/home/dev/two words", "timestamp": "2026-10-08T10:00:00Z", "message": "cwd fake"}"#, AgentKind::Claude);
+        aggregate.line(br#"{"cwd":"/home/dev/quote\"dir"}"#, AgentKind::Claude);
+        let session = aggregate.session(AgentKind::Claude, 0).unwrap();
+        assert_eq!(session.cwds.len(), 2);
+        assert_eq!(session.last_cwd.as_deref(), Some("/home/dev/quote\"dir"));
+    }
+}
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn records(kind: AgentKind, cwd: &str) -> String {
+        let value = match kind {
+            AgentKind::Claude => serde_json::json!({"cwd":cwd,"timestamp":"2026-11-01T00:00:00Z"}),
+            AgentKind::Codex => {
+                serde_json::json!({"type":"session_meta","timestamp":"2026-11-01T00:00:00Z","payload":{"id":"demo","cwd":cwd,"source":"cli"}})
+            }
+        };
+        format!("{value}\n")
+    }
+
+    #[test]
+    fn appends_resume_persisted_aggregates_and_wait_for_complete_lines() {
+        for kind in [AgentKind::Claude, AgentKind::Codex] {
+            let dir = crate::table::fixtures::temp_dir();
+            let path = dir.join("demo.jsonl");
+            let row = records(kind, "/home/dev/old");
+            std::fs::write(&path, row.repeat(20_000)).unwrap();
+            let mut cache = Cache::default();
+            let original = cache.session(&path, kind).unwrap();
+            assert_eq!(original.cwds[0].1, 20_000);
+            cache.session(&path, kind).unwrap();
+            assert_eq!(cache.bytes_read, 0);
+            let saved = serde_json::to_vec(&cache.entries).unwrap();
+            let mut cache = Cache {
+                entries: serde_json::from_slice(&saved).unwrap(),
+                ..Default::default()
+            };
+            let next = records(kind, "/home/dev/new");
+            let mut output = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            output.write_all(next.trim_end().as_bytes()).unwrap();
+            assert_eq!(cache.session(&path, kind).unwrap().cwds[0].1, 20_000);
+            output.write_all(b"\n").unwrap();
+            let appended = cache.session(&path, kind).unwrap();
+            assert_eq!(appended.first_cwd, original.first_cwd);
+            assert_eq!(appended.last_cwd.as_deref(), Some("/home/dev/new"));
+            assert_eq!(appended.cwds.iter().map(|(_, n)| n).sum::<usize>(), 20_001);
+            assert!(
+                cache.bytes_read < 1024,
+                "append reparsed {} bytes",
+                cache.bytes_read
+            );
+        }
+    }
+
+    #[test]
+    fn truncation_replacement_and_changed_prefix_reset_the_aggregate() {
+        for kind in [AgentKind::Claude, AgentKind::Codex] {
+            let dir = crate::table::fixtures::temp_dir();
+            let path = dir.join("demo.jsonl");
+            let mut cache = Cache::default();
+            std::fs::write(&path, records(kind, "/home/dev/old").repeat(4)).unwrap();
+            cache.session(&path, kind).unwrap();
+            std::fs::write(&path, records(kind, "/home/dev/truncated")).unwrap();
+            assert_eq!(
+                cache.session(&path, kind).unwrap().first_cwd.as_deref(),
+                Some("/home/dev/truncated")
+            );
+            let replacement = dir.join("replacement");
+            std::fs::write(&replacement, records(kind, "/home/dev/replaced").repeat(8)).unwrap();
+            std::fs::rename(replacement, &path).unwrap();
+            assert_eq!(
+                cache.session(&path, kind).unwrap().cwds,
+                vec![("/home/dev/replaced".into(), 8)]
+            );
+            std::fs::write(&path, records(kind, "/home/dev/edited").repeat(16)).unwrap();
+            assert_eq!(
+                cache.session(&path, kind).unwrap().cwds,
+                vec![("/home/dev/edited".into(), 16)]
+            );
+        }
     }
 }

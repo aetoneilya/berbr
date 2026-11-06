@@ -325,12 +325,6 @@ export function looseWhy(row) {
   return "This item is not attached to a task.";
 }
 
-export function stripFrontmatter(text) {
-  const source = String(text ?? "");
-  if (!/^---\r?\n/.test(source)) return source;
-  return source.replace(/^---\r?\n[\s\S]*?^---\r?$(?:\n)?/m, "");
-}
-
 export function obsidianUri(path) {
   return "obsidian://open?path=" + encodeURIComponent(path);
 }
@@ -343,13 +337,6 @@ export function cleanObsidian(body = "") {
       const [target, alias] = link.split("|");
       return alias ?? target.split("#")[0];
     }).trim();
-}
-
-export function matchesFilter(row, query) {
-  const needle = String(query ?? "").trim().toLowerCase();
-  if (!needle) return true;
-  return walk([row]).some(item => [item.title, item.label, item.task, item.target,
-    item.branch, ...(item.tags ?? [])].filter(Boolean).join(" ").toLowerCase().includes(needle));
 }
 
 export function taskDetail(row, liveAgents = [], liveByTerminal = new Map(liveAgents.flatMap(agent => [[agent.address, agent], [agent.pane, agent]]))) {
@@ -465,7 +452,14 @@ export function groupSections(rows = [], liveAgents = [], liveSpaces = [], signa
   const sections = Object.entries(sectionLabels).map(([id, label]) => ({id, label, rows:[], collapsible:true}));
   const byId = new Map(sections.map(section => [section.id, section]));
   const seen = new Set();
-  const tasks = (rows ?? []).flatMap(row => row.kind === "header" ? row.children ?? [] : [row]);
+  const tasks = [];
+  const roots = (row, promoted = false) => {
+    if (row.kind === "header") { for (const child of row.children ?? []) roots(child); return; }
+    if (row.kind !== "task") return;
+    if (!promoted || !row.done) tasks.push(row);
+    if (row.done) for (const child of row.children ?? []) roots(child, true);
+  };
+  for (const row of rows ?? []) roots(row);
   for (const row of tasks) {
     if (row.kind !== "task" || seen.has(row.id)) continue;
     seen.add(row.id);
@@ -515,13 +509,6 @@ export function looseReason(row) {
   return age === null ? "no ticket" : `no ticket · ${age}d`;
 }
 
-export function visibleSections(sections, { query = "", showDone = false, collapsed = new Set() } = {}) {
-  return sections.filter(section => section.id !== "done" || showDone).map(section => {
-    const rows = section.rows.filter(row => matchesFilter(row, query));
-    return { ...section, rows, expanded: Boolean(query.trim()) || !collapsed.has(section.id) };
-  }).filter(section => section.rows.length);
-}
-
 export function visibleRows(sections) {
   return sections.flatMap(section => section.expanded ? section.rows : []);
 }
@@ -529,14 +516,6 @@ export function visibleRows(sections) {
 export function ticketTitle(row) {
   const label = String(row.label ?? "").trim();
   return row.target && label.startsWith(row.target) ? label.slice(row.target.length).trim() : label;
-}
-
-export function rowState(row) {
-  if (isMergedTree(row)) return "Merged";
-  if (row.kind === "ticket") return normalizeTicketState(row.state);
-  if (row.kind === "mr") return { opened: "Open", merged: "Merged", closed: "Closed" }[row.state?.toLowerCase()] ?? normalizeTicketState(row.state);
-  if (row.kind === "tree" && row.state === "active") return "";
-  return normalizeTicketState(row.state);
 }
 
 export function treeMarks(row) {
@@ -578,10 +557,13 @@ export function backendClosePlan(plan) {
 // Snapshot traversal belongs here, once per snapshot. Hover/focus redraws reuse it.
 export class PanelModel {
   update(data, liveAgents = [], liveSpaces = [], options = {}) {
-    const key = liveAgents.map(agent => `${agent.address}:${agent.status}:${agent.seq}:${agent.pane}`).join("|") + "/" +
-      liveSpaces.map(space => `${space.id}:${space.name}:${space.active}:${(space.tabs ?? []).map(tab => `${tab.id}:${tab.working_since}`).join(",")}`).join("|");
+    const agentKeys = new Map(liveAgents.map(agent => [agent.address,
+      [agent.status, agent.seq, agent.pane, agent.space, agent.tab, agent.title, agent.app,
+        agent.program?.name, agent.program?.icon, agent.program?.tint].join(":")]));
+    const spacesKey = liveSpaces.map(space => `${space.id}:${space.name}:${space.active}:${(space.tabs ?? []).map(tab => `${tab.id}:${tab.working_since}`).join(",")}`).join("|");
+    const key = [...agentKeys].map(([address, value]) => `${address}:${value}`).join("|") + "/" + spacesKey;
     if (this.data !== data || !this.related) {
-      this.data = data; this.related = new Map(); this.search = new Map();
+      this.data = data; this.related = new Map(); this.search = new Map(); this.owners = new Map();
       this.trees = []; const treeKeys = new Set();
       const visit = row => {
         const children = [];
@@ -591,6 +573,10 @@ export class PanelModel {
           search += " " + this.search.get(child);
         }
         this.related.set(row, children); this.search.set(row, search);
+        if (row.kind === "task") for (const agent of children.filter(child => child.kind === "agent" && child.terminal)) {
+          if (!this.owners.has(agent.terminal)) this.owners.set(agent.terminal, new Set());
+          this.owners.get(agent.terminal).add(row);
+        }
         if (row.kind === "tree") {
           const id = row.cwd || row.tree || row.id || row;
           if (!treeKeys.has(id)) { treeKeys.add(id); this.trees.push(row); }
@@ -598,15 +584,28 @@ export class PanelModel {
       };
       for (const row of data?.rows ?? []) visit(row);
       this.key = null;
-    }
-    if (this.key !== key) {
-      this.activities = new Map();
-      this.key = key; this.agents = liveAgents; this.spaces = liveSpaces;
-      this.live = new Map(liveAgents.flatMap(agent => [[agent.address, agent], [agent.pane, agent]]));
       this.signals = new Map(); this.details = new Map(); this.reasons = new Map(); this.whys = new Map(); this.plans = new Map();
-      this.sections = groupSections(data?.rows, liveAgents, liveSpaces, row => this.signal(row));
       this.mergedTrees = this.trees.filter(isMergedTree);
       this.bulkPlan = mergedPlan(this.trees);
+    }
+    if (this.key !== key) {
+      const full = this.key === null || this.spacesKey !== spacesKey;
+      const affected = new Set(), byAddress = new Map(liveAgents.map(agent => [agent.address, agent]));
+      const changed = new Set([...agentKeys.keys(), ...(this.agentKeys?.keys() ?? [])]);
+      for (const address of full ? [] : changed) {
+        if (agentKeys.get(address) === this.agentKeys?.get(address)) continue;
+        for (const terminal of [address, this.agentPanes?.get(address),
+          byAddress.get(address)?.pane])
+          for (const owner of this.owners.get(terminal) ?? []) affected.add(owner);
+        this.activities?.delete(address);
+      }
+      if (full) { this.signals.clear(); this.details.clear(); this.plans.clear(); this.activities = new Map(); }
+      else for (const row of affected) { this.signals.delete(row); this.details.delete(row); }
+      this.key = key; this.agentKeys = agentKeys; this.spacesKey = spacesKey;
+      this.agentPanes = new Map(liveAgents.map(agent => [agent.address, agent.pane]));
+      this.agents = liveAgents; this.spaces = liveSpaces;
+      this.live = new Map(liveAgents.flatMap(agent => [[agent.address, agent], [agent.pane, agent]]));
+      this.sections = groupSections(data?.rows, liveAgents, liveSpaces, row => this.signal(row));
       this.visibleKey = null;
     }
     const visibleKey = JSON.stringify([options.query ?? "", Boolean(options.showDone),

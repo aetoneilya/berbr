@@ -237,7 +237,7 @@ pub fn build(table: &Table, options: &Options) -> Vec<Node> {
         let closed = ticket.is_some_and(|t| t.closed());
         let worked_on = live || (open && !closed);
         let mine = ticket.is_some_and(|t| t.mine);
-        if !worked_on && !mine && !all {
+        if !worked_on && !mine && !all && !(options.all && (!loose.trees.is_empty() || open)) {
             continue;
         }
         let text = format!(
@@ -249,7 +249,7 @@ pub fn build(table: &Table, options: &Options) -> Vec<Node> {
         if !keep(text) {
             continue;
         }
-        let (trees, held) = tree_nodes(table, &loose.trees, all, hide, options.all);
+        let (trees, held) = tree_nodes(table, &loose.trees, options.all, hide, options.all);
         let mut children: Vec<Node> = loose
             .mrs
             .iter()
@@ -270,7 +270,7 @@ pub fn build(table: &Table, options: &Options) -> Vec<Node> {
         }
     }
 
-    for node in tree_nodes(table, &table.other_trees, all, hide, options.all).0 {
+    for node in tree_nodes(table, &table.other_trees, options.all, hide, options.all).0 {
         if let Kind::Tree(t) = node.kind
             && keep(format!(
                 "{} {}",
@@ -281,7 +281,7 @@ pub fn build(table: &Table, options: &Options) -> Vec<Node> {
             no_task.push(node);
         }
     }
-    if all && !hide.mrs {
+    if options.all && !hide.mrs {
         for &m in &table.other_mrs {
             if keep(table.mr(m).mr.title().to_string()) {
                 no_task.push(mr_node(m));
@@ -579,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn active_loose_keeps_all_task_content_only() {
+    fn active_loose_hides_only_inactive_jira_inbox_items() {
         let table = table(
             vec![task_note(
                 "done",
@@ -607,12 +607,9 @@ mod tests {
         assert!(shown.contains(&"task:done".into()));
         assert!(shown.contains(&"  tree:/a".into()));
         assert!(shown.contains(&format!("    mr:{}", table.mr_index(1))));
-        assert!(
-            !shown
-                .iter()
-                .any(|n| n.contains("DEMO-2") || n.contains("finished"))
-        );
-        assert!(!shown.contains(&format!("mr:{}", table.mr_index(3))));
+        assert!(shown.iter().any(|n| n.contains("DEMO-2")));
+        assert!(shown.iter().any(|n| n.contains("finished")));
+        assert!(shown.contains(&format!("mr:{}", table.mr_index(3))));
         assert!(shown.contains(&"header:assigned to me in Jira".into()));
         assert!(shown.contains(&"loose:DEMO-3".into()));
         // The existing all view retains its expanded loose sections.
@@ -693,5 +690,48 @@ mod tests {
         );
         let roots: Vec<String> = filtered.iter().map(|n| n.id.replace(ROOT, "")).collect();
         assert_eq!(roots, vec!["header:no task", "tree:/misc"]);
+    }
+}
+
+#[cfg(test)]
+mod regressions {
+    use super::*;
+    use crate::table::fixtures::*;
+    fn snapshot_options() -> Options<'static> {
+        Options {
+            all: true,
+            active_loose: true,
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn online_snapshot_must_include_merged_loose_worktree() {
+        let table = table(
+            vec![],
+            vec![],
+            vec![mr(1, "DEMO-1-work", "work", "merged")],
+            vec![tree("work", "DEMO-1-work")],
+        );
+        assert!(table.trees[0].finished);
+        let nodes = build(&table, &snapshot_options());
+        assert!(
+            nodes.iter().any(|n| matches!(n.kind, Kind::Loose(_))),
+            "clean merged worktree vanished from Cleanup"
+        );
+    }
+    #[test]
+    fn snapshot_must_include_open_mr_without_ticket_or_tree() {
+        let table = table(
+            vec![],
+            vec![],
+            vec![mr(1, "misc", "No key", "opened")],
+            vec![],
+        );
+        assert_eq!(table.other_mrs.len(), 1);
+        let nodes = build(&table, &snapshot_options());
+        assert!(
+            nodes.iter().any(|n| matches!(n.kind, Kind::Mr(_))),
+            "open MR vanished from snapshot"
+        );
     }
 }

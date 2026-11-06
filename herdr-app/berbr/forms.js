@@ -1,10 +1,11 @@
 import { div } from "gpui-kit";
 import { h_flex, v_flex, TextView, EditorState, Editor } from "gpui-base";
-import { props, closeOverlay, setShared, readTextFile, writeTextFile, watchFolder, settings } from "herdr";
+import { props, closeOverlay, readTextFile, writeTextFile, watchFolder, settings } from "herdr";
+import { exists } from "fs/promises";
 import { parseFrontmatter, transformWikilinks, wikiTargets, wikiPath, obsidianUri, treeMarks } from "./model.js";
-import { icon, iconButton, button, chip, segmented, kbd, worktreeSwitch } from "./ui.js";
+import { icon, iconButton, button, chip, segmented, kbd, worktreeSwitch, keyboardControl } from "./ui.js";
 
-function reloadNote(view, cx, {discard = false} = {}) {
+function reloadNote(view, cx, {discard = false, links = false} = {}) {
   const note = view.note;
   if (note.saving || (note.editing && !discard)) return;
   const request = ++note.request, path = note.path;
@@ -14,16 +15,21 @@ function reloadNote(view, cx, {discard = false} = {}) {
       if (!path) throw new Error("Note path is unavailable");
       const source = await readTextFile(path);
       if (source === null) throw new Error("File not found");
+      if (request !== note.request || (note.editing && !discard)) return;
+      if (!discard && !links && source === note.source && path === note.loadedPath) {
+        note.loading = false; note.error = null; cx.notify(); return;
+      }
       const parsed = parseFrontmatter(source);
       const existing = new Set();
       await Promise.all(wikiTargets(parsed.body).map(async target => {
         const destination = wikiPath(path, target);
         if (!destination) return;
-        try { if (await readTextFile(destination) !== null) existing.add(destination); }
+        try { if (await exists(destination)) existing.add(destination); }
         catch (_) { /* Missing or unreadable links remain plain text. */ }
       }));
       if (request !== note.request || (note.editing && !discard)) return;
       note.source = source; note.properties = parsed.properties;
+      note.loadedPath = path;
       note.text = transformWikilinks(parsed.body, path, existing).trim();
       note.existing = existing; note.error = null;
       if (discard) { note.editor?.set_value(source); note.dirty = false; note.conflict = false; note.ask = null; }
@@ -62,7 +68,7 @@ function saveNote(view, cx, overwrite = false) {
     try {
       const expected = overwrite ? await readTextFile(path) : original;
       await writeTextFile(path, value, expected);
-      note.source = value; note.dirty = note.editor.value() !== value; note.conflict = false; note.ask = null;
+      note.source = value; note.loadedPath = null; note.dirty = note.editor.value() !== value; note.conflict = false; note.ask = null;
     } catch (failure) {
       let changed = false;
       try { changed = await readTextFile(path) !== original; } catch (_) { /* Report the write error. */ }
@@ -186,7 +192,7 @@ function noteForm(view, t, p) {
       .when(note.editing, el => el.child(button(t, "note-done", "Done", cx => leaveNote(view, cx), "ghost", note.saving)
         .on_mouse_down("left", (_event, cx) => cx.stop_propagation())))
       .child(control("note-obsidian", "file-text", "Open in Obsidian", cx => view.openUrl(obsidianUri(note.path), cx)))
-      .when(!note.editing, el => el.child(control("note-reload", "refresh", "Reload", cx => reloadNote(view, cx))))
+      .when(!note.editing, el => el.child(control("note-reload", "refresh", "Reload", cx => reloadNote(view, cx, {links:true}))))
       .child(control("note-close", "x", "Close", cx => leaveNote(view, cx, true))))
     .when(Boolean(note.ask), el => el.child(h_flex().px(16).py(8).gap(8).items_center()
       .child(div().flex_1().text_size(12).child("Unsaved changes"))
@@ -231,9 +237,9 @@ function newForm(view, t) {
       .child(worktreeSwitch(t, view.worktree, (value, cx) => {view.worktree = value; cx.notify();}, view.busy))
       .child(div().text_size(12).text_color(t.foreground).child("Create a worktree"))))
     .when(view.worktree, el => el.child(v_flex().gap(8)
-      .child(h_flex().id("advanced").h(28).gap(6).items_center().cursor_pointer().text_color(t.muted)
+      .child(keyboardControl(h_flex().id("advanced"), cx => {view.advanced = !view.advanced; cx.notify();}, view.busy).h(28).gap(6).items_center().cursor_pointer().text_color(t.muted)
         .hover(el => el.text_color(t.foreground))
-        .on_click((_event, cx) => {view.advanced = !view.advanced; cx.notify();})
+        .on_click((_event, cx) => {if (!view.busy) {view.advanced = !view.advanced; cx.notify();}})
         .child(icon(view.advanced ? "chevron-down" : "chevron-right", 12))
         .child(div().text_size(12).child("Advanced")))
       .when(view.advanced, el => el.child(v_flex().gap(8)
@@ -252,10 +258,19 @@ function newForm(view, t) {
 }
 
 function ticketForm(view, t, p) {
-  return v_flex().size_full().p(24).gap(10).bg(t.popover).text_color(t.foreground)
+  return v_flex().size_full().min_h(0).p(24).gap(10).bg(t.popover).text_color(t.foreground)
     .child(div().text_size(15).font_semibold().child("Add a Jira ticket"))
     .child(div().text_size(12).text_color(t.dim).truncate().child(p.title ?? p.task ?? ""))
     .child(view.input("ticket"))
+    .child(v_flex().id("ticket-worktree").flex_1().min_h(0).gap(6).overflow_y_scrollbar()
+      .child(div().text_size(12).text_color(t.muted).child("New worktree name (optional)"))
+      .child(view.input("name"))
+      .when(Boolean(p.trees?.length), el => el.child(div().text_size(12).text_color(t.muted).child("Or reuse an existing worktree"))
+        .children(p.trees.map(tree => button(t, `ticket-tree-${tree.id}`, `${view.ticketTree === tree.tree ? "✓ " : ""}${tree.tree}`,
+          cx => {view.ticketTree = view.ticketTree === tree.tree ? null : tree.tree; cx.notify();}, "ghost", view.busy)
+          .tooltip(tree.cwd ?? tree.tree))))
+      .when(Boolean(p.tickets?.includes(view.values.ticket?.trim())), el => el.child(div().text_size(12).text_color(t.muted)
+        .whitespace_normal().child("This ticket is already linked. Enter a name or select a worktree."))))
     .when(Boolean(view.error), el => el.child(errorLine(view, t)))
     .child(div().flex_1())
     .child(h_flex().gap(8).justify_end()
@@ -278,7 +293,7 @@ function doneForm(view, t, p) {
   section("Will be kept", (plan.keep ?? []).map(tree => row("git-branch", `${tree.tree} — ${tree.reason}`)));
   section("Left open in Jira", (plan.leave ?? []).map(key => row("file-text", key)));
   section("Will be removed", plan.removals.map(tree => row("git-branch",
-    `${tree.name}${tree.path ? ` · ${tree.path}` : ""}${tree.changes ? ` — loses +${tree.changes} uncommitted` : ""}`, tree.changes ? t.blocked : t.foreground)));
+    `${tree.name}${tree.path ? ` · ${tree.path}` : ""}${tree.changes ? ` — WARNING: deletes ${tree.changes} uncommitted file(s)` : ""}`, tree.changes ? t.blocked : t.foreground)));
   section("Jira", plan.jira.length ? [row("file-text", `Closes your open tickets: ${plan.jira.join(", ")}`),
     div().text_size(12).text_color(t.dim).whitespace_normal().child("Tickets assigned to someone else stay open.")] : []);
   section("Also", plan.also.map(text => row(text.includes("space") ? "monitor" : "file-text", text)));
@@ -378,48 +393,54 @@ function stopAgentForm(view, t, p) {
 }
 
 function projectsForm(view, t, p) {
-  return v_flex().p(4).bg(t.popover).text_color(t.foreground)
-    .children((p.projects ?? []).map(project => h_flex().id(`project-${project.name}`).h(32).flex_none().px(10).gap(8)
-      .items_center().rounded(6).cursor_pointer().hover(el => el.bg(t.hover))
-      .on_click(() => {setShared("berbr.project", project.name); closeOverlay(p.overlay);})
-      .child(div().flex_1().min_w(0).text_size(13).truncate().child(project.name))
-      .when(project.name === view.project, el => el.child(icon("check", 12).text_color(t.dim)))))
-    .when(!p.projects?.length, el => el.child(div().p(10).text_size(12).text_color(t.dim).child("No projects available")));
+  const matches = view.pickerMatches(), start = Math.max(0, view.pickerIndex);
+  return v_flex().size_full().min_h(0).p(4).gap(4).bg(t.popover).text_color(t.foreground)
+    .child(view.input("search"))
+    .child(v_flex().id("project-results").flex_1().min_h(0).overflow_y_scrollbar()
+      .children(matches.slice(start).map((project, index) => h_flex().id(`project-${project.name}`).h(32).flex_none().px(10).gap(8)
+        .items_center().rounded(6).cursor_pointer().hover(el => el.bg(t.hover))
+        .when(start + index === view.pickerIndex, el => el.bg(t.selected))
+        .on_click((_event, cx) => view.choosePicker(cx, project))
+        .child(div().flex_1().min_w(0).text_size(13).truncate().tooltip(project.name).child(project.name))
+        .when(project.name === view.project, el => el.child(icon("check", 12).text_color(t.dim)))))
+      .when(!matches.length, el => el.child(div().p(10).text_size(12).text_color(t.dim).child(p.projects?.length ? "No matches" : "No projects available"))))
+    .child(kbd(t, "↑↓ move · ⏎ select · esc close"));
 }
 
 function jumpForm(view, t) {
   const matches = view.jumpMatches();
-  const start = Math.max(0, view.jumpIndex - 5);
+  const start = Math.max(0, view.jumpIndex);
   const names = {task:"Task", tree:"Worktree", agent:"Agent", ticket:"Ticket", mr:"MR", project:"Project"};
-  return v_flex().p(6).gap(4).min_w(0).bg(t.popover).text_color(t.foreground)
+  return v_flex().size_full().min_h(0).p(6).gap(4).min_w(0).bg(t.popover).text_color(t.foreground)
     .child(view.input("search"))
-    .child(v_flex().id("jump-results").children(matches.slice(start, start + 10).map((item, index) =>
+    .child(v_flex().id("jump-results").flex_1().min_h(0).overflow_y_scrollbar().children(matches.slice(start, start + 10).map((item, index) =>
       h_flex().id(`jump-${item.id}`).h(30).flex_none().px(8).gap(6).items_center().min_w(0).rounded(6)
         .when(start + index === view.jumpIndex, el => el.bg(t.selected)).cursor_pointer().hover(el => el.bg(t.hover))
         .on_click((_event, cx) => view.chooseJump(cx, item))
         .child(icon({task:"circle-check", tree:"git-branch", agent:"terminal", ticket:"file-text", mr:"git-compare", project:"folder"}[item.kind], 12).text_color(t.dim))
-        .child(div().flex_1().min_w(0).truncate().text_size(12).child(item.title))
+        .child(div().flex_1().min_w(0).truncate().text_size(12).tooltip(item.title).child(item.title))
         .child(div().flex_none().text_size(11).text_color(t.dim).child(names[item.kind])))))
     .when(!matches.length, el => el.child(div().p(10).text_size(12).text_color(t.dim).child("No matches")))
     .child(kbd(t, "↑↓ move · ⏎ jump · esc close"));
 }
 
 function attachTaskForm(view, t, p) {
-  return v_flex().p(4).bg(t.popover).text_color(t.foreground)
-    .children((p.tasks ?? []).map(task => {
-      const id = `attach-task-${task.id}`;
-      const pending = view.busy && view.busyAction === id;
-      return h_flex().id(id).h(32).flex_none().px(10).gap(8).items_center().rounded(6)
-        .cursor_pointer().opacity(view.busy && !pending ? 0.4 : 1).hover(el => el.bg(t.hover))
-        .on_click((_event, cx) => {
-          if (!p.ticket || !task.task) { view.error = "Ticket or task name is unavailable."; cx.notify(); return; }
-          view.perform(cx, ["attach", p.ticket, task.task], {close:true, action:id});
-        })
-        .child(div().flex_1().min_w(0).truncate().text_size(13).child(task.title ?? task.task))
-        .when(pending, el => el.child(icon("spinner", 11).text_color(t.dim).spin(900)));
-    }))
-    .when(!p.tasks?.length, el => el.child(div().p(10).text_size(12).text_color(t.dim).child("No open tasks")))
-    .when(Boolean(view.error), el => el.child(div().p(10).child(errorLine(view, t))));
+  const matches = view.pickerMatches(), start = Math.max(0, view.pickerIndex);
+  return v_flex().size_full().min_h(0).p(4).gap(4).bg(t.popover).text_color(t.foreground)
+    .child(view.input("search"))
+    .child(v_flex().id("attach-results").flex_1().min_h(0).overflow_y_scrollbar()
+      .children(matches.slice(start).map((task, index) => {
+        const id = `attach-task-${task.id}`, pending = view.busy && view.busyAction === id;
+        return h_flex().id(id).h(32).flex_none().px(10).gap(8).items_center().rounded(6)
+          .when(start + index === view.pickerIndex, el => el.bg(t.selected))
+          .cursor_pointer().opacity(view.busy && !pending ? 0.4 : 1).hover(el => el.bg(t.hover))
+          .on_click((_event, cx) => view.choosePicker(cx, task))
+          .child(div().flex_1().min_w(0).truncate().tooltip(task.title ?? task.task).text_size(13).child(task.title ?? task.task))
+          .child(div().size(11).flex_none().when(!pending, el => el.invisible()).child(icon("spinner", 11).text_color(t.dim).when(pending, el => el.spin(900))));
+      }))
+      .when(!matches.length, el => el.child(div().p(10).text_size(12).text_color(t.dim).child(p.tasks?.length ? "No matches" : "No open tasks"))))
+    .when(Boolean(view.error), el => el.child(div().p(10).child(errorLine(view, t))))
+    .child(kbd(t, "↑↓ move · ⏎ attach · esc close"));
 }
 
 export function formView(view, t) {

@@ -126,9 +126,16 @@ pub(super) fn choose_repo(config: &Config, ui: &mut dyn Ui) -> Result<PathBuf, S
         .iter()
         .filter_map(|r| worktree::main_checkout(&r.path).ok())
         .collect();
+    choose_discovered_repo(&mains, ui)
+}
+
+pub(super) fn choose_discovered_repo(
+    mains: &[PathBuf],
+    ui: &mut dyn Ui,
+) -> Result<PathBuf, String> {
     let here = std::env::current_dir()
         .ok()
-        .and_then(|d| worktree::main_checkout(&d).ok());
+        .and_then(|dir| mains.iter().find(|main| dir.starts_with(main)).cloned());
     match mains.len() {
         0 => return Err("no [[repo]] in ~/.config/berbr/config.toml".to_string()),
         1 => return Ok(mains[0].clone()),
@@ -144,13 +151,25 @@ pub(super) fn choose_repo(config: &Config, ui: &mut dyn Ui) -> Result<PathBuf, S
     Ok(mains[ui.pick("Repository", &names)?].clone())
 }
 
-/// The main checkout that has worktree `name`, if any repo has it.
-pub(super) fn repo_with_worktree(config: &Config, name: &str) -> Option<PathBuf> {
-    config
-        .repos
-        .iter()
-        .filter_map(|r| worktree::main_checkout(&r.path).ok())
-        .find(|main| worktree::worktree_dir(main, name).exists())
+/// A checkout by basename across the discovered repos and both directory roots.
+pub(super) fn find_worktree(
+    config: &Config,
+    mains: &[PathBuf],
+    name: &str,
+) -> Result<Option<PathBuf>, String> {
+    let mut matches = Vec::new();
+    for main in mains {
+        if let Some(path) =
+            worktree::existing_worktree(main, &config.workflow.worktree_dir, name).map_err(err)?
+        {
+            matches.push(path);
+        }
+    }
+    match matches.as_slice() {
+        [] => Ok(None),
+        [main] => Ok(Some(main.clone())),
+        _ => Err(format!("worktree {name} is ambiguous across repositories")),
+    }
 }
 
 pub(super) fn list(items: &[String]) -> Value {
@@ -187,19 +206,29 @@ pub(super) fn current_task(table: &Table) -> Option<usize> {
         .ok()
         .and_then(|d| worktree::worktree_root(&d).ok())
     {
-        let by_tree = table
+        let by_tree: Vec<_> = table
             .tasks
             .iter()
-            .position(|r| open(r) && r.trees.iter().any(|&t| table.tree(t).wt.path == root));
-        if by_tree.is_some() {
-            return by_tree;
+            .enumerate()
+            .filter(|(_, r)| open(r) && r.trees.iter().any(|&t| table.tree(t).wt.path == root))
+            .map(|(i, _)| i)
+            .collect();
+        if let [i] = by_tree.as_slice() {
+            return Some(*i);
         }
     }
     let space = std::env::var("HERDR_WORKSPACE_ID").ok()?;
-    table
+    let by_space: Vec<_> = table
         .tasks
         .iter()
-        .position(|r| open(r) && r.space.as_deref() == Some(space.as_str()))
+        .enumerate()
+        .filter(|(_, r)| open(r) && r.space.as_deref() == Some(space.as_str()))
+        .map(|(i, _)| i)
+        .collect();
+    match by_space.as_slice() {
+        [i] => Some(*i),
+        _ => None,
+    }
 }
 
 /// A task by ticket key, or by name; open tasks win over done ones. With
@@ -268,21 +297,37 @@ where
 /// A task by `find_task`, otherwise the current one, otherwise a picker.
 pub(super) fn resolve_task(
     config: &Config,
-    mut tasks: Vec<Task>,
+    tasks: Vec<Task>,
     arg: Option<&str>,
     ui: &mut dyn Ui,
 ) -> Result<Task, String> {
+    let (mut table, row) = resolve_task_table(config, tasks, arg, ui)?;
+    Ok(table.tasks.swap_remove(row).task)
+}
+
+pub(super) fn resolve_task_table(
+    config: &Config,
+    tasks: Vec<Task>,
+    arg: Option<&str>,
+    ui: &mut dyn Ui,
+) -> Result<(Table, usize), String> {
     if let Some(arg) = arg {
-        return match find_task(&tasks, arg, true)? {
-            Some(i) => Ok(tasks.swap_remove(i)),
-            None => Err(format!(
-                "no task \"{arg}\": berbr start \"{arg}\" creates it"
-            )),
-        };
+        let i = find_task(&tasks, arg, true)?
+            .ok_or_else(|| format!("no task {arg}: berbr start creates it"))?;
+        let name = tasks[i].name.clone();
+        let table = table::build(config, tasks, false);
+        check_task_identity(&table, &name)?;
+        let i = table
+            .tasks
+            .iter()
+            .position(|r| r.task.name == name)
+            .ok_or("task disappeared")?;
+        return Ok((table, i));
     }
-    let mut table = table::build(config, tasks, false);
+    let table = table::build(config, tasks, false);
     if let Some(i) = current_task(&table) {
-        return Ok(table.tasks.swap_remove(i).task);
+        check_task_identity(&table, &table.tasks[i].task.name)?;
+        return Ok((table, i));
     }
     if !ui.can_ask() {
         return Err("no task here; pass its ID explicitly: berbr add <task> <KEY>".into());
@@ -295,7 +340,8 @@ pub(super) fn resolve_task(
         .map(|&i| table.tasks[i].task.display_name())
         .collect();
     let chosen = open[ui.pick("Task", &items)?];
-    Ok(table.tasks.swap_remove(chosen).task)
+    check_task_identity(&table, &table.tasks[chosen].task.name)?;
+    Ok((table, chosen))
 }
 
 /// Every worktree of the configured repos; `online` adds MRs, changes and
@@ -318,10 +364,23 @@ pub(super) fn resolve_tree(
     let trees = &table.trees;
 
     if let Some(name) = name {
-        return trees
+        let matches: Vec<_> = trees
             .iter()
-            .position(|t| t.wt.name() == name || t.wt.branch.as_deref() == Some(name.as_str()))
-            .ok_or_else(|| format!("No worktree named {name}"));
+            .enumerate()
+            .filter(|(_, t)| {
+                t.wt.name() == name
+                    || t.wt.branch.as_deref() == Some(name.as_str())
+                    || t.wt.path.to_str() == Some(name.as_str())
+            })
+            .map(|(i, _)| i)
+            .collect();
+        return match matches.as_slice() {
+            [i] => Ok(*i),
+            [] => Err(format!("No worktree named {name}")),
+            _ => Err(format!(
+                "Worktree {name} is ambiguous; use its full path or --repo with done --tree"
+            )),
+        };
     }
 
     let root = std::env::current_dir()
@@ -336,6 +395,18 @@ pub(super) fn resolve_tree(
     }
     let names: Vec<String> = trees.iter().map(|t| t.wt.name()).collect();
     ui.pick("Worktree", &names)
+}
+
+/// Identity warnings must be resolved before launching work or choosing a space.
+pub(super) fn check_task_identity(table: &Table, name: &str) -> Result<(), String> {
+    if let Some(warning) = table
+        .warnings
+        .iter()
+        .find(|w| w.starts_with(&format!("{name}: ambiguous")))
+    {
+        return Err(warning.clone());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

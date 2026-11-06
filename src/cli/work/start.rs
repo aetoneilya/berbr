@@ -3,7 +3,7 @@
 use super::brief::brief_text;
 use super::common::{
     Terminal, Ui, branch_name, choose_repo, err, fetch_issue, find_task, is_ticket_key, list,
-    name_from_issue, resolve_task, work_name,
+    name_from_issue, resolve_task_table, work_name,
 };
 use super::launch::{Context, Open, Space, launch, open_added_work, open_work};
 use crate::cli::{AddArgs, StartArgs, load};
@@ -20,6 +20,7 @@ pub(in crate::cli) fn cli_start(config: &Config, args: StartArgs) -> Result<(), 
 }
 
 pub(crate) fn start(config: &Config, args: StartArgs, ui: &mut dyn Ui) -> Result<(), String> {
+    let _operation = crate::client::herdr::operation();
     start_with(config, load(config)?, args, ui)
 }
 
@@ -29,6 +30,9 @@ fn start_with(
     mut args: StartArgs,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
+    if let Some(name) = &args.name {
+        worktree::validate_name(name).map_err(err)?;
+    }
     args.description = args.description.filter(|d| !d.trim().is_empty());
     let target = match args
         .target
@@ -45,6 +49,7 @@ fn start_with(
             ui.say("generating a task name from the description…".into());
             let names = super::naming::from_description(args.description.as_deref().unwrap())?;
             if args.name.is_none() {
+                worktree::validate_name(&names.worktree).map_err(err)?;
                 args.name = Some(names.worktree);
             }
             ui.say(format!("task name: {}", names.title));
@@ -194,9 +199,21 @@ fn start_with(
         );
     }
 
-    let wt_name = work_name(&task, tree_name, issue.as_ref());
+    let desired = work_name(&task, tree_name, issue.as_ref());
+    let wt_name = worktree::reserve_name(
+        &main,
+        &config.workflow.worktree_dir,
+        &desired,
+        &task.name,
+        &config.workflow.branch_prefix,
+        keys.first().map(String::as_str),
+    )
+    .map_err(err)?;
+    if desired != wt_name {
+        ui.say(format!("{desired} is reserved; using {wt_name}"));
+    }
     let branch = branch.unwrap_or_else(|| branch_name(config, keys.first(), &wt_name));
-    let tree = worktree::worktree_dir(&main, &wt_name);
+    let tree = worktree::worktree_dir(&main, &config.workflow.worktree_dir, &wt_name);
     let brief = brief_text(
         &tree,
         &branch,
@@ -206,6 +223,7 @@ fn start_with(
         description.as_deref().or(message.as_deref()),
     );
     let open = Open {
+        directory: config.workflow.worktree_dir.clone(),
         kind: config.workflow.agent,
         agent: !no_agent,
         focus: !bg,
@@ -234,6 +252,7 @@ pub(in crate::cli) fn cli_add(config: &Config, args: AddArgs) -> Result<(), Stri
 }
 
 pub(crate) fn add(config: &Config, args: AddArgs, ui: &mut dyn Ui) -> Result<(), String> {
+    let _operation = crate::client::herdr::operation();
     add_with(config, load(config)?, args, ui)
 }
 
@@ -261,7 +280,13 @@ fn add_with(
             "\"{key}\" is not a ticket key: berbr add [<task>] <KEY>"
         ));
     }
-    let mut task = resolve_task(config, tasks, task_arg.as_deref(), ui)?;
+    let (mut table, row) = resolve_task_table(config, tasks, task_arg.as_deref(), ui)?;
+    let owned: Vec<_> = table.tasks[row]
+        .trees
+        .iter()
+        .map(|&i| (table.tree(i).repo.clone(), table.tree(i).wt.clone()))
+        .collect();
+    let mut task = table.tasks.swap_remove(row).task;
     if task.tickets.contains(&key) && name.is_none() && in_tree.is_none() {
         return Err(format!(
             "{key} is already in task \"{}\"; pass --name <name> for a new worktree or --in <tree> for an existing one",
@@ -274,35 +299,58 @@ fn add_with(
         .map(|_| fetch_issue(config, &key))
         .transpose()?;
     let main = match &in_tree {
-        Some(existing) => super::common::repo_with_worktree(config, existing)
-            .ok_or_else(|| format!("no worktree {existing}"))?,
-        None => choose_repo(config, ui)?,
+        Some(existing) => {
+            let matches: Vec<_> = owned
+                .iter()
+                .filter(|(_, wt)| {
+                    wt.name() == *existing || wt.path.to_str() == Some(existing.as_str())
+                })
+                .collect();
+            match matches.as_slice() {
+                [(repo, _)] => repo.clone(),
+                [] => {
+                    return Err(format!(
+                        "{} has no worktree {existing}; --in only accepts this task's worktrees",
+                        task.name
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "worktree {existing} is ambiguous; use its full path"
+                    ));
+                }
+            }
+        }
+        None => super::common::choose_discovered_repo(&table.mains, ui)?,
     };
     let existing = in_tree.is_some();
     let (tree, branch, wt_name) = match in_tree {
         Some(existing) => {
-            let dir = worktree::worktree_dir(&main, &existing);
+            let dir = if std::path::Path::new(&existing).is_absolute() {
+                existing.clone().into()
+            } else {
+                worktree::existing_worktree(&main, &config.workflow.worktree_dir, &existing)
+                    .map_err(err)?
+                    .ok_or_else(|| format!("no worktree {existing}"))?
+            };
             if !dir.exists() {
                 return Err(format!("no worktree {}", dir.display()));
             }
             let branch = worktree::current_branch(&dir).map_err(err)?;
-            (dir, branch, existing)
+            let name = dir
+                .file_name()
+                .ok_or("worktree has no name")?
+                .to_string_lossy()
+                .into_owned();
+            (dir, branch, name)
         }
         None => {
             let wt_name = name
                 .or_else(|| issue.as_ref().map(name_from_issue))
                 .ok_or("pass --name <name> when Jira is not configured")?;
-            if wt_name.is_empty()
-                || wt_name == "."
-                || wt_name == ".."
-                || wt_name
-                    .chars()
-                    .any(|c| c == '/' || c == '\\' || c.is_control())
-            {
-                return Err("--name must be a single non-empty directory name".into());
-            }
+            worktree::validate_name(&wt_name).map_err(err)?;
             let branch = branch_name(config, Some(&key), &wt_name);
-            let tree = worktree::worktree_dir(&main, &wt_name);
+            let tree = worktree::worktree_dir(&main, &config.workflow.worktree_dir, &wt_name);
             if tree.exists() {
                 return Err(format!(
                     "worktree {} already exists; pass --in {wt_name} or another --name",
@@ -316,7 +364,8 @@ fn add_with(
         return Err("berbr add needs Herdr to open the worktree tab and agent".into());
     }
     if !existing {
-        worktree::create_new_worktree(&main, &wt_name, &branch).map_err(err)?;
+        worktree::create_new_worktree(&main, &config.workflow.worktree_dir, &wt_name, &branch)
+            .map_err(err)?;
     }
     if !task.tickets.contains(&key) {
         let _lock = crate::vault::lock().map_err(err)?;
@@ -337,6 +386,7 @@ fn add_with(
         description.as_deref().or(message.as_deref()),
     );
     let open = Open {
+        directory: config.workflow.worktree_dir.clone(),
         kind: config.workflow.agent,
         agent: true,
         focus: !bg && ui.can_ask(),

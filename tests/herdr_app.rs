@@ -90,7 +90,7 @@ else:
   starting=False
   if os.environ.get('BERBR_TEST_STARTING') and a[1]=='t7':
    count=r/'ready-count'; n=int(count.read_text()) if count.exists() else 0; count.write_text(str(n+1)); starting=n==0
-  out={'address':a[1],'cwd':str(r/'repo'),'foreground':None if starting else {'name':'codex' if busy else 'zsh','cwd':str(r/'repo')},'labels':{},'status':'working' if busy else None}
+  out={'address':a[1],'cwd':os.environ.get('BERBR_TEST_AGENT_CWD',str(r/'repo')),'foreground':None if starting else {'name':'codex' if busy else 'zsh','cwd':os.environ.get('BERBR_TEST_AGENT_CWD',str(r/'repo'))},'labels':{},'status':'working' if busy else None}
  else: out={}
 print(json.dumps(out))
 "#;
@@ -308,7 +308,7 @@ fn add_existing_key_creates_named_worktree_without_prompts_or_focus() {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let tree = repo.join(".claude/worktrees/followup");
+        let tree = repo.join(".herdr/worktrees/followup");
         assert!(tree.is_dir());
         assert_eq!(
             f.git(&tree, &["branch", "--show-current"]),
@@ -470,8 +470,14 @@ fn unavailable_app_does_not_look_like_an_empty_agent_list() {
         .args(["app-snapshot", "--cached"])
         .output()
         .unwrap();
-    assert!(!out.status.success());
-    assert!(out.stdout.is_empty());
+    let data = success(out);
+    assert!(
+        data["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("Herdr"))
+    );
 }
 
 #[test]
@@ -521,7 +527,13 @@ fn done_dry_run_preserves_notes_worktrees_branches_and_caches() {
         "refs/remotes/origin/main",
     ]);
     let wt = f.root.join("repo/.claude/worktrees/test-0");
-    git(&["worktree", "add", "-qb", "DEMO-1-test", wt.to_str().unwrap()]);
+    git(&[
+        "worktree",
+        "add",
+        "-qb",
+        "DEMO-1-test",
+        wt.to_str().unwrap(),
+    ]);
     let note = f.root.join("vault/tasks/test-0.md");
     fs::write(
         &note,
@@ -595,9 +607,16 @@ fn done_dry_run_preserves_notes_worktrees_branches_and_caches() {
     for args in [
         vec!["done", "test-0", "--dry-run", "--json"],
         vec!["done", "DEMO-1", "--dry-run", "--json"],
-        vec!["done", "DEMO-1-test", "--dry-run", "--json"],
+        vec!["done", "--tree", "DEMO-1-test", "--dry-run", "--json"],
         vec!["done", "--merged", "--dry-run", "--json"],
-        vec!["done", "DEMO-1-test", "--force", "--dry-run", "--json"],
+        vec![
+            "done",
+            "--tree",
+            "DEMO-1-test",
+            "--force",
+            "--dry-run",
+            "--json",
+        ],
     ] {
         let plan = success(
             f.command()
@@ -608,7 +627,10 @@ fn done_dry_run_preserves_notes_worktrees_branches_and_caches() {
                 .unwrap(),
         );
         assert!(plan["blockers"].as_array().unwrap().is_empty());
-        assert_eq!(plan["note_done"], args[1] == "test-0" || args[1] == "DEMO-1");
+        assert_eq!(
+            plan["note_done"],
+            args[1] == "test-0" || args[1] == "DEMO-1"
+        );
         assert_eq!(fs::read(&note).unwrap(), before);
         assert!(wt.is_dir());
         git(&["show-ref", "--verify", "refs/heads/DEMO-1-test"]);
@@ -639,7 +661,7 @@ fn done_dry_run_preserves_notes_worktrees_branches_and_caches() {
     fs::write(wt.join("dirty"), "uncommitted").unwrap();
     let plan = success(
         f.command()
-            .args(["done", "DEMO-1-test", "--dry-run", "--json"])
+            .args(["done", "--tree", "DEMO-1-test", "--dry-run", "--json"])
             .output()
             .unwrap(),
     );
@@ -670,8 +692,8 @@ fn done_dry_run_preserves_notes_worktrees_branches_and_caches() {
         fs::remove_file(cache.join("berbr/remote-test.json")).unwrap();
     }
     for args in [
-        ["done", "DEMO-1-test", "--dry-run", "--json"],
-        ["done", "--merged", "--dry-run", "--json"],
+        vec!["done", "--tree", "DEMO-1-test", "--dry-run", "--json"],
+        vec!["done", "--merged", "--dry-run", "--json"],
     ] {
         let missing = success(
             f.command()
@@ -901,4 +923,605 @@ fn rename_validates_title_and_shares_note_update_with_task_update() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 1);
     assert!(path.exists());
     assert!(!f.calls().iter().any(|c| c[1][1] == "space.rename"));
+}
+
+#[test]
+fn remove_ticket_named_tree_must_not_resolve_whole_task() {
+    let f = Fixture::new();
+    fs::write(
+        f.root.join("vault/tasks/test-0.md"),
+        "---\nid: test-0\ntitle: Actual task\ntickets: [DEMO-12]\n---\nBody\n",
+    )
+    .unwrap();
+    f.git(
+        &f.root.join("repo"),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "DEMO-12-work",
+            f.root
+                .join("repo/.claude/worktrees/DEMO-12")
+                .to_str()
+                .unwrap(),
+        ],
+    );
+    f.git(
+        &f.root.join("repo"),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "DEMO-12-other",
+            f.root
+                .join("repo/.claude/worktrees/other-work")
+                .to_str()
+                .unwrap(),
+        ],
+    );
+    f.git(
+        &f.root.join("repo"),
+        &["update-ref", "refs/remotes/origin/HEAD", "HEAD"],
+    );
+    let plan = success(
+        f.command()
+            .args(["done", "--tree", "DEMO-12", "--dry-run", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert!(plan["blockers"].as_array().unwrap().is_empty());
+    assert_eq!(plan["remove"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        plan["kind"], "trees",
+        "Remove-worktree argv resolves whole task: {plan}"
+    );
+}
+
+#[test]
+fn add_in_must_reject_another_tasks_worktree() {
+    let f = Fixture::new();
+    let tree = f.root.join("repo/.claude/worktrees/foreign");
+    f.git(
+        &f.root.join("repo"),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "foreign-branch",
+            tree.to_str().unwrap(),
+        ],
+    );
+    fs::write(
+        f.root.join("vault/tasks/test-1.md"),
+        "---\nid: test-1\ntitle: Other task\nworktrees: [foreign]\n---\nOther context\n",
+    )
+    .unwrap();
+    let out = f
+        .command()
+        .args(["add", "test-0", "DEMO-12", "--in", "foreign", "--bg"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "add claims other task's worktree, overwrites its brief and launches new agent: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn native_snapshot_must_report_hc_failure() {
+    let f = Fixture::new();
+    fs::write(f.root.join("bin/hc"), "#!/bin/sh\nexit 1\n").unwrap();
+    let out = f
+        .command()
+        .args(["app-snapshot", "--cached"])
+        .output()
+        .unwrap();
+    let v = success(out);
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("hc"))
+    );
+}
+
+#[test]
+fn snapshot_must_warn_about_skipped_malformed_notes() {
+    let f = Fixture::new();
+    fs::write(
+        f.root.join("vault/tasks/broken.md"),
+        "---\nstate: [\n---\nBody\n",
+    )
+    .unwrap();
+    let out = f
+        .command()
+        .args(["app-snapshot", "--cached"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("broken.md"))
+    );
+}
+
+#[test]
+fn status_must_preserve_quoted_frontmatter() {
+    let f = Fixture::new();
+    let note = f.root.join("vault/tasks/test-0.md");
+    fs::write(
+        &note,
+        "---\nid: test-0\ntitle: Demo\n\"state\": active\ndone: false\n---\nBody\n",
+    )
+    .unwrap();
+    let out = f.command().arg("status").output().unwrap();
+    assert!(out.status.success());
+    let saved = fs::read_to_string(&note).unwrap();
+    let yaml = saved
+        .strip_prefix("---\n")
+        .unwrap()
+        .split("\n---")
+        .next()
+        .unwrap();
+    assert!(
+        serde_yaml::from_str::<serde_yaml::Value>(yaml).is_ok(),
+        "status exits successfully after corrupting valid note: {saved}"
+    );
+}
+
+#[test]
+fn task_close_warns_before_discarding_dirty_files_but_tree_remove_refuses() {
+    let f = Fixture::new();
+    let repo = f.root.join("repo");
+    let tree = repo.join(".claude/worktrees/work");
+    f.git(
+        &repo,
+        &["worktree", "add", "-qb", "work", tree.to_str().unwrap()],
+    );
+    f.git(&repo, &["update-ref", "refs/remotes/origin/HEAD", "HEAD"]);
+    fs::write(tree.join("local.txt"), "synthetic uncommitted content").unwrap();
+    let note = f.root.join("vault/tasks/test-0.md");
+    fs::write(
+        &note,
+        "---\nid: test-0\nworktrees: [work]\ndone: false\n---\nBody\n",
+    )
+    .unwrap();
+    let plan = success(
+        f.command()
+            .args(["done", "test-0", "--dry-run", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert!(plan["blockers"].as_array().unwrap().is_empty());
+    assert_eq!(plan["dirty"][0]["tree"], "work");
+    assert_eq!(plan["dirty"][0]["uncommitted"], 1);
+    assert_eq!(plan["remove"][0]["uncommitted"], 1);
+    let refused = f
+        .command()
+        .args(["done", "--tree", "work", "--yes"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(tree.join("local.txt").exists());
+    let closed = f
+        .command()
+        .args(["done", "test-0", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        closed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&closed.stderr)
+    );
+    assert!(String::from_utf8_lossy(&closed.stdout).contains("work, losing 1 uncommitted"));
+    assert!(!tree.exists());
+    assert!(fs::read_to_string(note).unwrap().contains("done: true"));
+}
+
+#[test]
+fn typed_removal_refuses_duplicate_names_and_accepts_repository_or_full_path() {
+    let f = Fixture::new();
+    let beta = f.root.join("beta");
+    fs::create_dir(&beta).unwrap();
+    f.git(&beta, &["init", "-q"]);
+    f.git(&beta, &["commit", "--allow-empty", "-qm", "base"]);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(f.root.join("config.toml"))
+        .map(|mut file| {
+            use std::io::Write;
+            writeln!(file, "[[project.repo]]\npath = {beta:?}").unwrap();
+        })
+        .unwrap();
+    for repo in [f.root.join("repo"), beta.clone()] {
+        let tree = repo.join(".claude/worktrees/same");
+        f.git(
+            &repo,
+            &["worktree", "add", "-qb", "same", tree.to_str().unwrap()],
+        );
+        f.git(&repo, &["update-ref", "refs/remotes/origin/HEAD", "HEAD"]);
+    }
+    let untyped = f
+        .command()
+        .args(["done", "same", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert!(!untyped.status.success());
+    assert!(String::from_utf8_lossy(&untyped.stderr).contains("done --tree"));
+    let ambiguous = f
+        .command()
+        .args(["done", "--tree", "same", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert!(!ambiguous.status.success());
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("ambiguous"));
+    let scoped = success(
+        f.command()
+            .args([
+                "done",
+                "--tree",
+                "same",
+                "--repo",
+                beta.to_str().unwrap(),
+                "--dry-run",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(scoped["remove"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        scoped["remove"][0]["path"],
+        beta.join(".claude/worktrees/same").to_str().unwrap()
+    );
+    let path = beta.join(".claude/worktrees/same");
+    let scoped = success(
+        f.command()
+            .args([
+                "done",
+                "--tree",
+                path.to_str().unwrap(),
+                "--dry-run",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(scoped["remove"][0]["path"], path.to_str().unwrap());
+}
+
+#[test]
+fn creation_rejects_path_names_before_creating_a_note_or_space() {
+    let f = Fixture::new();
+    let before = fs::read_dir(f.root.join("vault/tasks")).unwrap().count();
+    for args in [
+        vec![
+            "start",
+            "Synthetic task",
+            "--name",
+            "../outside",
+            "--no-agent",
+        ],
+        vec!["select", "test-0", "--tree", "../outside"],
+        vec!["add", "test-0", "DEMO-12", "--name", "../outside"],
+    ] {
+        let out = f.command().args(args).output().unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("single non-empty directory name"));
+    }
+    assert_eq!(
+        fs::read_dir(f.root.join("vault/tasks")).unwrap().count(),
+        before
+    );
+    assert!(!f.calls().iter().any(|c| c[1][0] == "do"));
+}
+
+#[test]
+fn colliding_task_slugs_get_distinct_checkout_names_and_keep_the_old_brief() {
+    let f = Fixture::new();
+    let repo = f.root.join("repo");
+    let tree = repo.join(".claude/worktrees/refactor-cache-key-handling");
+    f.git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "old-owner",
+            tree.to_str().unwrap(),
+        ],
+    );
+    let git_dir = f.git(&tree, &["rev-parse", "--absolute-git-dir"]);
+    let brief = PathBuf::from(git_dir).join("task.md");
+    fs::write(&brief, "original task brief").unwrap();
+    for title in [
+        "Refactor cache key handling alpha",
+        "Refactor cache key handling beta",
+    ] {
+        let out = f
+            .command()
+            .args(["start", title, "--no-agent", "--bg"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert_eq!(fs::read_to_string(brief).unwrap(), "original task brief");
+    let names: Vec<String> = f
+        .calls()
+        .iter()
+        .filter(|c| c[1][1] == "tab.rename")
+        .map(|c| {
+            serde_json::from_str::<Value>(c[1][2].as_str().unwrap()).unwrap()["name"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "refactor-cache-key-handling-test-1",
+            "refactor-cache-key-handling-test-2"
+        ]
+    );
+}
+
+#[test]
+fn native_read_and_focus_reuse_one_inventory_and_focus_the_known_terminal() {
+    for select in [false, true] {
+        let f = Fixture::new();
+        let repo = f.root.join("repo");
+        let tree = repo.join(".claude/worktrees/work");
+        f.git(
+            &repo,
+            &["worktree", "add", "-qb", "work", tree.to_str().unwrap()],
+        );
+        fs::write(
+            f.root.join("vault/tasks/test-0.md"),
+            "---\nid: test-0\nworktrees: [work]\n---\nBody\n",
+        )
+        .unwrap();
+        let mut command = f.command();
+        command.env("BERBR_TEST_AGENT_CWD", &tree);
+        if select {
+            command.args(["select", "test-0", "--tree", "work"]);
+        } else {
+            command.args(["app-snapshot", "--cached"]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let calls = f.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c[0] == "herdr-app" && c[1][0] == "ls")
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c[0] == "hc" && c[1][0] == "get")
+                .count(),
+            1
+        );
+        if select {
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c[1][1] == "agent.focus" && c[1][2].as_str().unwrap().contains("t1"))
+            );
+        }
+    }
+}
+
+#[test]
+fn only_snapshots_compute_diffs_and_repository_ref_facts_are_batched() {
+    let f = Fixture::new();
+    let repo = f.root.join("repo");
+    let tree = repo.join(".claude/worktrees/work");
+    f.git(
+        &repo,
+        &["worktree", "add", "-qb", "work", tree.to_str().unwrap()],
+    );
+    f.git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    f.git(
+        &repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    fs::write(
+        f.root.join("vault/tasks/test-0.md"),
+        "---\nid: test-0\nworktrees: [work]\n---\nBody\n",
+    )
+    .unwrap();
+    let wrapper = f.root.join("bin/git");
+    fs::write(&wrapper,"#!/usr/bin/env python3\nimport os,sys,json\nwith open(os.environ['BERBR_TEST_GIT_LOG'],'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\nos.execv('/usr/bin/git',['git',*sys.argv[1:]])\n").unwrap();
+    fs::set_permissions(wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    for (args, snapshot, online) in [
+        (vec!["status", "--no-write"], false, true),
+        (vec!["done", "test-0", "--dry-run", "--json"], false, true),
+        (vec!["select", "test-0", "--tree", "work"], false, false),
+        (vec!["app-snapshot", "--cached"], true, false),
+        (vec!["app-snapshot"], true, true),
+    ] {
+        let log = f.root.join("git-calls.jsonl");
+        fs::write(&log, "").unwrap();
+        let out = f
+            .command()
+            .env("BERBR_TEST_GIT_LOG", &log)
+            .env("BERBR_TEST_AGENT_CWD", &tree)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let calls: Vec<Vec<String>> = fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let count = |word: &str| {
+            calls
+                .iter()
+                .filter(|args| args.iter().any(|s| s == word))
+                .count()
+        };
+        assert_eq!(
+            count("merge-base"),
+            usize::from(snapshot),
+            "{args:?}: {calls:?}"
+        );
+        assert_eq!(count("diff"), usize::from(snapshot), "{args:?}");
+        assert_eq!(
+            count("for-each-ref"),
+            usize::from(snapshot || online),
+            "{args:?}"
+        );
+        assert_eq!(count("list"), 1, "worktree discovery repeated: {calls:?}");
+        assert!(
+            !calls
+                .iter()
+                .any(|args| args.windows(2).any(|pair| pair == ["log", "-1"]))
+        );
+    }
+}
+
+#[test]
+fn configured_checkout_root_keeps_legacy_trees_and_excludes_new_root_once() {
+    for directory in [".herdr/worktrees", "dev/trees"] {
+        let f = Fixture::new();
+        let repo = f.root.join("repo");
+        let legacy = repo.join(".claude/worktrees/legacy");
+        f.git(
+            &repo,
+            &["worktree", "add", "-qb", "legacy", legacy.to_str().unwrap()],
+        );
+        fs::write(
+            f.root.join("vault/tasks/test-0.md"),
+            "---\nid: test-0\nworktrees: [legacy]\n---\nBody\n",
+        )
+        .unwrap();
+        let config = f.root.join("config.toml");
+        fs::write(
+            &config,
+            format!(
+                "[workflow]\nworktree_dir = {directory:?}\n{}",
+                fs::read_to_string(&config).unwrap()
+            ),
+        )
+        .unwrap();
+        for name in ["new-one", "new-two"] {
+            let out = f
+                .command()
+                .args(["add", "test-0", "DEMO-42", "--name", name, "--bg"])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(repo.join(directory).join(name).is_dir());
+            assert!(!repo.join(".claude/worktrees").join(name).exists());
+        }
+        let exclude = fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            exclude
+                .lines()
+                .filter(|line| *line == format!("/{directory}/"))
+                .count(),
+            1
+        );
+        assert!(!repo.join(".gitignore").exists());
+        let snapshot = success(
+            f.command()
+                .args(["app-snapshot", "--cached"])
+                .output()
+                .unwrap(),
+        );
+        assert!(snapshot.to_string().contains(legacy.to_str().unwrap()));
+        assert!(
+            snapshot
+                .to_string()
+                .contains(repo.join(directory).join("new-one").to_str().unwrap())
+        );
+        let refused = f
+            .command()
+            .args(["add", "test-0", "DEMO-43", "--name", "legacy", "--bg"])
+            .output()
+            .unwrap();
+        assert!(!refused.status.success());
+        assert!(legacy.is_dir());
+        assert!(!repo.join(directory).join("legacy").exists());
+        let reused = f
+            .command()
+            .args(["add", "test-0", "DEMO-42", "--in", "legacy", "--bg"])
+            .output()
+            .unwrap();
+        assert!(
+            reused.status.success(),
+            "{}",
+            String::from_utf8_lossy(&reused.stderr)
+        );
+        assert!(String::from_utf8_lossy(&reused.stdout).contains(legacy.to_str().unwrap()));
+    }
+}
+
+#[test]
+fn native_terminal_details_use_at_most_eight_concurrent_reads() {
+    let f = Fixture::new();
+    fs::write(f.root.join("bin/herdr-app"), r#"#!/usr/bin/env python3
+import json
+print(json.dumps({'spaces':[{'id':'space','name':'test-0','machine':None,'tabs':[{'id':'tab','name':'demo','terminals':[{'terminal':f't{i}','app':'codex','status':'idle'} for i in range(20)]}]}]}))
+"#).unwrap();
+    fs::write(f.root.join("bin/hc"),r#"#!/usr/bin/env python3
+import os,sys,json,time,fcntl
+from pathlib import Path
+root=Path(os.environ['BERBR_TEST_ROOT']); path=root/'detail-pool.json'
+def update(delta):
+ with path.open('a+') as f:
+  fcntl.flock(f,fcntl.LOCK_EX); f.seek(0)
+  value=json.loads(f.read() or '{"active":0,"peak":0,"reads":0}')
+  value['active']+=delta; value['peak']=max(value['peak'],value['active']); value['reads']+=int(delta>0)
+  f.seek(0); f.truncate(); f.write(json.dumps(value)); f.flush()
+update(1); time.sleep(.035); update(-1)
+print(json.dumps({'address':sys.argv[2],'cwd':str(root/'repo'),'foreground':{'name':'codex','cwd':str(root/'repo')},'labels':{}}))
+"#).unwrap();
+    let snapshot = success(
+        f.command()
+            .args(["app-snapshot", "--cached"])
+            .output()
+            .unwrap(),
+    );
+    assert!(snapshot["warnings"].as_array().unwrap().is_empty());
+    let pool: Value =
+        serde_json::from_slice(&fs::read(f.root.join("detail-pool.json")).unwrap()).unwrap();
+    assert_eq!(pool["reads"], 20);
+    assert_eq!(pool["active"], 0);
+    assert!(pool["peak"].as_u64().unwrap() <= 8);
 }

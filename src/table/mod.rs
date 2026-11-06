@@ -298,6 +298,7 @@ pub struct Source {
 
 #[derive(Debug)]
 pub struct Table {
+    pub mains: Vec<PathBuf>,
     pub tasks: Vec<TaskRow>,
     pub loose: Vec<LooseTicket>,
     pub other_trees: Vec<usize>,
@@ -318,19 +319,78 @@ pub struct Table {
 /// `online: false` skips Jira and GitLab: worktrees, agents, workspaces and
 /// sessions only, without task states — for commands that must answer fast.
 pub fn build(config: &Config, tasks: Vec<Task>, online: bool) -> Table {
-    let inputs = fetch::fetch(config, tasks, online, online, true);
+    let inputs = fetch::fetch(
+        config,
+        tasks,
+        fetch::Options {
+            online,
+            cached: online,
+            persist: true,
+            with_diff: false,
+            closing: None,
+        },
+    );
     crate::trace::time("matching", || matching::assemble(inputs))
 }
 
 /// Fresh planning data, without writing remote or transcript caches.
 pub fn build_read_only(config: &Config, tasks: Vec<Task>) -> Table {
-    matching::assemble(fetch::fetch(config, tasks, true, true, false))
+    matching::assemble(fetch::fetch(
+        config,
+        tasks,
+        fetch::Options {
+            online: true,
+            cached: true,
+            persist: false,
+            with_diff: false,
+            closing: None,
+        },
+    ))
 }
 
 /// Offline, but with the tickets and MRs of the last online build: the TUI's
 /// first frame shows them at once while the refresh runs.
 pub fn build_cached(config: &Config, tasks: Vec<Task>) -> Table {
-    matching::assemble(fetch::fetch(config, tasks, false, true, true))
+    matching::assemble(fetch::fetch(
+        config,
+        tasks,
+        fetch::Options {
+            online: false,
+            cached: true,
+            persist: true,
+            with_diff: false,
+            closing: None,
+        },
+    ))
+}
+
+/// Only app snapshots request current local merge-base/diff statistics.
+pub fn build_app(config: &Config, tasks: Vec<Task>, cached: bool) -> Table {
+    matching::assemble(fetch::fetch(
+        config,
+        tasks,
+        fetch::Options {
+            online: !cached,
+            cached: true,
+            persist: true,
+            with_diff: true,
+            closing: None,
+        },
+    ))
+}
+
+pub fn build_closing(config: &Config, tasks: Vec<Task>, name: &str) -> Table {
+    matching::assemble(fetch::fetch(
+        config,
+        tasks,
+        fetch::Options {
+            online: true,
+            cached: true,
+            persist: false,
+            with_diff: false,
+            closing: Some(name.into()),
+        },
+    ))
 }
 
 /// MR merged or closed, and the branch has nothing beyond it: either every commit

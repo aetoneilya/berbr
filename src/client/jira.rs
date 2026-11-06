@@ -15,6 +15,8 @@ pub struct JiraClient {
 
 #[derive(Debug, Error)]
 pub enum JiraError {
+    #[error("incomplete Jira search: {0}")]
+    Incomplete(String),
     #[error("failed during request execution: {0}")]
     RequestExecutionError(#[from] reqwest::Error),
 
@@ -87,6 +89,7 @@ impl JiraClient {
         url: &str,
         query: &[(&str, &str)],
     ) -> Result<T> {
+        let _permit = super::http::acquire();
         let response = self.client.get(url).query(query).send()?;
         Ok(checked(response)?.json()?)
     }
@@ -100,6 +103,7 @@ impl JiraClient {
 
     pub fn transition(&self, key: &str, transition_id: &str) -> Result<()> {
         let url = format!("{}/rest/api/2/issue/{}/transitions", self.base_url, key);
+        let _permit = super::http::acquire();
         let response = self
             .client
             .post(&url)
@@ -119,6 +123,7 @@ impl JiraClient {
             "summary": summary,
             "assignee": { "name": me.name },
         });
+        let _permit = super::http::acquire();
         let response = self
             .client
             .post(&url)
@@ -137,14 +142,19 @@ impl JiraClient {
     /// Search returning only the fields `JiraIssue` needs, up to `max` issues.
     pub fn search_issues_brief(&self, jql: &str, max: usize) -> Result<Vec<JiraIssue>> {
         let url = format!("{}/rest/api/2/search", self.base_url);
-        let max = max.to_string();
-        let query = [
-            ("jql", jql),
-            ("maxResults", max.as_str()),
-            ("fields", "summary,status,created,updated,assignee"),
-        ];
-        let result: JiraSearchResult = self.get_json(&url, &query)?;
-        Ok(result.issues)
+        search_pages(max, |start, limit| {
+            let start = start.to_string();
+            let limit = limit.to_string();
+            self.get_json(
+                &url,
+                &[
+                    ("jql", jql),
+                    ("startAt", &start),
+                    ("maxResults", &limit),
+                    ("fields", "summary,status,created,updated,assignee"),
+                ],
+            )
+        })
     }
 }
 
@@ -180,6 +190,52 @@ pub struct TransitionTarget {
 #[derive(Debug, Deserialize)]
 struct JiraSearchResult {
     issues: Vec<JiraIssue>,
+    #[serde(default, rename = "startAt")]
+    start_at: Option<usize>,
+    #[serde(default)]
+    total: Option<usize>,
+}
+
+fn search_pages(
+    max: usize,
+    mut fetch: impl FnMut(usize, usize) -> Result<JiraSearchResult>,
+) -> Result<Vec<JiraIssue>> {
+    let mut issues = Vec::new();
+    let mut keys = std::collections::HashSet::new();
+    while issues.len() < max {
+        let start = issues.len();
+        let limit = (max - start).min(100);
+        let page = fetch(start, limit)?;
+        if page.start_at.is_some_and(|offset| offset != start) {
+            return Err(JiraError::Incomplete(format!(
+                "expected startAt {start}, got {:?}",
+                page.start_at
+            )));
+        }
+        let count = page.issues.len();
+        for issue in page.issues.into_iter().take(max - start) {
+            if !keys.insert(issue.key.clone()) {
+                return Err(JiraError::Incomplete(format!(
+                    "repeated key {} on page at {start}",
+                    issue.key
+                )));
+            }
+            issues.push(issue);
+        }
+        if page.total.is_some_and(|total| issues.len() >= total) {
+            break;
+        }
+        if page.total.is_none() && count < limit {
+            break;
+        }
+        if count == 0 {
+            return Err(JiraError::Incomplete(format!(
+                "empty page at {start} before total {:?}",
+                page.total
+            )));
+        }
+    }
+    Ok(issues)
 }
 
 #[derive(Debug, Deserialize)]
@@ -237,4 +293,70 @@ pub enum Category {
     Done,
     #[serde(rename = "undefined", other)]
     Unknown,
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+
+    fn page(start: usize, count: usize, total: usize) -> JiraSearchResult {
+        serde_json::from_value(serde_json::json!({
+            "startAt": start, "maxResults": count, "total": total,
+            "issues": (start..start + count).map(|n| serde_json::json!({
+                "key": format!("DEMO-{}", n + 1),
+                "fields": {"summary":"Synthetic issue", "created":"2026-11-01T00:00:00Z"}
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn follows_server_caps_and_stops_at_the_requested_bound() {
+        let mut starts = Vec::new();
+        let issues = search_pages(80, |start, limit| {
+            starts.push((start, limit));
+            Ok(page(start, 30.min(80 - start), 120))
+        })
+        .unwrap();
+        assert_eq!(starts, [(0, 80), (30, 50), (60, 20)]);
+        assert_eq!(issues.len(), 80);
+        let issues = search_pages(usize::MAX, |start, _| {
+            Ok(page(start, 30.min(230 - start), 230))
+        })
+        .unwrap();
+        assert_eq!(issues.len(), 230);
+        assert!(
+            search_pages(0, |_, _| panic!("no request for zero bound"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn incomplete_repeated_and_failed_pages_are_errors() {
+        assert!(
+            search_pages(80, |start, _| Ok(page(
+                start,
+                if start == 0 { 50 } else { 0 },
+                80
+            )))
+            .is_err()
+        );
+        assert!(search_pages(80, |_, _| Ok(page(0, 50, 80))).is_err());
+        assert!(
+            search_pages(80, |start, _| {
+                if start > 0 {
+                    Err(JiraError::Incomplete("page failed".into()))
+                } else {
+                    Ok(page(0, 50, 80))
+                }
+            })
+            .is_err()
+        );
+        assert!(
+            search_pages(80, |_, _| Ok(page(0, 0, 0)))
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

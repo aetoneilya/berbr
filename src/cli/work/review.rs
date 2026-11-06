@@ -19,6 +19,7 @@ pub(in crate::cli) fn cli_review(config: &Config, name: Option<String>) -> Resul
 
 /// A reviewer agent on the worktree, under the task's agent or in a tab of its own.
 pub(crate) fn review(config: &Config, name: Option<String>, ui: &mut dyn Ui) -> Result<(), String> {
+    let _operation = herdr::operation();
     if !herdr::available() {
         return Err("berbr review needs herdr: run it inside a herdr pane".to_string());
     }

@@ -111,17 +111,15 @@ pub(in crate::cli) fn cli_rename(
     } else {
         Vec::new()
     };
-    let matched: Vec<_> = spaces
-        .iter()
-        .filter(|space| crate::vault::task::task_space_matches(&task, &space.label))
-        .collect();
+    let identities = load(config)?;
+    let matched = crate::vault::task::task_space_in(&task, &spaces, &identities)?;
     task = update_context(task, Some(title), None, false)?;
     println!(
         "note: {} — title: {}",
         task.note.path.display(),
         task.space_name()
     );
-    for space in matched {
+    if let Some(space) = matched {
         herdr::rename_workspace(&space.workspace_id, &task.space_name()).map_err(err)?;
         println!("space: {} — {}", space.workspace_id, task.space_name());
     }

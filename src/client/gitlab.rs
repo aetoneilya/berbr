@@ -46,12 +46,18 @@ impl GitLab {
         Ok(url)
     }
 
-    fn get(&self, url: Url, query: &[(&str, &str)]) -> Result<Response, String> {
+    fn get(
+        &self,
+        url: Url,
+        query: &[(&str, &str)],
+    ) -> Result<(Response, super::http::Permit<'static>), String> {
+        let permit = super::http::acquire();
         self.client
             .get(url)
             .query(query)
             .send()
             .and_then(|r| r.error_for_status())
+            .map(|response| (response, permit))
             .map_err(|e| e.to_string())
     }
 
@@ -86,7 +92,7 @@ impl GitLab {
                 ("page", page.as_str()),
             ];
             query.extend_from_slice(filters);
-            let response = self.get(url.clone(), &query)?;
+            let (response, _permit) = self.get(url.clone(), &query)?;
             let last = response
                 .headers()
                 .get("x-next-page")
@@ -102,13 +108,35 @@ impl GitLab {
         let iid = iid.to_string();
         let get = |tail: &[&str], query: &[(&str, &str)]| -> Result<serde_json::Value, String> {
             let path = [&["merge_requests", iid.as_str()], tail].concat();
-            self.get(self.project_url(project, &path)?, query)?
-                .json()
-                .map_err(|e| e.to_string())
+            let (response, _permit) = self.get(self.project_url(project, &path)?, query)?;
+            response.json().map_err(|e| e.to_string())
         };
         let (mr, approvals, discussions) = std::thread::scope(|scope| {
             let approvals = scope.spawn(|| get(&["approvals"], &[]));
-            let discussions = scope.spawn(|| get(&["discussions"], &[("per_page", "100")]));
+            let discussions = scope.spawn(|| {
+                discussion_pages(|page| {
+                    let page_text = page.to_string();
+                    let (response, _permit) = self.get(
+                        self.project_url(project, &["merge_requests", &iid, "discussions"])?,
+                        &[("per_page", "100"), ("page", &page_text)],
+                    )?;
+                    let next = match response.headers().get("x-next-page") {
+                        Some(value) if value.is_empty() => Some(None),
+                        Some(value) => Some(Some(
+                            value
+                                .to_str()
+                                .map_err(|e| e.to_string())?
+                                .parse::<u32>()
+                                .map_err(|e| e.to_string())?,
+                        )),
+                        None => None,
+                    };
+                    let threads: Vec<serde_json::Value> =
+                        response.json().map_err(|e| e.to_string())?;
+                    let next = next.unwrap_or_else(|| (threads.len() == 100).then_some(page + 1));
+                    Ok((threads, next))
+                })
+            });
             (
                 get(&[], &[]),
                 joined(approvals, "a GitLab request"),
@@ -131,23 +159,36 @@ impl GitLab {
             })
             .unwrap_or_default();
         let unresolved = discussions?
-            .as_array()
-            .map(|threads| {
-                threads
-                    .iter()
-                    .filter(|d| {
-                        d.pointer("/notes/0/resolvable").and_then(|v| v.as_bool()) == Some(true)
-                            && d.pointer("/notes/0/resolved").and_then(|v| v.as_bool())
-                                == Some(false)
-                    })
-                    .count()
+            .iter()
+            .filter(|d| {
+                d.pointer("/notes/0/resolvable").and_then(|v| v.as_bool()) == Some(true)
+                    && d.pointer("/notes/0/resolved").and_then(|v| v.as_bool()) == Some(false)
             })
-            .unwrap_or(0);
+            .count();
         Ok(MrReview {
             pipeline,
             approved_by,
             unresolved,
         })
+    }
+}
+
+fn discussion_pages(
+    mut fetch: impl FnMut(u32) -> Result<(Vec<serde_json::Value>, Option<u32>), String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut found = Vec::new();
+    let mut page = 1;
+    loop {
+        let (threads, next) = fetch(page)?;
+        if next.is_some() && threads.is_empty() {
+            return Err("incomplete GitLab discussions: empty page before next page".into());
+        }
+        found.extend(threads);
+        match next {
+            None => return Ok(found),
+            Some(next) if next > page => page = next,
+            _ => return Err("invalid GitLab discussions pagination".into()),
+        }
     }
 }
 
@@ -304,5 +345,48 @@ mod tests {
             request.url().query(),
             Some("updated_after=2026-10-01T00%3A00%3A00%2B00%3A00")
         );
+    }
+}
+
+#[cfg(test)]
+mod discussion_tests {
+    use super::*;
+
+    #[test]
+    fn follows_discussions_past_the_first_hundred_and_propagates_failure() {
+        let mut calls = Vec::new();
+        let discussions = discussion_pages(|page| {
+            calls.push(page);
+            Ok(if page == 1 {
+                (
+                    vec![serde_json::json!({"notes":[{"resolvable":true,"resolved":true}]}); 100],
+                    Some(2),
+                )
+            } else {
+                (
+                    vec![serde_json::json!({"notes":[{"resolvable":true,"resolved":false}]})],
+                    None,
+                )
+            })
+        })
+        .unwrap();
+        assert_eq!(calls, [1, 2]);
+        assert_eq!(discussions.len(), 101);
+        assert_eq!(
+            discussions
+                .iter()
+                .filter(|d| d.pointer("/notes/0/resolved").and_then(|v| v.as_bool()) == Some(false))
+                .count(),
+            1
+        );
+        assert!(
+            discussion_pages(|page| if page == 1 {
+                Ok((vec![serde_json::json!({})], Some(2)))
+            } else {
+                Err("page failed".into())
+            })
+            .is_err()
+        );
+        assert!(discussion_pages(|_| Ok((vec![serde_json::json!({})], Some(1)))).is_err());
     }
 }

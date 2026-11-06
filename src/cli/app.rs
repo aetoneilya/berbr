@@ -8,18 +8,12 @@ use crate::table::{
 use serde_json::{Value, json};
 
 pub(super) fn snapshot(projects: &[Config], chosen: usize, cached: bool) -> Result<(), String> {
-    if std::env::var("BERBR_BACKEND").is_ok_and(|s| s == "herdr-app") {
-        // The normal table tolerates a missing multiplexer. The app board must
-        // surface a broken backend instead of making every live agent disappear.
-        crate::client::herdr::list_workspaces().map_err(|e| e.to_string())?;
-    }
     let config = &projects[chosen];
-    let tasks = super::load(config)?;
-    let table = if cached {
-        table::build_cached(config, tasks)
-    } else {
-        table::build(config, tasks, true)
-    };
+    let (tasks, skipped) = crate::vault::task::load(config)?;
+    let mut table = table::build_app(config, tasks, cached);
+    table
+        .warnings
+        .extend(skipped.into_iter().map(|e| format!("skipped {e}")));
     let roots = view::build(
         &table,
         &view::Options {
@@ -99,6 +93,7 @@ fn row(table: &Table, node: &Node, owner: Option<&str>) -> Value {
             value["label"] = json!(t.wt.name());
             value["tree"] = json!(t.wt.name());
             value["cwd"] = json!(t.wt.path);
+            value["repo"] = json!(t.repo);
             value["branch"] = json!(t.wt.branch);
             value["diff"] = json!(t.diff);
             value["merged"] = json!(

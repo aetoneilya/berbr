@@ -10,7 +10,6 @@ model and the decisions.
 
 ## Install
 
-Repository: [example/berbr](https://github.com/example/berbr).
 
 ```
 cargo install --path . --locked
@@ -27,19 +26,20 @@ path = "~/demo-vault"
 
 [workflow]                  # defaults for every project
 branch_prefix = "demo/"
+worktree_dir = ".herdr/worktrees" # relative to each main checkout
 # agent = "codex"           # default: "claude"; also accepts --agent per command
 # review_model = "claude-fable-5-1"
 # ide = "IntelliJ IDEA"
 
-[[project]]                 # in the TUI's project dropdown, `berbr -p demoapp`
-name = "demoapp"
+[[project]]                 # in the TUI's project dropdown, `berbr -p demo`
+name = "demo"
 task_dirs = ["30-work/tasks"]
 # new_task_dir = "30-work/tasks"   # default: the first of task_dirs
 jira = { host = "https://jira.example.com", project = "DEMO", issue_type = "Задача" }
 gitlab = { host = "gitlab.example.com", project = "demo/service" }
 
 [[project.repo]]
-path = "~/projects/demoapp"
+path = "~/projects/demo"
 gitlab_project = "demo/service"
 
 [[project]]                 # no Jira, no GitLab: notes, worktrees, agents
@@ -80,7 +80,7 @@ berbr select [<task|KEY>]     go back to a task: its agent, or claude resuming i
 berbr note "<text>"           (for agents) append a finding to the note's "Agent notes"
 berbr status                  the table in plain text; updates `state` and `sessions` in notes
 berbr review [<worktree>]     start a reviewer agent next to the worktree's agent
-berbr done [<task|worktree>] [--merged] [--force] [-y] [--dry-run [--json]]
+berbr done [<task>] [--tree <name-or-path> [--repo <path>]] [--merged] [-y] [--dry-run [--json]]
                            close a task (worktrees, my Jira tickets, note marked
                            done, its herdr workspace),
                            or remove one worktree; --merged removes every finished one
@@ -91,8 +91,19 @@ berbr completions <shell>     shell completion script
 branches, herdr or caches. Add `--json` for one plan object, including blockers,
 removals, kept trees and ticket actions. Blockers still exit 0 in dry-run; the
 listed steps are conditional on resolving them. Without dry-run they refuse the
-operation. This also works with a task ticket, a worktree branch or `--merged`.
-Unknown inspection counts (possible with `--force`) are JSON `null`.
+operation. A task ticket alias still selects its task. To remove a checkout,
+use `berbr done --tree <name-or-path> [--repo <main-checkout>]`: this target never
+resolves a task or ticket. Positional arguments select tasks only. Duplicate
+worktree names require a full checkout path or
+`--repo`. The mod uses this explicit target too. `--merged` sweeps clean,
+finished checkouts.
+
+Task closing lists each dirty checkout and its uncommitted file count before
+confirmation; JSON includes both `dirty` and the counts in `remove`. Accepting
+that plan discards those files. Single-worktree removal refuses dirty checkouts.
+A failed removal or Jira transition reports the failed step and leaves the note
+and Herdr space open for retry; successful prior steps remain completed.
+Unknown inspection counts are JSON `null`.
 
 `berbr <command> --help` lists the options.
 
@@ -126,8 +137,11 @@ and Changes. See [Herdr App installation and behavior](herdr-app/README.md).
 
 `berbr app-snapshot [--cached]` emits snapshot version 3, retaining all v1/v2 fields.
 Worktree rows retain `merged` and `mr_state`, with the known MR as a child even when
-merged or closed. Task subtrees include done work; loose sections follow the
-TUI's active-only rules. `--cached` uses the last remote data without network.
+merged or closed. Task subtrees include done work. Loose sections include clean
+merged checkouts and open MRs even without a ticket or local checkout; only
+inactive Jira-only entries are suppressed. `--cached` uses the last remote data
+without network. Snapshot warnings include unavailable Herdr/hc inventories and
+skipped notes with their paths.
 
 Open MR rows, at every nesting level, add `ci` (head pipeline status or null),
 `approvals` (approver count), `unresolved` (discussion count), `draft`,
@@ -142,7 +156,7 @@ unavailable. It includes committed, staged and unstaged tracked changes, using
 local Git only, even with `--cached`. Zero changes gives zero counts; detached
 trees, missing defaults and Git errors give null.
 
-Agents can run `berbr add [<task>] TEST-1 --name followup --agent codex
+Agents can run `berbr add [<task>] DEMO-1 --name followup --agent codex
 --description "Implement the followup"` to open another branch and agent in the
 task's Herdr space. The task defaults to the current worktree/space. An existing
 ticket requires `--name` for a new worktree or `--in <tree>` to reuse one; an
@@ -152,3 +166,19 @@ the caller's focus. It waits for worktree creation and the agent launch request,
 then prints one line with the path, tab and terminal IDs. Errors exit nonzero
 with one error line. Herdr is required; a failed launch leaves the worktree for
 inspection/retry with `--in`.
+
+New task checkouts reserve a unique name before launch. A slug collision adds
+its task ID (then a counter if needed); a new task never reuses another task's
+checkout. Saved checkout paths include their repository; legacy bare names are
+accepted only when unique. Newly discovered sessions also save full checkout
+paths; versioned string entries preserve names containing spaces. For `add --in`,
+use a checkout owned by that task.
+
+New checkouts use `<main checkout>/.herdr/worktrees/<name>`. Configure
+`[workflow] worktree_dir = "dev/trees"`, or override `worktree_dir` on a
+`[[project]]`. It must be a repository-relative directory without `..`.
+Discovery and resume keep using existing `.claude/worktrees` alongside the
+configured root; existing checkouts are never moved. Names and pending name
+reservations in either root prevent a conflicting checkout in the other.
+The first checkout appends `/.herdr/worktrees/` (or the configured root) once to
+that repository's `.git/info/exclude`; `.gitignore` is unchanged.

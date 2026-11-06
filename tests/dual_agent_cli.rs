@@ -263,13 +263,13 @@ finally:
         if both {
             fs::write(
                 claude.join("shared.jsonl"),
-                json!({"cwd":tree,"timestamp":"2026-10-29T10:00:00Z"}).to_string(),
+                json!({"cwd":tree,"timestamp":"2026-10-29T10:00:00Z"}).to_string() + "\n",
             )
             .unwrap();
         }
         let codex = self.root.join("codex/sessions/2026/10/29");
         fs::create_dir_all(&codex).unwrap();
-        fs::write(codex.join("rollout-fixture.jsonl"), json!({"type":"session_meta","timestamp":"2026-10-29T10:00:00Z","payload":{"id":"shared","cwd":tree,"source":"cli"}}).to_string()).unwrap();
+        fs::write(codex.join("rollout-fixture.jsonl"), json!({"type":"session_meta","timestamp":"2026-10-29T10:00:00Z","payload":{"id":"shared","cwd":tree,"source":"cli"}}).to_string() + "\n").unwrap();
     }
 }
 
@@ -379,7 +379,7 @@ fn explicit_tree_resumes_its_latest_session_without_changing_git() {
     fs::write(fixture.root.join("vault/tasks/task.md"),
         "---\ntickets: [DEMO-1]\nsessions: [\"codex:shared task 2026-10-29\", \"codex:recent task 2026-10-30\"]\n---\nContext\n").unwrap();
     fs::write(fixture.root.join("codex/sessions/2026/10/29/rollout-recent.jsonl"),
-        json!({"type":"session_meta","timestamp":"2026-10-30T10:00:00Z","payload":{"id":"recent","cwd":tree,"source":"cli"}}).to_string()).unwrap();
+        json!({"type":"session_meta","timestamp":"2026-10-30T10:00:00Z","payload":{"id":"recent","cwd":tree,"source":"cli"}}).to_string() + "\n").unwrap();
     let before = git_snapshot(&fixture.repo);
     let commands = fixture.run(&["select", "task", "--tree", "task", "--bg"]);
     assert_eq!(
@@ -428,7 +428,7 @@ fn explicit_tree_names_the_first_checkout_of_a_task_without_trees_or_sessions() 
     let command = pane_command(&commands);
     assert!(command.contains(" prepare "), "{command}");
     assert!(
-        command.contains(".claude/worktrees/chosen-tree"),
+        command.contains(".herdr/worktrees/chosen-tree"),
         "{command}"
     );
     let note = fs::read_to_string(fixture.root.join("vault/tasks/task.md")).unwrap();

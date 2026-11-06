@@ -204,7 +204,7 @@ impl App {
         }
     }
 
-    /// The dropdown's closed face: `[ demoapp ▾ ]`, lit while it has the focus.
+    /// The dropdown's closed face: `[ demo ▾ ]`, lit while it has the focus.
     pub(super) fn dropdown(&self) -> Span<'static> {
         let style = if self.projects_focused {
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn the_filter_keeps_new_project_last() {
-        let projects = [project("demoapp", "30/tasks"), project("vpn", "10/vpn")];
+        let projects = [project("demo", "30/tasks"), project("vpn", "10/vpn")];
         assert_eq!(
             options(&projects, ""),
             [Choice::Project(0), Choice::Project(1), Choice::New]

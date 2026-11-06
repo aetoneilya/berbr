@@ -7,7 +7,7 @@ use crate::cli::progress;
 use crate::client::agent::AgentKind;
 use crate::client::herdr::shell_quote;
 use crate::client::{herdr, worktree};
-use crate::vault::task::{Task, same_name, task_space_matches};
+use crate::vault::task::{Task, same_name, task_space};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -58,6 +58,7 @@ pub(super) fn launch(
 /// How `open_work` opens the worktree: with an agent or a shell only, and
 /// whether its tab is focused.
 pub(super) struct Open {
+    pub(super) directory: PathBuf,
     pub(super) agent: bool,
     pub(super) kind: AgentKind,
     pub(super) focus: bool,
@@ -67,6 +68,8 @@ pub(super) struct Open {
 /// What `berbr prepare` does in the new tab, handed over in a file.
 #[derive(Serialize, Deserialize)]
 struct PrepareSpec {
+    #[serde(default = "legacy_directory")]
+    directory: PathBuf,
     main: PathBuf,
     name: String,
     branch: String,
@@ -79,6 +82,10 @@ struct PrepareSpec {
     kind: AgentKind,
     #[serde(default)]
     description: Option<String>,
+}
+
+fn legacy_directory() -> PathBuf {
+    worktree::LEGACY_DIRECTORY.into()
 }
 
 /// A tab for the worktree `name` in the task's herdr workspace. Fetch and
@@ -95,26 +102,41 @@ pub(super) fn open_work(
     open: Open,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
+    let directory = open.directory.clone();
+    worktree::validate_name(name).map_err(err)?;
+    worktree::validate_directory(&directory).map_err(err)?;
+    if worktree::existing_worktree(main, &directory, name)
+        .map_err(err)?
+        .is_some()
+    {
+        return Err(format!(
+            "worktree {name} already exists; select the owning task to resume it"
+        ));
+    }
     let Open {
         agent,
         focus,
         kind,
         description,
+        ..
     } = open;
-    if task.tickets.is_empty() {
+    {
         let _lock = crate::vault::lock().map_err(err)?;
         let mut note = crate::vault::note::Note::read(&task.note.path).map_err(err)?;
         let mut names = note.strings("worktrees");
-        if !names.iter().any(|existing| existing == name) {
-            names.push(name.to_string());
+        let reference = worktree::worktree_dir(main, &directory, name)
+            .to_string_lossy()
+            .into_owned();
+        if !names.contains(&reference) {
+            names.push(reference);
             note.set("worktrees", super::common::list(&names));
             note.save().map_err(err)?;
         }
     }
     let (space, note) = (Space::Task(task), Some(task.note.path.as_path()));
-    let dir = worktree::worktree_dir(main, name);
+    let dir = worktree::worktree_dir(main, &directory, name);
     if !herdr::available() {
-        let dir = worktree::create_worktree(main, name, branch).map_err(err)?;
+        let dir = worktree::create_new_worktree(main, &directory, name, branch).map_err(err)?;
         ui.say(format!("worktree: {} ({branch})", dir.display()));
         let brief = write_brief(&dir, &brief)?;
         if agent {
@@ -132,6 +154,7 @@ pub(super) fn open_work(
     let (tab, pane) = open_tab(space, cwd, name)?;
     let agent = agent.then(|| free_agent_name(name));
     let spec = PrepareSpec {
+        directory,
         main: main.to_path_buf(),
         name: name.to_string(),
         branch: branch.to_string(),
@@ -211,13 +234,21 @@ pub(super) fn open_added_work(
 pub(in crate::cli) fn cli_prepare(spec_path: &Path) -> Result<(), String> {
     let spec: PrepareSpec =
         serde_json::from_slice(&std::fs::read(spec_path).map_err(err)?).map_err(err)?;
-    let dir = worktree::worktree_dir(&spec.main, &spec.name);
+    worktree::validate_name(&spec.name).map_err(err)?;
+    let dir = worktree::worktree_dir(&spec.main, &spec.directory, &spec.name);
+    worktree::ensure_excluded(&spec.main, &spec.directory).map_err(err)?;
     let started = std::time::Instant::now();
 
-    if !dir.exists() {
+    if dir.symlink_metadata().is_ok() {
+        return Err(format!(
+            "{} already exists; refusing to replace its brief",
+            dir.display()
+        ));
+    }
+    {
         println!("{} ({})", dir.display(), spec.branch);
         let plan = progress::step("worktree plan", || {
-            worktree::plan_worktree(&spec.main, &spec.name, &spec.branch)
+            worktree::plan_worktree(&spec.main, &spec.directory, &spec.name, &spec.branch)
         })?;
         // a failed fetch leaves the worktree on the remote branch as last
         // fetched: better than no worktree
@@ -233,6 +264,7 @@ pub(in crate::cli) fn cli_prepare(spec_path: &Path) -> Result<(), String> {
         })?;
         worktree::copy_worktree_includes(&spec.main, &dir);
     }
+    worktree::ensure_excluded(&spec.main, &spec.directory).map_err(err)?;
     let brief = write_brief(&dir, &spec.brief)?;
     let _ = std::fs::remove_file(spec_path);
     let Some(agent) = &spec.agent else {
@@ -294,13 +326,21 @@ pub(super) fn open_agent(
 /// A new tab `label` in the herdr workspace `space`, created when missing;
 /// returns the tab and its pane.
 fn open_tab(space: Space<'_>, cwd: &Path, label: &str) -> Result<(String, String), String> {
-    let existing = herdr::list_workspaces()
-        .map_err(err)?
-        .into_iter()
-        .find(|w| match space {
-            Space::Task(task) => task_space_matches(task, &w.label),
-            Space::Label(label) => same_name(&w.label, label),
-        });
+    let spaces = herdr::list_workspaces().map_err(err)?;
+    let existing = match space {
+        Space::Task(task) => task_space(task, &spaces)?,
+        Space::Label(label) => {
+            let matches: Vec<_> = spaces
+                .iter()
+                .filter(|w| same_name(&w.label, label))
+                .collect();
+            match matches.as_slice() {
+                [] => None,
+                [space] => Some(*space),
+                _ => return Err(format!("ambiguous Herdr space {label}")),
+            }
+        }
+    };
     match existing {
         Some(ws) => herdr::create_tab(&ws.workspace_id, cwd, label).map_err(err),
         None => {

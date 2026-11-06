@@ -27,12 +27,22 @@ export function iconButton(t, id, name, label, action, { disabled = false, spinn
 
 export function button(t, id, label, action, variant = "ghost", disabled = false, spinning = false) {
   const primary = variant === "primary";
-  return h_flex().id(id).h(30).px(10).gap(6).items_center().justify_center().rounded(6)
+  return keyboardControl(h_flex().id(id), action, disabled).h(30).px(10).gap(6).items_center().justify_center().rounded(6)
     .text_size(12).text_color(primary ? t.solid_foreground : t.muted)
     .when(primary, el => el.bg(t.solid)).cursor_pointer().opacity(disabled && !spinning ? 0.4 : 1)
     .hover(el => primary ? el.opacity(disabled && !spinning ? 0.4 : 0.85) : el.bg(t.hover).text_color(t.foreground))
     .on_click((_event, cx) => { cx.stop_propagation(); if (!disabled) action(cx); }).child(label)
-    .when(spinning, el => el.child(icon("spinner", 11).spin(900)));
+    .child(div().size(11).flex_none().when(!spinning, el => el.invisible())
+      .child(icon("spinner", 11).when(spinning, el => el.spin(900))));
+}
+
+// Plain elements need both a tab stop and keyboard activation in this runtime.
+export function keyboardControl(element, action, disabled = false) {
+  return element.tab_index(0).tab_stop(!disabled).on_key_down((event, cx) => {
+    if (!["enter", "space", " "].includes(event.key)) return;
+    cx.stop_propagation();
+    if (!disabled) action(cx);
+  });
 }
 
 export function chip(t, label) {
@@ -43,7 +53,7 @@ export function chip(t, label) {
 
 export function segmented(t, id, options, value, action, disabled = false) {
   return h_flex().h(28).p(2).gap(2).items_center().bg(t.background).border_1().border_color(t.border).rounded(6)
-    .children(options.map(([key, label]) => h_flex().id(`${id}-${key}`).h(22).px(10).items_center().rounded(4)
+    .children(options.map(([key, label]) => keyboardControl(h_flex().id(`${id}-${key}`), cx => action(key, cx), disabled).h(22).px(10).items_center().rounded(4)
       .when(key === value, el => el.bg(t.raised)).text_size(12).text_color(key === value ? t.foreground : t.muted)
       .cursor_pointer().hover(el => el.text_color(t.foreground)).opacity(disabled ? 0.4 : 1)
       .on_click((_event, cx) => { if (!disabled) action(key, cx); }).child(label)));

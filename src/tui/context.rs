@@ -138,6 +138,14 @@ impl Opening {
             }
         }
         let label = self.label.as_deref()?;
+        let ids: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|&i| crate::vault::task::same_name(&table.tasks[i].task.name, label))
+            .collect();
+        if !ids.is_empty() {
+            return unique(ids);
+        }
         unique(
             candidates
                 .iter()

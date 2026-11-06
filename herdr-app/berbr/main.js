@@ -2,9 +2,9 @@ import { View, div, svg, image } from "gpui-kit";
 import { h_flex, v_flex, Input, InputState, TextView } from "gpui-base";
 import { appHome, exec, focused, spaces, agents, panes, theme, run, props,
   openOverlay, closeOverlay, notify, shared, setShared, nextCommand, hc } from "herdr";
-import { walk, visibleRows, sectionLabels, taskSpace, rowMenu,
+import { walk, sectionLabels, taskSpace, rowMenu,
   normalizeTicketState, ticketTitle,
-  worktreeNameCollision, cleanCliText, isClosedTicket,
+  cleanCliText, isClosedTicket,
   agentActivity, formatElapsed, blockedPrompt, mrPills, focusedTask, focusedTree, treeFocusTarget, jumpItems, matchJump, closePlan, PanelModel, treeMarks, isMergedTree, mergedPlan, backendClosePlan } from "./model.js";
 import { icon, iconButton, button, chip, sectionHeader, statusMark, kbd, pill } from "./ui.js";
 import { formView, initNote, noteKey } from "./forms.js";
@@ -20,8 +20,9 @@ export default class Berbr extends View {
     this.filter = ""; this.all = false; this.selected = null; this.hovered = null;
     this.expanded = null; this.busyAction = null;
     this.blockedReasons = new Map(); this.panelModel = new PanelModel();
+    this.promptQueue = []; this.promptWorkers = 0;
     this.jumpIndex = 0; this.jumpQuery = "";
-    this.menuIndex = 0;
+    this.menuIndex = 0; this.pickerIndex = 0;
     if (this.form === "menu") this.menuItems = rowMenu(p.row, {spaces:spaces(), mr:p.mr, live:p.live});
     if (this.form === "done") this.closePlan = p.plan ?? closePlan(p.row, spaces());
     if (this.form === "remove-merged") this.bulkPlan = mergedPlan(p.trees);
@@ -57,11 +58,13 @@ export default class Berbr extends View {
       input.on("change", (_event, cx) => {
         this.values[key] = input.value();
         if (key === "search") this.filter = input.value();
+        if (key === "search") this.pickerIndex = 0;
         if (key === "search" && this.form === "jump") { this.jumpQuery = input.value(); this.jumpIndex = 0; }
         cx.notify();
       });
       input.on("submit", (_event, cx) => {
         if (this.form === "jump" && key === "search") this.chooseJump(cx);
+        if (["projects", "attach-task"].includes(this.form) && key === "search") this.choosePicker(cx);
         if (this.form === "new" && ["title", "ticket"].includes(key)) this.submitNew(cx);
         if (this.form === "rename" && key === "title") this.submitRename(cx);
         if (this.form === "ticket" && key === "ticket") this.submitTicket(cx, true);
@@ -79,11 +82,14 @@ export default class Berbr extends View {
       this.refresh(cx, true);
       cx.timer.every(1000, cx => {
         this.syncFocus(cx);
-        this.syncBlocked(visibleRows(this.sections()), cx);
+        const live = this.liveState();
+        this.syncBlocked(live.rows, cx, false, live);
       });
       cx.timer.every(30000, cx => {
-        this.refresh(cx, true);
-        if (visibleRows(this.sections()).some(row => row.kind === "task" && this.signal(row).working)) cx.notify();
+        this.withLive(live => {
+          this.refresh(cx, true);
+          if (live.rows.some(row => row.kind === "task" && live.signal(row).working)) cx.notify();
+        });
       });
       cx.timer.every(300000, cx => this.refresh(cx));
       cx.spawn(async cx => {
@@ -91,7 +97,7 @@ export default class Berbr extends View {
           const command = await nextCommand();
           if (command === "refresh") this.refresh(cx, true);
           if (command === "new") this.formOverlay("new");
-          if (command === "details" && this.chosen()) this.showDetails(this.chosen(), cx);
+          if (command === "details") this.withLive(() => { const row = this.chosen(); if (row) this.showDetails(row, cx); });
           if (command === "focus") { this.handle.focus(); this.receiveJump(cx); }
           if (command === "jump") this.openJump();
           if (command === "navigate") this.receiveJump(cx);
@@ -100,6 +106,8 @@ export default class Berbr extends View {
       });
     } else if (this.form === "jump") {
       this.jumpEntries = jumpItems(p.snapshot, p.agents ?? []); this.inputs.search.focus();
+    } else if (["projects", "attach-task"].includes(this.form)) {
+      this.inputs.search.focus();
     } else if (["new", "rename"].includes(this.form)) this.inputs.title.focus();
     else if (this.form === "ticket") this.inputs.ticket.focus();
     if (["done", "remove-merged"].includes(this.form)) this.loadClosePlan(cx);
@@ -138,12 +146,13 @@ export default class Berbr extends View {
     return result.stdout;
   }
 
-  refresh(cx, cached = false) {
+  refresh(cx, cached = false, forcePrompts = false) {
     if (this.loading || this.busy) return;
     const desired = shared("berbr.project");
     if (desired && desired !== this.project) { this.switchProject(desired, cx); return; }
     this.loading = true;
-    this.syncBlocked(visibleRows(this.sections()), cx, true);
+    const live = this.liveState();
+    this.syncBlocked(live.rows, cx, forcePrompts, live);
     const requestedProject = this.project;
     cx.spawn(async cx => {
       try {
@@ -165,7 +174,9 @@ export default class Berbr extends View {
           if ((task ?? flat.find(row => row.id === this.expanded))?.done) this.all = true;
         }
       } catch (error) { this.error = String(error.message ?? error); }
-      this.loading = false; this.syncBlocked(visibleRows(this.sections()), cx); cx.notify();
+      this.loading = false;
+      const live = this.liveState();
+      this.syncBlocked(live.rows, cx, false, live); cx.notify();
       if (cached && !this.didOnline) { this.didOnline = true; this.refresh(cx); }
     });
   }
@@ -186,46 +197,89 @@ export default class Berbr extends View {
     });
   }
 
+  withLive(action) {
+    const previous = this.renderLive;
+    this.renderLive = this.liveState();
+    try { return action(this.renderLive); }
+    finally { this.renderLive = previous; }
+  }
+
   signal(row) { return this.liveState().signal(row); }
 
   activity(agent, treeName) {
     if (!agent) return {text:"", elapsed:""};
     const live = this.liveState();
     live.activities ??= new Map();
-    const key = JSON.stringify([agent.address, agent.seq, treeName]);
-    if (!live.activities.has(key)) {
+    const key = agent.address;
+    if (!live.activities.has(key) || live.activities.get(key)?.seq !== agent.seq || live.activities.get(key)?.treeName !== treeName) {
       const tab = live.spaces.find(space => space.id === agent.space)?.tabs?.find(tab => tab.id === agent.tab);
-      live.activities.set(key, {text:agentActivity(agent.title, agent.app ?? agent.program?.name, treeName),
+      live.activities.set(key, {seq:agent.seq, treeName, text:agentActivity(agent.title, agent.app ?? agent.program?.name, treeName),
         since:tab?.working_since});
     }
     const activity = live.activities.get(key);
     return {text:activity.text, elapsed:formatElapsed(activity.since == null ? null : Date.now() - activity.since)};
   }
 
-  syncBlocked(rows, cx, force = false) {
-    const live = this.liveState();
-    for (const [address, entry] of this.blockedReasons) {
-      if (!live.agents.some(agent => agent.address === address && agent.status === "blocked" && (entry.busy || agent.seq === entry.seq)))
-        this.blockedReasons.delete(address);
+  clearBlocked(address, cx) {
+    this.blockedReasons.delete(address);
+    if (this.replyFocused?.endsWith(`/waiting/${address}`)) {
+      this.replyFocused = null; this.handle.focus(); cx.notify();
     }
-    const blocked = new Map(rows.filter(row => row.kind === "task").flatMap(row => this.signal(row).agents)
+  }
+
+  syncBlocked(rows, cx, force = false, live = this.liveState()) {
+    for (const [address, entry] of this.blockedReasons) {
+      const agent = live.live.get(address);
+      if (!agent || agent.status !== "blocked" || (!entry.busy && agent.seq !== entry.seq))
+        this.clearBlocked(address, cx);
+    }
+    // Read the expanded/selected task first, then the other displayed tasks.
+    const tasks = rows.filter(row => row.kind === "task");
+    const priority = tasks.filter(row => row.id === this.expanded || row.id === this.selected);
+    const blocked = new Map([...priority, ...tasks].flatMap(row => live.signal(row).agents)
       .filter(agent => agent.status === "blocked" && agent.address).map(agent => [agent.address, agent]));
-    for (const [address, agent] of blocked) {
-      const previous = this.blockedReasons.get(address);
-      if (previous?.busy || previous?.loading || (!force && previous && previous.seq === agent.seq)) continue;
-      const entry = {seq:agent.seq, reason:{kind:"waiting"}, choices:[], loading:true};
-      this.blockedReasons.set(address, entry);
+    // An automatic snapshot arriving mid-read must not cancel a manual refresh pass.
+    if (force || !this.promptScan || !this.promptForce) {
+      this.promptScan = blocked.values(); this.promptForce = force;
+    }
+    this.fillPromptQueue();
+    while (this.promptWorkers < 4 && this.promptWorkers < this.promptQueue.length) {
+      this.promptWorkers++;
       cx.spawn(async cx => {
         try {
-          const [info, screen] = await Promise.all([hc(["get", address]), hc(["read", address])]);
-          let status;
-          try { if (info.code === 0) status = JSON.parse(info.stdout).status; } catch (_) { /* Older cores may not report a message. */ }
-          Object.assign(entry, blockedPrompt(status, screen.code === 0 ? screen.stdout : ""));
-        } catch (_) { /* An unreadable prompt still needs the person. */ }
-        const current = agents().find(agent => agent.address === address);
-        if (this.blockedReasons.get(address) !== entry || current?.status !== "blocked" || current.seq !== entry.seq) return;
-        entry.loading = false; cx.notify();
+          for (;;) {
+            this.fillPromptQueue();
+            const job = this.promptQueue.shift();
+            if (!job) break;
+            const {address, entry} = job;
+            const latest = agents().find(agent => agent.address === address);
+            if (this.blockedReasons.get(address) !== entry || latest?.status !== "blocked" || latest.seq !== entry.seq) continue;
+            try {
+              const [info, screen] = await Promise.all([hc(["get", address]), hc(["read", address])]);
+              let status;
+              try { if (info.code === 0) status = JSON.parse(info.stdout).status; } catch (_) { /* Older cores may not report a message. */ }
+              Object.assign(entry, blockedPrompt(status, screen.code === 0 ? screen.stdout : ""));
+            } catch (_) { /* An unreadable prompt still needs the person. */ }
+            const current = agents().find(agent => agent.address === address);
+            if (this.blockedReasons.get(address) !== entry || current?.status !== "blocked" || current.seq !== entry.seq) continue;
+            entry.loading = false; entry.readAt = Date.now(); cx.notify();
+          }
+        } finally { this.promptWorkers--; }
       });
+    }
+  }
+
+  fillPromptQueue() {
+    while (this.promptScan && this.promptQueue.length < 64) {
+      const {value:agent, done} = this.promptScan.next();
+      if (done) { this.promptScan = null; break; }
+      const previous = this.blockedReasons.get(agent.address);
+      if (previous?.busy || previous?.loading || (!this.promptForce && previous &&
+          previous.seq === agent.seq && Date.now() - previous.readAt < 300000)) continue;
+      const entry = {...previous, seq:agent.seq, reason:previous?.reason ?? {kind:"waiting"},
+        choices:previous?.choices ?? [], loading:true};
+      this.blockedReasons.set(agent.address, entry);
+      this.promptQueue.push({address:agent.address, entry});
     }
   }
 
@@ -278,9 +332,11 @@ export default class Berbr extends View {
         } else this.blockedReasons.delete(address);
         if (reply && entry.input.value() === value) entry.input.set_value("");
       } catch (error) { entry.feedback = String(error.message ?? error); }
-      entry.busy = false;
-      if (reply && this.replyFocused === item.id) { this.replyFocused = null; this.handle.focus(); }
-      cx.notify();
+      finally {
+        entry.busy = false;
+        if (reply && this.replyFocused === item.id) { this.replyFocused = null; this.handle.focus(); }
+        cx.notify();
+      }
     });
   }
 
@@ -320,7 +376,9 @@ export default class Berbr extends View {
     return this.liveState().visible;
   }
 
-  rows(sections = this.sections()) {
+  rows(sections = null) { return this.withLive(() => this.rowItems(sections ?? this.sections())); }
+
+  rowItems(sections) {
     return sections.flatMap(section => [
       {id:`section-${section.id}`, kind:"section", section:section.id},
       ...(section.expanded ? section.rows.flatMap(row => {
@@ -328,7 +386,8 @@ export default class Berbr extends View {
         const details = row.id === this.expanded
           ? (row.kind === "task" ? this.detailItems(row) : this.looseItems(row)).filter(item => item.action) : [];
         if (!details.length) return [row, ...waiting];
-        return [row, ...details.flatMap(item => [item, ...waiting.filter(prompt => item.type === "agent" && item.live?.address === prompt.agent.address)])];
+        return [row, ...details.flatMap(item => [item, ...waiting.filter(prompt => item.type === "agent" && item.live?.address === prompt.agent.address)]),
+          ...waiting.filter(prompt => !details.some(item => item.type === "agent" && item.live?.address === prompt.agent.address))];
       }) : []),
     ]);
   }
@@ -340,6 +399,23 @@ export default class Berbr extends View {
   }
 
   jumpMatches() { return matchJump(this.jumpEntries ?? [], this.jumpQuery); }
+
+  pickerMatches() {
+    const p = props() ?? {}, query = this.filter.trim().toLowerCase();
+    return (this.form === "projects" ? p.projects ?? [] : p.tasks ?? [])
+      .filter(item => [item.name, item.title, item.task].filter(Boolean).join(" ").toLowerCase().includes(query));
+  }
+
+  choosePicker(cx, item = this.pickerMatches()[this.pickerIndex]) {
+    if (!item || this.busy || this.pickerChosen) return;
+    if (this.form === "projects") {
+      this.pickerChosen = true;
+      setShared("berbr.project", item.name); closeOverlay(props().overlay);
+    } else {
+      if (!props()?.ticket || !item.task) { this.error = "Ticket or task name is unavailable."; cx.notify(); return; }
+      this.perform(cx, ["attach", props().ticket, item.task], {close:true, action:`attach-task-${item.id}`});
+    }
+  }
 
   chooseJump(cx, item = this.jumpMatches()[this.jumpIndex]) {
     if (!item || this.jumpChosen) return;
@@ -456,7 +532,7 @@ export default class Berbr extends View {
     const popup = ["projects", "attach-task", "menu"].includes(form);
     openOverlay({ mod:"berbr", kind: popup ? "popup" : "dialog",
       width: ["done", "remove-merged"].includes(form) ? 520 : ["projects", "menu"].includes(form) ? 220 : form === "attach-task" ? 300 : ["jump", "new"].includes(form) ? 560 : form === "remove-tree" ? 440 : 480,
-      height: popup ? undefined : form === "jump" ? 0.6 : ["done", "remove-merged"].includes(form) ? 0.75 : form === "new" ? 380 : form === "remove-tree" ? 360 : 240,
+      height: ["projects", "attach-task"].includes(form) ? 0.6 : popup ? undefined : form === "jump" ? 0.6 : ["done", "remove-merged"].includes(form) ? 0.75 : form === "new" ? 380 : form === "ticket" ? 420 : form === "remove-tree" ? 360 : 240,
       modal: ["new", "rename", "stop-agent", "remove-tree", "done", "remove-merged"].includes(form),
       ...(popup ? {at:"pointer"} : {}),
       props:{ form, project:this.project, binary:this.binary, agent:this.agent,
@@ -571,6 +647,9 @@ export default class Berbr extends View {
   }
 
   submitNew(cx) {
+    if (this.ticketMode === "existing" && !/^[A-Z][A-Z0-9]*-\d+$/.test(this.values.ticket?.trim() ?? "")) {
+      this.error = "Enter a valid Jira ticket key (for example DEMO-123)."; cx.notify(); return;
+    }
     const title = this.values.title?.trim();
     const args = ["start", ...(title ? [title] : ["--unnamed"]), "--bg"];
     if (this.agent === "none") args.push("--no-agent"); else args.push("--agent", this.agent);
@@ -589,7 +668,16 @@ export default class Berbr extends View {
     const ticket = this.values.ticket?.trim();
     if (!ticket) { this.error = "Enter a Jira ticket key."; cx.notify(); return; }
     const task = props()?.task;
-    this.perform(cx, worktree ? ["add", task, ticket] : ["attach", ticket, task], {close:true});
+    const args = worktree ? ["add", task, ticket] : ["attach", ticket, task];
+    if (worktree) {
+      const name = this.values.name?.trim(), existing = this.ticketTree;
+      if (existing) args.push("--in", existing);
+      else if (name) args.push("--name", name);
+      else if (props()?.tickets?.includes(ticket)) {
+        this.error = "Choose an existing worktree or enter a new worktree name."; cx.notify(); return;
+      }
+    }
+    this.perform(cx, args, {close:true});
   }
 
   removeTree(tree, mr, rows = this.data?.rows ?? []) {
@@ -599,14 +687,11 @@ export default class Berbr extends View {
   submitRemoveTree(cx) {
     const p = props() ?? {};
     const name = p.tree?.tree;
-    const collision = "A task has the same name; remove this worktree from the terminal: berbr done --merged";
     if (!name?.trim()) { this.error = "Worktree name is unavailable."; cx.notify(); return; }
-    if (worktreeNameCollision(p.rows, name)) { this.error = collision; cx.notify(); return; }
-    this.perform(cx, ["done", name, "--yes"], {close:true, action:"remove-tree", before:async () => {
-      const data = JSON.parse(await this.cli(["app-snapshot"]));
-      if (!Array.isArray(data.rows)) throw new Error("Could not check task names; refresh and try again.");
-      if (worktreeNameCollision(data.rows, name)) throw new Error(collision);
-    }});
+    const target = p.tree?.cwd || name;
+    const args = ["done", "--tree", target, "--yes"];
+    if (p.tree?.repo) args.push("--repo", p.tree.repo);
+    this.perform(cx, args, {close:true, action:"remove-tree"});
   }
 
   enterTree(tree, mr, cx, action, remove = false) {
@@ -661,8 +746,16 @@ export default class Berbr extends View {
     } else this.taskClick(row, cx);
   }
 
-  key(event, cx) {
+  key(event, cx) { return this.withLive(() => this.keyEvent(event, cx)); }
+
+  keyEvent(event, cx) {
     if (this.form === "note" && noteKey(this, event, cx)) return;
+    if (["projects", "attach-task"].includes(this.form) && ["up", "down", "enter"].includes(event.key)) {
+      if (event.key === "enter") this.choosePicker(cx);
+      else if (!this.busy) this.pickerIndex = Math.max(0, Math.min(this.pickerMatches().length - 1,
+        this.pickerIndex + (event.key === "down" ? 1 : -1)));
+      cx.stop_propagation(); cx.notify(); return;
+    }
     if (this.form === "menu" && ["up", "down", "enter"].includes(event.key)) {
       if (event.key === "enter") this.chooseMenu(cx);
       else if (!this.busy && this.menuItems.length)
@@ -676,8 +769,9 @@ export default class Berbr extends View {
     if (!this.form && this.panelFocused() && event.keystroke === "cmd-k") {
       this.openJump(); cx.stop_propagation(); return;
     }
-    if (this.form === "jump" && ["up", "down"].includes(event.key)) {
-      this.jumpIndex = Math.max(0, Math.min(this.jumpMatches().length - 1, this.jumpIndex + (event.key === "down" ? 1 : -1)));
+    if (this.form === "jump" && ["up", "down", "enter"].includes(event.key)) {
+      if (event.key === "enter") this.chooseJump(cx);
+      else this.jumpIndex = Math.max(0, Math.min(this.jumpMatches().length - 1, this.jumpIndex + (event.key === "down" ? 1 : -1)));
       cx.stop_propagation(); cx.notify(); return;
     }
     if (this.replyFocused) {
@@ -713,7 +807,7 @@ export default class Berbr extends View {
     } else if (["right", "space", " "].includes(event.key) && this.chosen()) this.showDetails(this.chosen(), cx);
     else if (event.key === "/") this.inputs.search.focus();
     else if (event.key === "n") this.formOverlay("new");
-    else if (event.key === "r") this.refresh(cx);
+    else if (event.key === "r") this.refresh(cx, false, true);
     else if (event.key === "d") this.all = !this.all;
     else return;
     cx.stop_propagation(); cx.notify();
@@ -754,10 +848,11 @@ export default class Berbr extends View {
       .child(`${signal.ticket.target}${normalizeTicketState(signal.ticket.state) === "In review" ? " in review" : ""}`));
     if ((!signal.working || showMr) && signal.mrs.length) {
       const mr = signal.mrs[0], spec = mrPills(mr)[0];
-      hints.child(this.externalLink(t, `task-mr-${row.id}`, mr).min_w(0)
-        .child(div().flex_none().child(signal.mrKey))
-        .when(Boolean(spec), el => el.child(pill(t, {...spec, tooltip:`${spec.label} — open ${signal.mrKey} in GitLab`})))
-        .when(signal.mrs.length > 1, el => el.child(div().flex_none().text_color(t.dim).child(`+${signal.mrs.length - 1}`))));
+      hints.child(this.externalLink(t, `task-mr-${row.id}`, mr, [
+        div().flex_none().child(signal.mrKey),
+        spec && pill(t, {...spec, tooltip:`${spec.label} — open ${signal.mrKey} in GitLab`}),
+        signal.mrs.length > 1 && div().flex_none().text_color(t.dim).child(`+${signal.mrs.length - 1}`),
+      ]).min_w(0));
     }
     const hasSignal = Boolean(signal.attention || signal.ticket || signal.mrs.length);
     if (!hasSignal && signal.trees.length) hints.child(div().text_color(t.dim)
@@ -922,7 +1017,7 @@ export default class Berbr extends View {
     return group(buttons);
   }
 
-  externalLink(t, id, row) {
+  externalLink(t, id, row, content = []) {
     const mr = row.kind === "mr";
     const key = mr ? row.label?.match(/!\d+/)?.[0] ?? "MR" : row.target ?? "ticket";
     return h_flex().id(id).min_w(0).gap(4).items_center().text_color(t.muted).cursor_pointer()
@@ -932,7 +1027,10 @@ export default class Berbr extends View {
       .when(this.panelFocused() && this.selected === row.id, el => el.bg(t.selected))
       .on_mouse_down("right", (_event, cx) => {cx.stop_propagation(); this.openRowMenu(row, cx);})
       .on_click((_event, cx) => {cx.stop_propagation(); this.openUrl(row.url, cx, id);})
-      .when(this.busy && this.busyAction === id, el => el.child(icon("spinner", 11).text_color(t.dim).spin(900)));
+      // The spinner slot trails the content: reserved so nothing shifts, never a leading gap.
+      .children(content.filter(Boolean))
+      .child(div().size(11).flex_none().when(!(this.busy && this.busyAction === id), el => el.invisible())
+        .child(icon("spinner", 11).text_color(t.dim).when(this.busy && this.busyAction === id, el => el.spin(900))));
   }
 
   mrState(t, mr, historical = false, state = mr?.state?.toLowerCase()) {
@@ -955,11 +1053,11 @@ export default class Berbr extends View {
       : status === "blocked" ? this.attention(item.live) : status === "done" ? "finished" : "";
     return line.text_size(12).text_color(item.live ? t.muted : t.dim)
       .child(mark.flex_none().tooltip(program?.name || "Terminal").accessibility_label(program?.name || "Terminal"))
-      .child(div().flex_1().min_w(0).truncate().when(Boolean(activity), el => el.text_color(t.muted)).child(title))
-      .child(h_flex().flex_none().gap(4).items_center().text_size(11)
+      .child(div().flex_1().min_w(0).truncate().tooltip(title).when(Boolean(activity), el => el.text_color(t.muted)).child(title))
+      .child(h_flex().min_w(0).max_w("50%").gap(4).items_center().text_size(11)
         .text_color(["blocked", "done"].includes(status) ? t[status] : t.dim)
         .child(activity ? icon("spinner", 11).text_color(t.working).spin(900) : statusMark(t, status))
-        .when(Boolean(label), el => el.child(div().flex_none().tooltip(label).child(label))));
+        .when(Boolean(label), el => el.child(div().min_w(0).truncate().tooltip(label).child(label))));
   }
 
   detailRow(t, item) {
@@ -971,16 +1069,19 @@ export default class Berbr extends View {
       line.child(mark("git-branch"))
         .child(div().flex_1().min_w(0).truncate()
           .text_color(isMergedTree(item.row) || ["merged", "closed"].includes(item.mr?.state?.toLowerCase()) ? t.muted : t.foreground)
-          .child(item.row.label ?? item.row.tree ?? "Untitled"));
-      const right = h_flex().flex_none().gap(6).items_center();
-      if (item.loose && item.row.branch) right.child(div().flex_none()
+          .tooltip(item.row.label ?? item.row.tree ?? "Untitled").child(item.row.label ?? item.row.tree ?? "Untitled"));
+      const summary = [item.row.branch, item.row.body, item.mr?.label, ...mrPills(item.mr).map(spec => spec.label),
+        item.row.diff ? `+${item.row.diff.adds} −${item.row.diff.dels}` : ""].filter(Boolean).join(" · ");
+      const right = h_flex().min_w(0).max_w("35%").gap(6).items_center().overflow_hidden().tooltip(summary);
+      if (item.loose && item.row.branch) right.child(div().flex_1().min_w(0).truncate()
         .text_size(11).text_color(t.dim).tooltip(item.row.branch).child(item.row.branch));
       const state = this.treeState(t, item.row, {compact:true, hideMerged:Boolean(item.mr && !item.loose), hideChanges:!item.loose});
-      if (state) right.child(state);
-      if (item.mr && !item.loose) right.child(this.externalLink(t, `${item.id}/mr`, item.mr).flex_none()
-        .child(div().flex_none().text_size(12).child(item.mr.label?.match(/!\d+/)?.[0] ?? "MR"))
-        .child(this.mrState(t, item.mr, false, isMergedTree(item.row) ? "merged"
-          : item.row.mr_state ?? item.mr.state?.toLowerCase())));
+      if (state) right.child(state.min_w(0).overflow_hidden());
+      if (item.mr && !item.loose) right.child(this.externalLink(t, `${item.id}/mr`, item.mr, [
+        div().flex_none().text_size(12).child(item.mr.label?.match(/!\d+/)?.[0] ?? "MR"),
+        this.mrState(t, item.mr, false, isMergedTree(item.row) ? "merged"
+          : item.row.mr_state ?? item.mr.state?.toLowerCase()),
+      ]).min_w(0).overflow_hidden());
       else if (!item.loose) right.child(div().flex_none().text_size(11).text_color(t.dim).child("no MR"));
       const changes = treeMarks(item.row).changes;
       if (!item.loose && changes) right.child(div().flex_none().size(6).rounded(3).bg(t.working)
@@ -990,11 +1091,10 @@ export default class Berbr extends View {
       if (diff && (diff.adds > 0 || diff.dels > 0)) right.child(h_flex().flex_none().gap(4).text_size(11)
         .child(div().flex_none().text_color(t.done ?? t.dim).child(`+${diff.adds}`))
         .child(div().flex_none().text_color(t.blocked ?? t.dim).child(`−${diff.dels}`)));
-      right.children(this.treeActions(t, item.row, item.mr, item.id, {loose:item.loose, ticket:item.ticket}));
-      line.child(right);
+      line.child(right).children(this.treeActions(t, item.row, item.mr, item.id, {loose:item.loose, ticket:item.ticket}));
     } else if (item.type === "ticket") {
-      line.child(this.externalLink(t, `${item.id}/ticket`, item.row).flex_none().tooltip("Open in Jira")
-        .child(item.row.target ?? "Ticket"))
+      line.child(this.externalLink(t, `${item.id}/ticket`, item.row, [div().child(item.row.target ?? "Ticket")])
+        .flex_none().tooltip("Open in Jira"))
         .child(chip(t, normalizeTicketState(item.row.state)))
         .child(div().flex_1().min_w(0).truncate().child(ticketTitle(item.row)));
     } else if (item.type === "agent") {
@@ -1003,11 +1103,11 @@ export default class Berbr extends View {
       const iid = item.row.label?.match(/!\d+/)?.[0] ?? "MR";
       const title = item.row.label?.replace(/^\s*!\d+\s*/, "") ?? "";
       line.text_color(item.historical ? t.dim : t.foreground).child(mark("git-compare"))
-        .child(this.externalLink(t, `${item.id}/mr`, item.row).flex_1()
-          .text_color(item.historical ? t.dim : t.foreground)
-          .child(div().flex_none().child(iid))
-          .child(div().flex_1().min_w(0).truncate().child(title))
-          .child(this.mrState(t, item.row, item.historical)))
+        .child(this.externalLink(t, `${item.id}/mr`, item.row, [
+          div().flex_none().child(iid),
+          div().flex_1().min_w(0).truncate().child(title),
+          this.mrState(t, item.row, item.historical),
+        ]).flex_1().text_color(item.historical ? t.dim : t.foreground))
         .when(Boolean(item.tickets.length), el => el.child(div().max_w("35%").min_w(0).truncate()
           .text_size(11).text_color(t.dim).child(item.tickets.join(" · "))));
     } else if (item.type === "subtask") {
@@ -1028,11 +1128,11 @@ export default class Berbr extends View {
 
   ticketsLine(t, task, detail) {
     const line = h_flex().min_h(26).gap(8).items_center().flex_wrap().min_w(0);
-    const ticket = (row, closed = false) => this.externalLink(t, `${task.id}/${row.id}`, row)
-      .h(26).max_w("100%").text_color(closed ? t.dim : t.muted)
-      .child(div().text_size(12).child(row.target ?? row.label ?? "Ticket"))
-      .child(div().min_w(0).truncate().text_size(11).text_color(!closed && normalizeTicketState(row.state) === "In review" ? t.accent : t.dim)
-        .child(normalizeTicketState(row.state)));
+    const ticket = (row, closed = false) => this.externalLink(t, `${task.id}/${row.id}`, row, [
+      div().text_size(12).child(row.target ?? row.label ?? "Ticket"),
+      div().min_w(0).truncate().text_size(11).text_color(!closed && normalizeTicketState(row.state) === "In review" ? t.accent : t.dim)
+        .child(normalizeTicketState(row.state)),
+    ]).h(26).max_w("100%").text_color(closed ? t.dim : t.muted);
     line.children(detail.tickets.open.map(row => ticket(row)));
     if (!detail.tickets.open.length && !detail.tickets.closed.length)
       line.child(div().text_size(12).text_color(t.dim).child("No ticket"));
@@ -1045,6 +1145,8 @@ export default class Berbr extends View {
     }
     return line.child(iconButton(t, `${task.id}/add-ticket`, "plus", "Add ticket", () => this.formOverlay("ticket", {
       task:task.task, title:task.title ?? task.label,
+      tickets:[...detail.tickets.open, ...detail.tickets.closed].map(ticket => ticket.target),
+      trees:detail.trees.map(tree => tree.row),
     }), {size:20, disabled:this.busy}));
   }
 
@@ -1078,18 +1180,21 @@ export default class Berbr extends View {
           if (prompt) el.child(div().ml(12).border_l_1().border_color(t.border).child(this.waitingCard(t, prompt)));
         })));
     body.child(this.actionRows(t, items));
+    body.children(waiting.filter(prompt => !items.some(item => item.type === "agent" && item.live?.address === prompt.agent.address))
+      .map(prompt => this.waitingCard(t, prompt)));
     return this.expandedBlock(t, this.taskRow(t, task), body);
   }
 
   actionRows(t, items) {
-    const actions = h_flex().h(28).flex_none().gap(2).items_center().min_w(0);
+    const actions = h_flex().min_h(28).flex_none().gap(2).items_center().min_w(0).flex_wrap();
     for (const item of items.filter(item => item.type === "action")) {
       if (item.close) actions.child(div().flex_1());
       const pending = this.busy && this.busyAction === item.id;
       actions.child(this.innerRow(t, item).text_size(12).text_color(item.accent ? t.accent : t.muted)
         .hover(el => el.bg(t.hover).text_color(item.close ? t.blocked : t.foreground))
         .when(item.link, el => el.tooltip(item.label).hover(el => el.text_color(t.foreground).underline()))
-        .child(item.label).when(pending, el => el.child(icon("spinner", 11).text_color(t.dim).spin(900))));
+        .child(item.label).child(div().size(11).flex_none().when(!pending, el => el.invisible())
+          .child(icon("spinner", 11).text_color(t.dim).when(pending, el => el.spin(900)))));
     }
     return actions;
   }
@@ -1164,9 +1269,7 @@ export default class Berbr extends View {
       this.pendingProject = desired;
       this.switchProject(desired, cx);
     } else if (desired === this.project && !this.loading) this.pendingProject = null;
-    this.renderLive = this.liveState();
-    try { return this.renderPanel(cx); }
-    finally { this.renderLive = null; }
+    return this.withLive(() => this.renderPanel(cx));
   }
 
   renderPanel(cx) {
@@ -1227,7 +1330,7 @@ export default class Berbr extends View {
           .child(div().min_w(0).truncate().text_size(13).font_semibold().child(this.project ?? "Project"))
           .child(icon("chevron-down", 12).text_color(t.dim)))
         .child(div().flex_1())
-        .child(iconButton(t, "refresh", "refresh", "Refresh (r)", cx => this.refresh(cx), {disabled, spinning:this.loading}))
+        .child(iconButton(t, "refresh", "refresh", "Refresh (r)", cx => this.refresh(cx, false, true), {disabled, spinning:this.loading}))
         .child(iconButton(t, "new", "plus", "New task (n)", () => this.formOverlay("new"), {disabled})))
       .child(div().px(10).pt(8).pb(4).child(h_flex().h(30).px(8).gap(6).items_center()
         .rounded(6).bg(t.background).border_1().border_color(this.searchFocused ? t.accent : t.border)

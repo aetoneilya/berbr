@@ -2,7 +2,71 @@
 //! Keep the legacy client contract so CLI and TUI can use either backend.
 use super::{HerdrError, Result};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+
+type Answer = std::result::Result<Vec<Value>, String>;
+#[derive(Default)]
+struct Inventory {
+    spaces: Option<Answer>,
+    agents: Option<Answer>,
+}
+type Context = Arc<Mutex<Inventory>>;
+thread_local! { static CURRENT: RefCell<Option<Context>> = const { RefCell::new(None) }; }
+
+pub(crate) struct Operation {
+    previous: Option<Context>,
+}
+impl Drop for Operation {
+    fn drop(&mut self) {
+        CURRENT.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+pub(crate) fn operation() -> Operation {
+    let previous = CURRENT.with(|slot| {
+        let old = slot.borrow().clone();
+        if old.is_none() {
+            *slot.borrow_mut() = Some(Arc::default());
+        }
+        old
+    });
+    Operation { previous }
+}
+
+pub(crate) fn inherit<R: Send>(f: impl FnOnce() -> R + Send) -> impl FnOnce() -> R + Send {
+    let context = CURRENT.with(|slot| slot.borrow().clone());
+    move || {
+        let previous = CURRENT.with(|slot| slot.replace(context));
+        let _scope = Operation { previous };
+        f()
+    }
+}
+
+fn invalidate() {
+    CURRENT.with(|slot| {
+        if let Some(cache) = slot.borrow().as_ref() {
+            *cache.lock().unwrap_or_else(|e| e.into_inner()) = Inventory::default();
+        }
+    });
+}
+
+fn cached(agents: bool, fetch: impl FnOnce() -> Result<Vec<Value>>) -> Result<Vec<Value>> {
+    let context = CURRENT.with(|slot| slot.borrow().clone());
+    let Some(context) = context else {
+        return fetch();
+    };
+    let mut cache = context.lock().unwrap_or_else(|e| e.into_inner());
+    let value = if agents {
+        &mut cache.agents
+    } else {
+        &mut cache.spaces
+    };
+    value
+        .get_or_insert_with(|| fetch().map_err(|e| e.to_string()))
+        .clone()
+        .map_err(HerdrError::NonZeroExit)
+}
 
 pub(super) fn enabled() -> bool {
     enabled_from_env(
@@ -33,7 +97,20 @@ fn read(bin: &str, args: &[&str]) -> Result<Value> {
 }
 
 fn act(command: &str, args: Value) -> Result<Value> {
-    read("herdr-app", &["do", command, &args.to_string()])
+    let result = read("herdr-app", &["do", command, &args.to_string()]);
+    if matches!(
+        command,
+        "space.new"
+            | "tab.new"
+            | "pane.split"
+            | "space.rename"
+            | "tab.rename"
+            | "space.close"
+            | "tab.close"
+    ) {
+        invalidate();
+    }
+    result
 }
 
 fn text<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -41,6 +118,10 @@ fn text<'a>(v: &'a Value, key: &str) -> &'a str {
 }
 
 fn spaces() -> Result<Vec<Value>> {
+    cached(false, read_spaces)
+}
+
+fn read_spaces() -> Result<Vec<Value>> {
     let state = read("herdr-app", &["ls"])?;
     let spaces = state
         .get("spaces")
@@ -63,22 +144,36 @@ fn terminals(tab: &Value) -> impl Iterator<Item = &Value> {
 }
 
 fn agents() -> Result<Vec<Value>> {
-    let mut agents = Vec::new();
-    for space in spaces()? {
-        for tab in tabs(&space) {
-            for term in terminals(tab).filter(|t| t["app"].as_str().is_some()) {
-                let address = text(term, "terminal");
-                let detail = read("hc", &["get", address, "--json"])?;
-                agents.push(json!({
-                    "name": detail["labels"]["berbr.name"].as_str().or(detail["name"].as_str()),
-                    "agent_status": term["status"], "cwd": detail["foreground"]["cwd"].as_str().or(detail["cwd"].as_str()),
-                    "pane_id": address, "tab_id": tab["id"], "workspace_id": space["id"],
-                    "agent": term["app"], "agent_session": null
-                }));
-            }
-        }
-    }
-    Ok(agents)
+    let spaces = spaces()?;
+    cached(true, || {
+        let jobs: Vec<_> = spaces
+            .iter()
+            .flat_map(|space| {
+                tabs(space).flat_map(move |tab| {
+                    terminals(tab)
+                        .filter(|t| t["app"].as_str().is_some())
+                        .map(move |term| (space, tab, term))
+                })
+            })
+            .collect();
+        super::super::parallel(&jobs, 8, |(space, tab, term)| {
+            let address = text(term, "terminal");
+            let detail = read("hc", &["get", address, "--json"])?;
+            Ok(json!({
+                "name": detail["labels"]["berbr.name"].as_str().or(detail["name"].as_str()),
+                "agent_status": term["status"], "cwd": detail["foreground"]["cwd"].as_str().or(detail["cwd"].as_str()),
+                "pane_id": address, "tab_id": tab["id"], "workspace_id": space["id"],
+                "agent": term["app"], "agent_session": null
+            }))
+        }).into_iter().map(|result| result.unwrap_or_else(|| Err(HerdrError::NonZeroExit("hc detail read panicked".into())))).collect()
+    })
+}
+
+pub(super) fn focus_known(space: &str, tab: &str, terminal: &str) -> Result<()> {
+    act("space.select", json!({"id":space}))?;
+    act("tab.select", json!({"id":tab}))?;
+    act("agent.focus", json!({"terminal":terminal}))?;
+    Ok(())
 }
 
 fn agent(target: &str) -> Result<Value> {
@@ -202,11 +297,15 @@ pub(super) fn output(args: &[&str]) -> Result<Vec<u8>> {
                 "export BERBR_BACKEND=herdr-app BERBR_CONFIG={}; {command}",
                 super::shell_quote(&crate::config::config_path().to_string_lossy())
             );
-            output_of("hc", &["send", address, &command])?;
+            let sent = output_of("hc", &["send", address, &command]);
+            invalidate();
+            sent?;
             json!({})
         }
         ["agent", "rename", address, name] => {
-            output_of("hc", &["label", address, &format!("berbr.name={name}")])?;
+            let renamed = output_of("hc", &["label", address, &format!("berbr.name={name}")]);
+            invalidate();
+            renamed?;
             json!({})
         }
         ["agent", "get", target] => json!({"agent": agent(target)?}),
@@ -265,5 +364,41 @@ mod tests {
                 "backend={backend:?}, socket={socket:?}, HERDR_ENV={herdr_env:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn operation_inventory_is_shared_with_workers_invalidated_and_not_reused_later() {
+        let calls = AtomicUsize::new(0);
+        {
+            let _scope = operation();
+            let fetch = || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![json!({"id":"demo"})])
+            };
+            cached(false, fetch).unwrap();
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(inherit(|| cached(false, fetch).unwrap()))
+                    .join()
+                    .unwrap();
+            });
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            invalidate();
+            cached(false, fetch).unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+        let _scope = operation();
+        cached(false, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        })
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }

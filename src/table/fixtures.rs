@@ -81,7 +81,7 @@ pub fn mr(iid: u64, branch: &str, title: &str, state: &str) -> Mr {
 pub fn tree(name: &str, branch: &str) -> Tree {
     Tree {
         repo: PathBuf::from("/r"),
-        project: None,
+        project: Some("demo/service".into()),
         wt: Worktree {
             path: PathBuf::from(ROOT).join(name),
             branch: Some(branch.to_string()),
@@ -123,6 +123,7 @@ pub fn workspace(id: &str, label: &str) -> herdr::Workspace {
 /// Inputs as from a build where Jira and GitLab both answered.
 pub fn inputs(tasks: Vec<Task>, tickets: Vec<Ticket>, mrs: Vec<Mr>, trees: Vec<Tree>) -> Inputs {
     Inputs {
+        mains: vec!["/r".into()],
         tasks,
         tickets: tickets.into_iter().map(|t| (t.key.clone(), t)).collect(),
         mrs,

@@ -5,12 +5,12 @@ import { registerHooks } from "node:module";
 import { state, theme } from "./support/runtime.mjs";
 
 registerHooks({resolve(specifier, context, next) {
-  return ["gpui-kit", "gpui-base", "herdr"].includes(specifier)
+  return ["gpui-kit", "gpui-base", "herdr", "fs/promises"].includes(specifier)
     ? {url:new URL("./support/runtime.mjs", import.meta.url).href, shortCircuit:true}
     : next(specifier, context);
 }});
 const {default:Berbr} = await import("../main.js");
-const {pill} = await import("../ui.js");
+const {pill, button} = await import("../ui.js");
 const snapshot = JSON.parse(await readFile(new URL("../fixtures/sample-snapshot.json", import.meta.url)));
 const storage = new Map();
 globalThis.localStorage = {getItem:key => storage.get(key) ?? null, setItem:(key, value) => storage.set(key, value)};
@@ -20,7 +20,7 @@ function setup({data = snapshot, props = {}, saved = null, collapsed = null, liv
   if (saved) storage.set("berbr.expanded", JSON.stringify(saved));
   if (collapsed) storage.set("berbr.collapsed", JSON.stringify(collapsed));
   Object.assign(state, {focused:focus, props, spaces:liveSpaces, agents:[], panes:[], shared:new Map(), calls:[], overlays:[], notices:[], execs:[], execResult:null,
-    reads:[], readResult:null, readError:null, watches:[], watchers:[], hcCalls:[], hcResult:null, hcError:null, hcHandler:null, files:null, writes:[], writeError:null, writeResult:null});
+    existsCalls:[], existsError:null, reads:[], readResult:null, readError:null, watches:[], watchers:[], hcCalls:[], hcResult:null, hcError:null, hcHandler:null, files:null, writes:[], writeError:null, writeResult:null});
   const jobs = [], timers = [];
   const handle = {focused:true, focus() {this.focused = true;}, is_focused() {return this.focused;}};
   const cx = {notify() {}, stop_propagation() {}, focus_handle:() => handle,
@@ -255,14 +255,14 @@ test("worktree hover actions reserve width at the right edge and keep Review in 
   const row = {kind:"tree", id:"tree", tree:"Demo", task:"Demo", diff:{adds:8, dels:2}, children:[mr]};
   const item = {id:"detail-tree", type:"tree", row, mr};
   view.selected = null;
-  const hidden = byId(view.detailRow(theme(), item), item.id).nodes.at(-1);
+  const hidden = byId(view.detailRow(theme(), item), item.id);
   const actions = hidden.nodes.at(-1);
   assert.ok(actions.attributes.invisible);
   assert.deepEqual(actions.nodes.map(node => node.attributes.tooltip[0]), ["Resume agent", "Remove worktree"]);
-  assert.ok(hidden.nodes.indexOf(byId(hidden, `${item.id}/mr`)) < hidden.nodes.indexOf(actions));
+  assert.ok(hidden.nodes.indexOf(hidden.nodes.find(node => byId(node, `${item.id}/mr`))) < hidden.nodes.indexOf(actions));
   assert.equal(byId(hidden, `${item.id}/review`), undefined);
   view.hovered = item.id;
-  const shown = byId(view.detailRow(theme(), item), item.id).nodes.at(-1);
+  const shown = byId(view.detailRow(theme(), item), item.id);
   assert.deepEqual(shown.nodes.map(node => node.attributes.id), hidden.nodes.map(node => node.attributes.id));
   assert.deepEqual(shown.nodes.at(-1).nodes.map(node => node.attributes.size), actions.nodes.map(node => node.attributes.size));
   assert.equal(shown.nodes.at(-1).attributes.invisible, undefined);
@@ -553,10 +553,10 @@ test("close acceptance card shows dirty loss, live space, proof link and CLI err
   const {view, cx, jobs} = setup({props:{form:"done", task:task.task, label:task.title, row:task, overlay:"accept"},
     liveSpaces:[{id:"live"}]});
   let rendered = view.render(cx);
-  assert.ok(text(rendered).includes("checkout — loses +2 uncommitted"));
+  assert.ok(text(rendered).includes("checkout — WARNING: deletes 2 uncommitted file(s)"));
   assert.ok(text(rendered).includes("Closes the Herdr space"));
   assert.ok(!text(rendered).includes("Jira Tickets assigned"));
-  const dirty = nodes(rendered).find(node => text(node).includes("checkout — loses +2 uncommitted"));
+  const dirty = nodes(rendered).find(node => text(node).includes("checkout — WARNING: deletes 2 uncommitted file(s)"));
   assert.ok(dirty);
   click(byId(rendered, "close-proof"), cx);
   await jobs.shift()(cx);
@@ -800,7 +800,7 @@ test("Not in a task gives a second-line reason; Make task prefills both loose an
     view.taskClick(row, cx);
     const rendered = view.render(cx);
     const action = byId(rendered, `${row.id}/loose/action/make-task`);
-    assert.equal(text(action), "Make task");
+    assert.ok(action.nodes.includes("Make task"));
     click(action, cx);
     const props = state.overlays.at(-1).props;
     assert.equal(props.form, "new");
@@ -921,8 +921,8 @@ test("merged worktrees only navigate on click and Enter; Resume and Remove remai
   assert.equal(jobs.length, 0);
 });
 
-test("remove confirmation checks current task names, runs done without force and closes on success", async () => {
-  const tree = {kind:"tree", tree:"branch"};
+test("remove confirmation uses an explicit worktree target and closes on success", async () => {
+  const tree = {kind:"tree", tree:"branch", cwd:"/home/dev/demo/worktrees/branch", repo:"/home/dev/demo"};
   const mr = {kind:"mr", label:"!42 Title", state:"merged"};
   const {view, cx, jobs} = setup({props:{form:"remove-tree", tree, mr, rows:[], overlay:"confirm"}});
   const args = [];
@@ -934,50 +934,33 @@ test("remove confirmation checks current task names, runs done without force and
   click(byId(rendered, "remove-tree"), cx);
   assert.equal(view.busy, true);
   await jobs.shift()(cx);
-  assert.deepEqual(args, [["app-snapshot"], ["done", "branch", "--yes"]]);
+  assert.deepEqual(args, [["done", "--tree", tree.cwd, "--yes", "--repo", tree.repo]]);
   assert.ok(args.every(values => !values.includes("--force")));
   assert.equal(view.busy, false);
   assert.ok(state.calls.some(([command, id]) => command === "closeOverlay" && id === "confirm"));
 });
 
-test("remove confirmation blocks known and fresh task-name collisions", async () => {
-  const error = "A task has the same name; remove this worktree from the terminal: berbr done --merged";
-  for (const cached of [true, false]) {
-    const rows = [{kind:"task", task:"different", title:" BRANCH ", done:false}];
-    const {view, cx, jobs} = setup({props:{form:"remove-tree", tree:{tree:"branch"}, rows:cached ? rows : []}});
+test("task IDs, titles and ticket aliases cannot change a removal target", async () => {
+  for (const row of [{task:"branch"}, {task:"demo-0", title:"branch"}, {task:"demo-0", children:[{kind:"ticket", target:"branch"}]}]) {
+    const {view, cx, jobs} = setup({props:{form:"remove-tree", tree:{tree:"branch"}, rows:[{kind:"task", ...row}]}});
     const args = [];
-    view.cli = async values => {args.push(values); return JSON.stringify({rows});};
-    click(byId(view.render(cx), "remove-tree"), cx);
-    if (!cached) await jobs.shift()(cx);
-    assert.equal(view.error, error);
-    assert.ok(text(view.render(cx)).includes(error));
-    assert.equal(view.busy, false);
-    assert.deepEqual(args, cached ? [] : [["app-snapshot"]]);
-    assert.equal(state.calls.length, 0);
+    view.cli = async values => {args.push(values); return "Removed";};
+    view.submitRemoveTree(cx);
+    await jobs.shift()(cx);
+    assert.deepEqual(args, [["done", "--tree", "branch", "--yes"]]);
+    assert.equal(view.error, null);
   }
 });
 
-test("remove confirmation fails closed on unavailable snapshots and displays CLI errors", async () => {
-  for (const failure of ["snapshot", "invalid", "done"]) {
-    const {view, cx, jobs} = setup({props:{form:"remove-tree", tree:{tree:"branch"}, rows:[]}});
-    const args = [];
-    view.cli = async values => {
-      args.push(values);
-      if (values[0] === "app-snapshot") {
-        if (failure === "snapshot") throw new Error("Snapshot unavailable");
-        return JSON.stringify(failure === "invalid" ? {} : {rows:[]});
-      }
-      throw new Error("Worktree has uncommitted changes");
-    };
-    view.submitRemoveTree(cx);
-    await jobs.shift()(cx);
-    assert.equal(view.busy, false);
-    assert.equal(view.busyAction, null);
-    assert.ok(view.error);
-    assert.ok(text(view.render(cx)).includes(view.error));
-    assert.equal(args.length, failure === "done" ? 2 : 1);
-    assert.equal(state.calls.length, 0);
-  }
+test("remove confirmation displays CLI blockers and retains the form", async () => {
+  const {view, cx, jobs} = setup({props:{form:"remove-tree", tree:{tree:"branch"}, rows:[]}});
+  view.cli = async () => { throw new Error("Worktree has uncommitted changes"); };
+  view.submitRemoveTree(cx);
+  await jobs.shift()(cx);
+  assert.equal(view.busy, false);
+  assert.equal(view.busyAction, null);
+  assert.ok(text(view.render(cx)).includes("Worktree has uncommitted changes"));
+  assert.equal(state.calls.length, 0);
 });
 
 test("Cleanup expands without starting work and offers removal on its inner worktree rows", () => {
@@ -1252,7 +1235,7 @@ test("worktree state is visible in task details, collapsed loose reasons and loo
   }
   assert.equal(line.nodes[1].attributes.min_w[0], 0);
   assert.ok(line.nodes[1].attributes.flex_1);
-  assert.ok(line.nodes[2].attributes.flex_none);
+  assert.equal(line.nodes[2].attributes.max_w[0], "35%");
   const dot = nodes(line).find(node => node.attributes.tooltip?.[0] === "1 uncommitted file");
   assert.equal(dot.attributes.size[0], 6);
   assert.equal(dot.attributes.bg[0], "working");
@@ -1318,7 +1301,8 @@ test("note window loads selectable markdown and wires title bar controls and Esc
   assert.ok(text(view.render(cx)).includes("Loading note…"));
   state.readResult = "---\ntitle: Hidden\n---\n# Visible\n\n[[Page|Link]]\n![[image.png]]";
   await jobs.shift()(cx);
-  assert.deepEqual(state.reads, [path, "/notes/Page.md"]);
+  assert.deepEqual(state.reads, [path]);
+  assert.deepEqual(state.existsCalls, ["/notes/Page.md"]);
   let rendered = view.render(cx);
   const markdown = nodes(rendered).find(node => node.attributes.selectable);
   assert.equal(text(markdown), "Visible");
@@ -1428,7 +1412,8 @@ const backendPlan = overrides => ({kind:"task", name:"Demo", blockers:[],
 test("close card waits for backend dry-run and uses its removals, keep list, tickets and blockers", async () => {
   const {view, cx, jobs} = setup({props:{form:"done", task:"Demo", row:{children:[]}}, keepJobs:true});
   const args = [];
-  view.cli = async values => {args.push(values); return JSON.stringify(backendPlan({blockers:["MR !7 is open"]}));};
+  view.cli = async values => {args.push(values); return JSON.stringify(backendPlan({blockers:["MR !7 is open"],
+    remove:[...backendPlan().remove, {tree:"dirty-open", path:"/home/dev/demo/dirty-open", uncommitted:3, unpushed:0}]}));};
   let rendered = view.render(cx);
   assert.ok(text(rendered).includes("Checking close plan…"));
   assert.ok(text(rendered).includes("spinner.svg"));
@@ -1439,6 +1424,7 @@ test("close card waits for backend dry-run and uses its removals, keep list, tic
   rendered = view.render(cx);
   for (const value of ["MR !7 is open", "/home/dev/demo/clean", "dirty — uncommitted changes", "DEMO-12", "DEMO-13"])
     assert.ok(text(rendered).includes(value), value);
+  assert.ok(text(rendered).includes("dirty-open · /home/dev/demo/dirty-open — WARNING: deletes 3 uncommitted file(s)"));
   assert.equal(byId(rendered, "done").attributes.opacity[0], 0.4);
   click(byId(rendered, "done"), cx);
   assert.equal(jobs.length, 0);
@@ -2210,7 +2196,7 @@ test("jumping to a subtask reveals its row inside the containing task without op
   assert.deepEqual(state.execs, []);
 });
 
-test("worktree MR numbers, flags and diffs stay fixed while only the worktree name truncates", () => {
+test("worktree metadata has a bounded rail and full tooltip while action slots remain fixed", () => {
   const {view} = setup({data:{rows:[]}});
   for (const [state, fields, flag] of [["opened", {ci:"running"}, "CI running"],
     ["opened", {ready:true}, "ready to merge"], ["merged", {}, "merged"]]) {
@@ -2228,10 +2214,12 @@ test("worktree MR numbers, flags and diffs stay fixed while only the worktree na
     assert.ok(flagText.attributes.flex_none);
     assert.equal(flagText.attributes.truncate, undefined);
     assert.equal(flagText.attributes.w, undefined);
-    assert.ok(right.attributes.flex_none);
-    assert.ok(link.attributes.flex_none);
-    assert.ok(nodes(right).every(node => !node.attributes.truncate && !node.attributes.flex_1));
-    assert.equal(right.attributes.max_w, undefined);
+    assert.equal(right.attributes.min_w[0], 0);
+    assert.equal(right.attributes.max_w[0], "35%");
+    assert.ok(right.attributes.overflow_hidden);
+    assert.ok(link.attributes.overflow_hidden);
+    assert.ok(right.attributes.tooltip[0].includes(flag));
+    assert.ok(line.nodes.at(-1).attributes.flex_none);
     assert.ok(name.attributes.truncate);
     assert.equal(name.attributes.min_w[0], 0);
     assert.ok(name.attributes.flex_1);
@@ -2262,17 +2250,17 @@ test("Open MRs and History keep iid and state fixed while the separate title tru
   }
 });
 
-test("agent status stays fixed without a width cap while the name truncates", () => {
+test("agent name and status truncate within their budgets with full tooltips", () => {
   const {view} = setup({data:{rows:[]}});
   for (const [status, label] of [["blocked", "Waiting for you"], ["done", "finished"], [null, "stopped"]]) {
     const live = status ? {address:"demo", status, title:"Demo agent with a long name"} : null;
     const rendered = view.detailRow(theme(), {id:"agent-fixed", type:"agent", row:{label:"Demo stopped agent"}, live, status});
     const line = byId(rendered, "agent-fixed"), name = line.nodes[1], right = line.nodes[2];
     const statusText = right.nodes.find(node => text(node) === label);
-    assert.ok(right.attributes.flex_none);
-    assert.equal(right.attributes.max_w, undefined);
-    assert.ok(statusText.attributes.flex_none);
-    assert.equal(statusText.attributes.truncate, undefined);
+    assert.equal(right.attributes.max_w[0], "50%");
+    assert.equal(right.attributes.min_w[0], 0);
+    assert.ok(statusText.attributes.truncate);
+    assert.equal(statusText.attributes.tooltip[0], label);
     assert.ok(name.attributes.flex_1);
     assert.equal(name.attributes.min_w[0], 0);
     assert.ok(name.attributes.truncate);
@@ -2536,4 +2524,235 @@ test("tree confirmation states known blockers and that pushed unmerged commits m
   assert.ok(rendered.includes("Removal will be refused: the MR is open"));
   assert.ok(rendered.includes("Uncommitted files are never discarded here"));
   assert.ok(rendered.includes("Unmerged commits already pushed to origin can be removed locally"));
+});
+
+// Regression scenarios adapted from the synthetic visual/logic audits.
+test("V06: expanding a parent preserves descendant questions in both render and keyboard rows", () => {
+  const agent = {id:"child-agent", kind:"agent", terminal:"a"};
+  const child = {id:"child", kind:"task", task:"Child", children:[agent]};
+  const parent = {id:"parent", kind:"task", task:"Parent", children:[child]};
+  const {view, cx} = setup({data:{rows:[parent]}});
+  state.agents = [{address:"a", status:"blocked", seq:1, title:"Child worker"}];
+  view.blockedReasons.set("a", {reason:{kind:"question", detail:"Continue?"}, question:"Continue?", choices:[{key:"1", label:"Yes"}]});
+  for (const expanded of [null, parent.id]) {
+    view.setExpanded(expanded, cx);
+    assert.ok(text(view.render(cx)).includes("Continue?"));
+    assert.equal(view.rows().filter(row => row.kind === "waiting").length, 1);
+  }
+  view.subtasks.add(parent.id);
+  assert.ok(text(view.render(cx)).includes("Continue?"));
+  assert.equal(view.rows().filter(row => row.kind === "waiting").length, 1);
+});
+
+test("V07: unblocking during reply verification clears focus immediately and in finally", async () => {
+  const task = {id:"task", kind:"task", task:"Demo", children:[{id:"agent", kind:"agent", terminal:"a"}]};
+  const {view, cx, jobs, key} = setup({data:{rows:[task]}});
+  state.agents = [{address:"a", status:"blocked", seq:1}];
+  const entry = {seq:1, question:"Continue?", msg:"answer: Continue?", choices:[], reason:{kind:"question"}};
+  view.blockedReasons.set("a", entry);
+  const item = view.waitingItems(task)[0];
+  view.replyTo(item, cx); entry.input.set_value("Continue"); entry.input.emit("focus", cx);
+  let resume, started;
+  const sleeping = new Promise(resolve => {started = resolve;});
+  cx.sleep = () => new Promise(resolve => {resume = resolve; started();});
+  state.hcHandler = async args => ({code:0, stdout:args[0] === "get" ? JSON.stringify({status:{state:"working"}}) : ""});
+  view.answerAgent(item, "Continue", cx, true);
+  const job = jobs.shift()(cx); await sleeping;
+  state.agents = [{address:"a", status:"working", seq:2}];
+  view.syncBlocked(view.rows(), cx);
+  assert.equal(view.blockedReasons.has("a"), false);
+  assert.equal(view.replyFocused, null);
+  resume(); await job;
+  assert.equal(entry.busy, false);
+  assert.ok(!nodes(view.render(cx)).some(node => node.input === entry.input));
+  key("n");
+  assert.equal(state.overlays.at(-1).props.form, "new");
+});
+
+test("logic 22: Existing Jira requires a valid nonempty key before creating anything", () => {
+  for (const ticket of ["", "  ", "DEMO", "demo-1", "DEMO-1 extra"]) {
+    const {view, cx, jobs} = setup({props:{form:"new", project:"demo"}});
+    view.values.title = "Named task"; view.ticketMode = "existing"; view.values.ticket = ticket;
+    view.submitNew(cx);
+    assert.match(view.error, /valid Jira ticket key/);
+    assert.equal(jobs.length, 0);
+    assert.deepEqual(state.execs, []);
+  }
+});
+
+test("V10: linked Jira offers a name or existing worktree and passes the explicit backend flag", async () => {
+  for (const existing of [false, true]) {
+    const tree = {kind:"tree", id:"tree", tree:"demo-checkout", cwd:"/home/dev/demo"};
+    const {view, cx, jobs} = setup({props:{form:"ticket", task:"Demo", tickets:["DEMO-1"], trees:[tree], prefill:{ticket:"DEMO-1"}}});
+    assert.ok(nodes(view.render(cx)).some(node => node.input === view.inputs.name));
+    view.submitTicket(cx, true);
+    assert.match(view.error, /worktree name/); assert.equal(jobs.length, 0);
+    if (existing) click(byId(view.render(cx), "ticket-tree-tree"), cx);
+    else view.values.name = "second-checkout";
+    const calls = []; view.cli = async args => {calls.push(args); return "Added";};
+    view.submitTicket(cx, true); await jobs.shift()(cx);
+    assert.deepEqual(calls, [["add", "Demo", "DEMO-1", existing ? "--in" : "--name", existing ? tree.tree : "second-checkout"]]);
+  }
+});
+
+test("V01/V02/V03: long branches and questions have budgets and tooltips, and action strips wrap", () => {
+  const {view} = setup();
+  const branch = "feature/" + "Ж".repeat(150);
+  const row = {kind:"tree", id:"tree", tree:"checkout", branch, body:"/home/dev/demo\n +12 ↑345 quiet 999d"};
+  const line = byId(view.detailRow(theme(), {id:"loose-tree", type:"tree", row, loose:true}), "loose-tree");
+  const rail = line.nodes[2], label = nodes(rail).find(node => node.nodes.includes(branch));
+  assert.equal(rail.attributes.max_w[0], "35%");
+  assert.ok(rail.attributes.overflow_hidden);
+  assert.ok(label.attributes.truncate); assert.equal(label.attributes.tooltip[0], branch);
+  assert.ok(line.nodes.at(-1).attributes.flex_none);
+  const detail = "Проверьте разрешение на изменение длинного файла ".repeat(6);
+  view.blockedReasons.set("a", {reason:{kind:"question", detail}});
+  const agent = byId(view.detailRow(theme(), {id:"agent", type:"agent", row:{label:"Исполнитель"},
+    live:{address:"a", status:"blocked", title:"Работа"}, status:"blocked"}), "agent");
+  assert.equal(agent.nodes[2].attributes.max_w[0], "50%");
+  assert.equal(agent.nodes[2].nodes.at(-1).attributes.tooltip[0], `Asks: ${detail}`);
+  assert.ok(agent.nodes[2].nodes.at(-1).attributes.truncate);
+  const actions = view.actionRows(theme(), view.looseItems({id:"ticket", kind:"ticket", target:"DEMO-1", state:"New"}));
+  assert.ok(actions.attributes.flex_wrap);
+  assert.equal(actions.attributes.h, undefined);
+});
+
+test("V04: confirm and segmented controls are tab stops with Enter/Space activation; Escape cancels", async () => {
+  for (const key of ["enter", "space", " "]) {
+    const {view, cx, jobs} = setup({props:{form:"stop-agent", terminal:"demo", overlay:"stop"}});
+    const confirm = byId(view.render(cx), "stop-agent");
+    assert.equal(confirm.attributes.tab_index[0], 0);
+    assert.equal(confirm.attributes.tab_stop[0], true);
+    confirm.attributes.on_key_down[0]({key}, cx);
+    assert.equal(jobs.length, 1);
+    const disabled = byId(view.render(cx), "stop-agent");
+    assert.equal(disabled.attributes.tab_stop[0], false);
+    disabled.attributes.on_key_down[0]({key}, cx);
+    assert.equal(jobs.length, 1);
+    await jobs.shift()(cx);
+  }
+  for (const [form, id] of [["done", "done"], ["remove-tree", "remove-tree"], ["remove-merged", "confirm-remove-merged"]]) {
+    const {view, cx, jobs} = setup({props:{form, task:"Demo", row:{kind:"task", task:"Demo", children:[]},
+      tree:{kind:"tree", tree:"demo"}, trees:[]}});
+    view.busy = true;
+    const confirm = byId(view.render(cx), id);
+    assert.equal(confirm.attributes.tab_index[0], 0);
+    assert.equal(confirm.attributes.tab_stop[0], false);
+    confirm.attributes.on_key_down[0]({key:"enter"}, cx);
+    assert.equal(jobs.length, 0);
+  }
+  const {view, cx, key} = setup({props:{form:"new", overlay:"new"}});
+  let root = view.render(cx);
+  for (const [id, expected] of [["agent-claude", "claude"], ["jira-existing", "existing"]]) {
+    const control = byId(root, id);
+    assert.equal(control.attributes.tab_index[0], 0);
+    control.attributes.on_key_down[0]({key:"space"}, cx);
+    assert.equal(id.startsWith("agent") ? view.agent : view.ticketMode, expected);
+    root = view.render(cx);
+  }
+  byId(root, "advanced").attributes.on_key_down[0]({key:"enter"}, cx);
+  assert.equal(view.advanced, true);
+  key("escape"); assert.deepEqual(state.calls.at(-1), ["closeOverlay", "new"]);
+});
+
+test("V08/V09: Jump, Projects and Attach have bounded scroll bodies and keyboard selection", async () => {
+  const rows = Array.from({length:50}, (_, index) => ({kind:"task", id:`task-${index}`, name:`Demo ${index}`, task:`Task ${index}`, title:`Задача ${index}`}));
+  for (const [form, listId] of [["jump", "jump-results"], ["projects", "project-results"], ["attach-task", "attach-results"]]) {
+    const {view, cx, jobs, key} = setup({props:{form, projects:rows, tasks:rows, snapshot:{rows}, ticket:"DEMO-1", overlay:"picker"}});
+    let root = view.render(cx), list = byId(root, listId);
+    assert.ok(list.attributes.flex_1); assert.equal(list.attributes.min_h[0], 0);
+    assert.ok(list.attributes.overflow_y_scrollbar);
+    for (let index = 0; index < 40; index++) key("down");
+    root = view.render(cx); list = byId(root, listId);
+    assert.ok(list.nodes[0].attributes.bg, "keyboard selection is the first rendered result");
+    if (form === "projects") {
+      key("enter"); assert.equal(state.shared.get("berbr.project"), rows[40].name);
+    } else if (form === "attach-task") {
+      const calls = []; view.cli = async args => {calls.push(args); return "Attached";};
+      key("enter"); await jobs.shift()(cx);
+      assert.deepEqual(calls, [["attach", "DEMO-1", rows[40].task]]);
+    } else {
+      const chosen = view.jumpMatches()[view.jumpIndex];
+      key("enter"); assert.equal(state.shared.get("berbr.jumpTarget").row, chosen.row.id);
+    }
+  }
+});
+
+test("V11: text buttons and MR links keep an equal spinner slot while idle or busy", () => {
+  const idleButton = button(theme(), "create", "Create task", () => {}, "primary");
+  const busyButton = button(theme(), "create", "Create task", () => {}, "primary", true, true);
+  assert.equal(idleButton.nodes.length, busyButton.nodes.length);
+  assert.equal(idleButton.nodes.at(-1).attributes.size[0], 11);
+  assert.equal(busyButton.nodes.at(-1).attributes.size[0], 11);
+  const {view} = setup();
+  const mr = {kind:"mr", id:"mr", label:"!1", state:"opened"};
+  const idle = view.externalLink(theme(), "link", mr).child("!1");
+  view.busy = true; view.busyAction = "link";
+  const busy = view.externalLink(theme(), "link", mr).child("!1");
+  assert.equal(idle.nodes.length, busy.nodes.length);
+  assert.equal(idle.nodes[0].attributes.size[0], 11);
+  assert.equal(busy.nodes[0].attributes.size[0], 11);
+  assert.ok(idle.nodes[0].attributes.invisible);
+  assert.equal(busy.nodes[0].attributes.invisible, undefined);
+});
+
+test("M2: blocked prompt workers and queue are bounded, prioritize expanded work and reuse unchanged seq", async () => {
+  const rows = Array.from({length:300}, (_, index) => ({kind:"task", id:`task-${index}`, title:`Demo ${index}`,
+    children:[{kind:"agent", terminal:`agent-${index}`}]}));
+  const {view, cx, jobs} = setup({data:{rows}});
+  state.agents = rows.map((_, index) => ({address:`agent-${index}`, status:"blocked", seq:1}));
+  view.expanded = "task-299"; view.selected = null;
+  let active = 0, peak = 0;
+  state.hcHandler = async args => {
+    active++; peak = Math.max(peak, active);
+    assert.ok(view.promptQueue.length <= 64);
+    await Promise.resolve(); active--;
+    return {code:0, stdout:args[0] === "get" ? JSON.stringify({status:{state:"blocked", msg:"Continue?"}}) : "1. Yes\n2. No", stderr:""};
+  };
+  view.syncBlocked(view.liveState().rows, cx);
+  assert.equal(jobs.length, 4); assert.ok(view.promptQueue.length <= 64);
+  await Promise.all(jobs.splice(0).map(job => job(cx)));
+  assert.equal(peak, 8); // Four prompt workers, two parallel hc requests each.
+  assert.equal(state.hcCalls.length, 600);
+  assert.equal(state.hcCalls[0][1], "agent-299");
+  view.didOnline = true; view.cli = async () => JSON.stringify(view.data);
+  view.refresh(cx, true);
+  await Promise.all(jobs.splice(0).map(job => job(cx)));
+  assert.equal(state.hcCalls.length, 600);
+  const entry = view.blockedReasons.get("agent-299"); entry.readAt -= 300001;
+  view.syncBlocked(view.liveState().rows, cx);
+  await Promise.all(jobs.splice(0).map(job => job(cx)));
+  assert.equal(state.hcCalls.length, 602);
+  view.refresh(cx, true, true);
+  await Promise.all(jobs.splice(0).map(job => job(cx)));
+  assert.equal(state.hcCalls.length, 1202);
+});
+
+test("M4: note wikilinks use existence checks, unchanged folder refresh skips them and manual reload retries", async () => {
+  const path = "/home/dev/notes/main.md";
+  const {view, cx, jobs} = setup({props:{form:"note", path}});
+  state.files = new Map([[path, "[[page]] [[missing]] [[../outside]]"], ["/home/dev/notes/page.md", "x".repeat(256 * 1024)]]);
+  await jobs.shift()(cx);
+  assert.deepEqual(state.reads, [path]);
+  assert.deepEqual(state.existsCalls, ["/home/dev/notes/page.md", "/home/dev/notes/missing.md"]);
+  assert.ok(view.note.existing.has("/home/dev/notes/page.md"));
+  const watch = jobs.shift()(cx); await Promise.resolve();
+  state.watchers.shift().resolve(["/home/dev/notes"]); await Promise.resolve(); await Promise.resolve();
+  await jobs.shift()(cx);
+  assert.equal(state.existsCalls.length, 2);
+  state.files.set("/home/dev/notes/missing.md", "Found");
+  click(byId(view.render(cx), "note-reload"), cx); await jobs.shift()(cx);
+  assert.ok(view.note.existing.has("/home/dev/notes/missing.md"));
+  state.watchers.shift().reject(new Error("Stopped")); await watch;
+});
+
+test("an MR link without a ticket starts with its number: the spinner slot trails the link", () => {
+  const task = {kind:"task", id:"task", task:"Demo", children:[
+    {kind:"mr", id:"mr", state:"opened", label:"!123 Demo", ci:"running", url:"https://example.invalid/mr/123"}]};
+  const {view} = setup({data:{rows:[task]}});
+  const link = byId(view.taskRow(theme(), task), "task-mr-task");
+  assert.equal(text(link.nodes[0]).trim(), "!123");
+  const slot = link.nodes.at(-1);
+  assert.deepEqual(slot.attributes.size, [11]);
+  assert.ok(slot.attributes.invisible);
 });

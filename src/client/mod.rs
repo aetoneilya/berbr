@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod gitlab;
 pub mod herdr;
+pub(crate) mod http;
 pub mod jira;
 pub mod sessions;
 pub mod worktree;

@@ -27,6 +27,23 @@ pub fn available() -> bool {
     app::enabled() || std::env::var("HERDR_ENV").is_ok_and(|v| v == "1")
 }
 
+/// Read/focus operation cache; never shared with a later operation or mutation.
+pub(crate) fn operation() -> app::Operation {
+    app::operation()
+}
+pub(crate) fn inherit<R: Send>(f: impl FnOnce() -> R + Send) -> impl FnOnce() -> R + Send {
+    app::inherit(f)
+}
+
+pub fn focus_known(workspace: &str, tab: &str, pane: &str) -> Result<()> {
+    if app::enabled() {
+        return app::focus_known(workspace, tab, pane);
+    }
+    run_herdr(&["workspace", "focus", workspace])?;
+    run_herdr(&["tab", "focus", tab])?;
+    run_herdr(&["agent", "focus", pane]).map(|_| ())
+}
+
 /// herdr's stdout, or its stderr as the error.
 fn herdr_output(args: &[&str]) -> Result<Vec<u8>> {
     if app::enabled() {
@@ -376,6 +393,7 @@ pub fn read_agent(target: &str, lines: usize) -> Result<String> {
 /// alone only makes the pane active inside a tab that may not be on screen.
 /// Accepts an agent name or the pane id hosting it.
 pub fn focus_agent(target: &str) -> Result<()> {
+    let _operation = operation();
     let info = run_herdr(&["agent", "get", target])?;
     let field = |name: &str| {
         info.pointer(&format!("/result/agent/{name}"))

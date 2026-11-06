@@ -14,6 +14,10 @@ export function div() {
       else if (key === "children") node.nodes.push(...args[0]);
       else if (key === "when") { if (args[0]) args[1](proxy); }
       else node.attributes[key] = args;
+      if (["on_mouse_down", "on_mouse_up"].includes(key)) {
+        node.handlers ??= {};
+        node.handlers[`${key}:${args[0]}`] = args[1];
+      }
       return proxy;
     };
   }});
@@ -84,3 +88,12 @@ export const writeTextFile = async (path, value, expected) => {
   }
   return null;
 };
+
+// fs/promises.exists is a host API; keep note tests on synthetic in-memory files.
+export const exists = async path => {
+  (state.existsCalls ??= []).push(path);
+  if (state.existsError) throw state.existsError;
+  return state.files ? state.files.has(path) : !state.readError && state.readResult !== null;
+};
+export const layout = () => state.layout ?? {children:[]};
+export const window = () => state.window ?? null;

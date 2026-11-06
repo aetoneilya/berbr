@@ -22,7 +22,9 @@ pub fn ticket_keys(text: &str) -> Vec<String> {
 }
 
 /// An agent session held in one of the task's worktrees, stored in the note as
-/// `<session id> <worktree name> <date>`; Codex ids have a `codex:` prefix.
+/// `<session id> <worktree path> <date>`; old bare worktree names still parse.
+/// Whitespace/empty fields use `v2:` plus a JSON string array. Codex session IDs
+/// have a `codex:` prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRef {
     pub id: String,
@@ -32,16 +34,60 @@ pub struct SessionRef {
 
 impl SessionRef {
     fn parse(entry: &str) -> Option<SessionRef> {
+        if let Some(encoded) = entry.strip_prefix("v2:") {
+            let [id, worktree, date]: [String; 3] = serde_json::from_str(encoded).ok()?;
+            return Some(SessionRef { id, worktree, date });
+        }
         let mut parts = entry.split_whitespace();
+        let id = parts.next()?.to_string();
+        let rest = entry.trim().strip_prefix(&id)?.trim();
+        if let Some((worktree, date)) = rest.rsplit_once(char::is_whitespace)
+            && date.len() == 10
+            && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
+        {
+            return Some(SessionRef {
+                id,
+                worktree: worktree.trim().to_string(),
+                date: date.into(),
+            });
+        }
         Some(SessionRef {
-            id: parts.next()?.to_string(),
+            id,
             worktree: parts.next().unwrap_or_default().to_string(),
             date: parts.next().unwrap_or_default().to_string(),
         })
     }
 
+    pub fn tree_name(&self) -> &str {
+        Path::new(&self.worktree)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&self.worktree)
+    }
+
+    pub fn matches_tree(&self, path: &Path) -> bool {
+        if Path::new(&self.worktree).is_absolute() {
+            Path::new(&self.worktree) == path
+        } else {
+            path.file_name()
+                .is_some_and(|name| name == self.worktree.as_str())
+        }
+    }
+
     pub fn entry(&self) -> String {
-        format!("{} {} {}", self.id, self.worktree, self.date)
+        if [&self.id, &self.worktree, &self.date]
+            .iter()
+            .any(|s| s.is_empty() || s.chars().any(char::is_whitespace))
+            || self.id.starts_with("v2:")
+        {
+            format!(
+                "v2:{}",
+                serde_json::to_string(&[&self.id, &self.worktree, &self.date])
+                    .expect("session strings")
+            )
+        } else {
+            format!("{} {} {}", self.id, self.worktree, self.date)
+        }
     }
 }
 
@@ -107,6 +153,69 @@ pub fn same_name(a: &str, b: &str) -> bool {
 
 pub fn task_space_matches(task: &Task, label: &str) -> bool {
     same_name(&task.name, label) || task.title().is_some_and(|title| same_name(&title, label))
+}
+
+/// Immutable identity wins; a legacy title is usable only when unambiguous.
+pub fn task_space<'a>(
+    task: &Task,
+    spaces: &'a [crate::client::herdr::Workspace],
+) -> Result<Option<&'a crate::client::herdr::Workspace>, String> {
+    let saved = task.note.string("space");
+    let ids: Vec<_> = spaces
+        .iter()
+        .filter(|s| saved.as_deref() == Some(s.workspace_id.as_str()))
+        .collect();
+    let ids = if ids.is_empty() {
+        spaces
+            .iter()
+            .filter(|s| same_name(&task.name, &s.label))
+            .collect()
+    } else {
+        ids
+    };
+    let matches = if ids.is_empty() {
+        spaces
+            .iter()
+            .filter(|s| {
+                task.title()
+                    .is_some_and(|title| same_name(&title, &s.label))
+            })
+            .collect()
+    } else {
+        ids
+    };
+    match matches.as_slice() {
+        [] => Ok(None),
+        [space] => Ok(Some(*space)),
+        _ => Err(format!(
+            "{}: ambiguous Herdr space; give the intended space the task ID",
+            task.name
+        )),
+    }
+}
+
+/// Resolve legacy labels using all task identities, not only workspace names.
+pub fn task_space_in<'a>(
+    task: &Task,
+    spaces: &'a [crate::client::herdr::Workspace],
+    tasks: &[Task],
+) -> Result<Option<&'a crate::client::herdr::Workspace>, String> {
+    let space = task_space(task, spaces)?;
+    if let Some(space) = space
+        && !same_name(&task.name, &space.label)
+        && task.note.string("space").as_deref() != Some(space.workspace_id.as_str())
+        && tasks
+            .iter()
+            .filter(|t| task_space_matches(t, &space.label))
+            .count()
+            > 1
+    {
+        return Err(format!(
+            "{}: ambiguous Herdr title {}; use the task ID as the space name",
+            task.name, space.label
+        ));
+    }
+    Ok(space)
 }
 
 impl Task {
@@ -305,8 +414,8 @@ mod tests {
     #[test]
     fn extracts_keys_once() {
         assert_eq!(
-            ticket_keys("demo/DEMO-61083-a2i, DEMO-61083: x, see DEMO-7"),
-            vec!["DEMO-61083", "DEMO-7"]
+            ticket_keys("demo/DEMO-42-a2i, DEMO-42: x, see DEMO-7"),
+            vec!["DEMO-42", "DEMO-7"]
         );
         assert!(ticket_keys("utf-8 and x86-64").is_empty());
     }
@@ -319,5 +428,19 @@ mod tests {
         let codex = SessionRef::parse("codex:a9c0 a2i-config 2026-10-29").unwrap();
         assert_eq!(codex.entry(), "codex:a9c0 a2i-config 2026-10-29");
         assert_ne!(codex.id, s.id);
+    }
+}
+
+#[cfg(test)]
+mod regressions {
+    use super::*;
+    #[test]
+    fn session_refs_must_roundtrip_worktree_with_spaces() {
+        let s = SessionRef {
+            id: "codex:demo".into(),
+            worktree: "two words".into(),
+            date: "2026-11-01".into(),
+        };
+        assert_eq!(SessionRef::parse(&s.entry()).unwrap(), s);
     }
 }

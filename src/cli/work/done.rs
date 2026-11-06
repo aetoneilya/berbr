@@ -16,14 +16,19 @@ use crate::vault::note::Note;
 use crate::vault::task::Task;
 use serde_yaml::Value;
 
-/// `berbr done`: with the name of an open task, or a ticket of one, closes the task;
-/// otherwise removes worktrees.
+/// Positional targets are tasks only. Checkout removal has an explicit target
+/// kind, so an editable task title or ticket alias can never redirect it.
 pub(in crate::cli) fn cli_done(config: &Config, args: DoneArgs) -> Result<(), String> {
-    if let Some(name) = args.name.as_deref().filter(|_| !args.merged)
-        && let Ok(tasks) = load(config)
-        && let Some(i) = find_task(&tasks, name, false)?
-        && !tasks[i].done
-    {
+    if let Some(name) = args.name.as_deref() {
+        let tasks = load(config)?;
+        let i = find_task(&tasks, name, false)?.ok_or_else(|| {
+            format!(
+                "no task \"{name}\"; to remove a worktree, use berbr done --tree <name-or-path>"
+            )
+        })?;
+        if tasks[i].done {
+            return Err(format!("task \"{name}\" is already done"));
+        }
         let plan = plan_task_with(config, tasks, name, args.force, args.dry_run)?;
         if args.dry_run {
             return plan.report(args.force).print(args.json);
@@ -55,6 +60,7 @@ struct DonePlan {
     name: Option<String>,
     blockers: Vec<String>,
     remove: Vec<Removal>,
+    dirty: Vec<DirtyTree>,
     keep: Vec<Kept>,
     close_tickets: Vec<String>,
     leave_tickets: Vec<String>,
@@ -63,6 +69,13 @@ struct DonePlan {
     steps: Vec<String>,
     #[serde(skip)]
     trees: Vec<usize>,
+}
+
+#[derive(serde::Serialize)]
+struct DirtyTree {
+    tree: String,
+    path: std::path::PathBuf,
+    uncommitted: usize,
 }
 
 #[derive(serde::Serialize)]
@@ -192,7 +205,19 @@ impl TaskPlan {
             .trees
             .iter()
             .map(|&t| {
-                let name = self.table.tree(t).wt.name();
+                let tree = self.table.tree(t);
+                let name = tree.wt.name();
+                let name = if row
+                    .trees
+                    .iter()
+                    .filter(|&&i| self.table.tree(i).wt.name() == name)
+                    .count()
+                    > 1
+                {
+                    format!("{name} ({})", tree.wt.path.display())
+                } else {
+                    name
+                };
                 match self.changes(t) {
                     Some(n) => {
                         format!("! remove worktree {name}, losing {n} uncommitted change(s)")
@@ -217,7 +242,7 @@ impl TaskPlan {
         steps
     }
 
-    fn report(&self, force: bool) -> DonePlan {
+    fn report(&self, _force: bool) -> DonePlan {
         let row = &self.table.tasks[self.row];
         let mut plan = DonePlan {
             kind: "task",
@@ -228,11 +253,22 @@ impl TaskPlan {
             note_done: true,
             close_space: row.space.is_some(),
             steps: self.steps(),
+            dirty: self
+                .dirty
+                .iter()
+                .map(|&(t, n)| DirtyTree {
+                    tree: self.table.tree(t).wt.name(),
+                    path: self.table.tree(t).wt.path.clone(),
+                    uncommitted: n,
+                })
+                .collect(),
             ..Default::default()
         };
+        // Task closing is atomic at the plan boundary: every checkout is a
+        // conditional removal, including dirty trees held by another blocker.
+        // The mod must show their loss warning before the blockers are cleared.
         for &t in &row.trees {
-            let blocked = !force && !held(&self.table, self.table.tree(t)).is_empty();
-            plan.add_tree(&self.table, t, blocked, true);
+            plan.add_tree(&self.table, t, false, true);
         }
         plan
     }
@@ -272,40 +308,51 @@ fn plan_task_with(
     tasks: Vec<Task>,
     name: &str,
     force: bool,
-    read_only: bool,
+    _read_only: bool,
 ) -> Result<TaskPlan, String> {
-    let table = if read_only {
-        table::build_read_only(config, tasks)
-    } else {
-        table::build(config, tasks, true)
-    };
-    let partial = [&table.jira, &table.gitlab]
-        .into_iter()
-        .find_map(|source| source.warning.as_ref())
-        .map(|warning| format!("{warning} — not closing a task on partial data"));
+    let task = find_task(&tasks, name, false)?
+        .filter(|&i| !tasks[i].done)
+        .ok_or_else(|| format!("no open task {name}"))?;
+    let id = tasks[task].name.clone();
+    let table = table::build_closing(config, tasks, &id);
     let row = find_task(table.tasks.iter().map(|r| &r.task), name, false)?
         .filter(|&i| !table.tasks[i].task.done)
         .ok_or_else(|| format!("no open task \"{name}\""))?;
-    let mut plan = plan_task_table(table, row, force)?;
-    if let Some(blocker) = partial {
-        plan.blockers.insert(0, blocker);
-    }
-    Ok(plan)
+    plan_task_table(table, row, force)
 }
 
-fn plan_task_table(table: Table, row: usize, force: bool) -> Result<TaskPlan, String> {
+fn plan_task_table(mut table: Table, row: usize, force: bool) -> Result<TaskPlan, String> {
     let task = &table.tasks[row];
     let mut blockers = Vec::new();
-    let mut dirty = Vec::new();
-    if !force {
-        for &t in &task.trees {
-            let tree = table.tree(t);
-            blockers.extend(held(&table, tree));
-            match uncommitted(tree)? {
-                0 => {}
-                n => dirty.push((t, n)),
-            }
+    for warning in table
+        .warnings
+        .iter()
+        .chain(table.jira.warning.iter())
+        .chain(table.gitlab.warning.iter())
+    {
+        if warning.contains(": ambiguous") && !warning.starts_with(&format!("{}:", task.task.name))
+        {
+            continue;
         }
+        let blocker = format!("{warning} — resolve incomplete or ambiguous data before closing");
+        if !blockers.contains(&blocker) {
+            blockers.push(blocker);
+        }
+    }
+    let mut dirty = Vec::new();
+    let mut inspected = Vec::new();
+    for &t in &task.trees {
+        let tree = table.tree(t);
+        if !force {
+            blockers.extend(held(&table, tree));
+        }
+        let changes = uncommitted(tree)?;
+        inspected.push((t, changes));
+        if changes > 0 {
+            dirty.push((t, changes));
+        }
+    }
+    if !force {
         let held: Vec<usize> = task
             .trees
             .iter()
@@ -333,6 +380,9 @@ fn plan_task_table(table: Table, row: usize, force: bool) -> Result<TaskPlan, St
             .collect()
     };
     let (to_close, left_open) = (open_tickets(true), open_tickets(false));
+    for (t, changes) in inspected {
+        table.trees[t].changes = Some(changes);
+    }
     Ok(TaskPlan {
         table,
         row,
@@ -350,6 +400,28 @@ pub(crate) fn finish_task(
     force: bool,
     say: &mut dyn FnMut(String),
 ) -> Result<(), String> {
+    if !plan.blockers.is_empty() {
+        return Err(not_finished(plan.name(), &plan.blockers));
+    }
+    let jira = if plan.to_close.is_empty() {
+        None
+    } else {
+        Some(config.jira_client()?)
+    };
+    finish_task_with(plan, force, say, &mut |key| {
+        close_in_jira(jira.as_ref().ok_or("Jira unavailable")?, key)
+    })
+}
+
+fn finish_task_with(
+    plan: TaskPlan,
+    force: bool,
+    say: &mut dyn FnMut(String),
+    close_ticket: &mut dyn FnMut(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    if !plan.blockers.is_empty() {
+        return Err(not_finished(plan.name(), &plan.blockers));
+    }
     let TaskPlan {
         table,
         row,
@@ -358,30 +430,43 @@ pub(crate) fn finish_task(
         ..
     } = plan;
     let row = &table.tasks[row];
-    // before anything goes: without Jira the task would end half-closed
-    let jira = if to_close.is_empty() {
-        None
-    } else {
-        Some(config.jira_client()?)
-    };
-
     let mut problems = Vec::new();
     for &t in &row.trees {
         let tree = table.tree(t);
         let discard = dirty.iter().any(|&(d, _)| d == t);
         match remove_tree(tree, mr_of(&table, tree), force, discard, say) {
             Ok(kept) => problems.extend(kept),
-            Err(e) => problems.push(format!("{}: {e}", tree.wt.name())),
+            Err(e) => {
+                let failure = format!("remove {} failed: {e}", tree.wt.name());
+                say(failure.clone());
+                problems.push(failure);
+            }
         }
     }
 
-    if let Some(jira) = &jira {
-        for key in &to_close {
-            match close_in_jira(jira, key) {
-                Ok(status) => say(format!("{key} → {status}")),
-                Err(e) => problems.push(format!("{key}: {e}")),
+    if !problems.is_empty() {
+        return Err(format!(
+            "task remains open; Jira, note and space unchanged:\n  {}",
+            problems.join("\n  ")
+        ));
+    }
+
+    for key in &to_close {
+        match close_ticket(key) {
+            Ok(status) => say(format!("{key} → {status}")),
+            Err(e) => {
+                let failure = format!("close {key} in Jira failed: {e}");
+                say(failure.clone());
+                problems.push(failure);
             }
         }
+    }
+
+    if !problems.is_empty() {
+        return Err(format!(
+            "task remains open; note and space unchanged:\n  {}",
+            problems.join("\n  ")
+        ));
     }
 
     let mrs: Vec<Value> = row
@@ -437,7 +522,7 @@ pub(crate) fn finish_task(
     }
 }
 
-/// `berbr done [<worktree>]` and `berbr done --merged`: worktrees go one by one, each
+/// `berbr done --tree <worktree>` and `berbr done --merged`: worktrees go one by one, each
 /// once it is finished.
 fn done_trees(config: &Config, args: DoneArgs) -> Result<(), String> {
     let (table, warning) = trees_for_done_with(config, args.force, args.dry_run)?;
@@ -446,7 +531,12 @@ fn done_trees(config: &Config, args: DoneArgs) -> Result<(), String> {
     }
 
     if !args.merged {
-        let tree = resolve_tree(&table, args.name, &mut Terminal)?;
+        let mut table = table;
+        if let Some(repo) = &args.repo {
+            let main = worktree::main_checkout(repo).map_err(err)?;
+            table.trees.retain(|t| t.repo == main);
+        }
+        let tree = resolve_tree(&table, args.tree, &mut Terminal)?;
         let plan = TreePlan::new(table, tree, args.force)?;
         if args.dry_run {
             return plan.report(args.force).print(args.json);
@@ -533,11 +623,11 @@ fn tree_data_blocker(table: &Table, force: bool) -> Option<String> {
         .as_ref()
         .filter(|_| !force && table.gitlab.fresh == Fresh::Missing)
         .map(|warning| {
-            format!("{warning} — not removing worktrees on partial data, or pass --force")
+            format!("{warning} — not removing worktrees on partial data; restore GitLab access and retry")
         })
 }
 
-/// What `berbr done <worktree>` would do: the worktree goes, with its branch and
+/// What `berbr done --tree <worktree>` would do: the worktree goes, with its branch and
 /// herdr tabs, once nothing holds it.
 pub(crate) struct TreePlan {
     table: Table,
@@ -639,7 +729,7 @@ fn held(table: &Table, tree: &Tree) -> Vec<String> {
 
 fn not_finished(name: &str, blockers: &[String]) -> String {
     format!(
-        "\"{name}\" is not finished:\n  {}\nfinish these, or pass --force",
+        "\"{name}\" is not finished:\n  {}\nresolve these blockers before removing work",
         blockers.join("\n  ")
     )
 }
@@ -840,6 +930,8 @@ mod tests {
         use crate::table::{Category, fixtures::ticket};
         let mut dirty = tree("dirty", "DEMO-1-a");
         dirty.changes = Some(2);
+        let mut open = tree("open", "DEMO-1-b");
+        open.changes = Some(3);
         let table = table(
             vec![task("work", &["DEMO-1", "DEMO-2", "DEMO-3"])],
             vec![
@@ -851,7 +943,7 @@ mod tests {
                 mr(1, "DEMO-1-a", "a", "merged"),
                 mr(2, "DEMO-1-b", "b", "opened"),
             ],
-            vec![dirty, tree("open", "DEMO-1-b")],
+            vec![dirty, open],
         );
         let plan = plan_task_table(table, 0, false).unwrap();
         let report = plan.report(false);
@@ -862,7 +954,11 @@ mod tests {
         assert!(report.note_done);
         assert_eq!(report.remove[0].tree, "dirty");
         assert_eq!(report.remove[0].uncommitted, Some(2));
-        assert_eq!(report.keep[0].reason, "open MR");
+        assert!(report.keep.is_empty());
+        assert_eq!(report.remove.len(), 2);
+        assert_eq!(report.remove[1].uncommitted, Some(3));
+        assert_eq!(report.dirty.len(), 2);
+        assert!(report.blockers.iter().any(|b| b.contains("MR !2 is open")));
         let forced = plan_task_table(plan.table, 0, true).unwrap();
         assert!(forced.report(true).blockers.is_empty());
         assert_eq!(forced.report(true).remove.len(), 2);
@@ -956,5 +1052,144 @@ mod tests {
         .unwrap();
         assert_eq!(closing_transition(&transitions).unwrap().id, "381");
         assert!(closing_transition(&transitions[..2]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod regressions {
+    use super::*;
+    use crate::table::fixtures::{table, task_note, temp_dir, tree};
+    fn config() -> Config {
+        Config {
+            name: "demo".into(),
+            jira: None,
+            gitlab: None,
+            workflow: Default::default(),
+            vault: crate::config::VaultConfig {
+                path: temp_dir(),
+                task_dirs: vec![],
+                new_task_dir: "tasks".into(),
+            },
+            repos: vec![],
+        }
+    }
+    #[test]
+    fn task_close_warns_about_each_dirty_worktree() {
+        let mut wt = tree("work", "work");
+        wt.changes = Some(1);
+        let table = table(
+            vec![task_note("demo-0", "worktrees: [work]", "2026-11-01")],
+            vec![],
+            vec![],
+            vec![wt],
+        );
+        let plan = plan_task_table(table, 0, false).unwrap();
+        assert!(plan.blockers.is_empty());
+        assert!(plan.steps()[0].contains("work, losing 1 uncommitted"));
+        let report = plan.report(false);
+        assert_eq!(report.dirty[0].tree, "work");
+        assert_eq!(report.dirty[0].uncommitted, 1);
+        assert_eq!(report.remove[0].uncommitted, Some(1));
+    }
+    #[test]
+    fn failed_removal_must_leave_task_open() {
+        let mut wt = tree("work", "work");
+        wt.repo = temp_dir().join("absent-repo");
+        let table = table(
+            vec![task_note(
+                "demo-0",
+                "worktrees: [work]\ndone: false",
+                "2026-11-01",
+            )],
+            vec![],
+            vec![],
+            vec![wt],
+        );
+        let path = table.tasks[0].task.note.path.clone();
+        let plan = plan_task_table(table, 0, false).unwrap();
+        assert!(plan.blockers.is_empty());
+        let result = finish_task(&config(), plan, false, &mut |_| {});
+        assert!(result.is_err());
+        assert!(
+            !Note::read(&path).unwrap().flag("done"),
+            "failed worktree removal still writes done:true"
+        );
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use crate::table::fixtures::{table, task, ticket};
+
+    #[test]
+    fn failed_jira_step_leaves_note_and_space_open_and_reports_each_ticket() {
+        let mut table = table(
+            vec![task("demo-0", &["DEMO-1", "DEMO-2"])],
+            vec![
+                ticket("DEMO-1", table::Category::New, true),
+                ticket("DEMO-2", table::Category::New, true),
+            ],
+            vec![],
+            vec![],
+        );
+        table.tasks[0].space = Some("space-demo".into());
+        let path = table.tasks[0].task.note.path.clone();
+        let before = std::fs::read(&path).unwrap();
+        let plan = plan_task_table(table, 0, false).unwrap();
+        let mut calls = Vec::new();
+        let mut report = Vec::new();
+        let result = finish_task_with(plan, false, &mut |line| report.push(line), &mut |key| {
+            calls.push(key.to_string());
+            if key == "DEMO-1" {
+                Ok("Done".into())
+            } else {
+                Err("transition refused".into())
+            }
+        });
+        assert!(result.unwrap_err().contains("task remains open"));
+        assert_eq!(calls, ["DEMO-1", "DEMO-2"]);
+        assert!(report.iter().any(|l| l.contains("DEMO-1 → Done")));
+        assert!(report.iter().any(|l| l.contains("DEMO-2 in Jira failed")));
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod data_guard_tests {
+    use super::*;
+    use crate::table::fixtures::{table, task};
+
+    #[test]
+    fn incomplete_jira_data_blocks_finalization_even_with_bypass_flag() {
+        let mut table = table(vec![task("demo-0", &["DEMO-1"])], vec![], vec![], vec![]);
+        table.jira = table::Source {
+            fresh: Fresh::Missing,
+            warning: Some("Jira: incomplete data for DEMO-1".into()),
+        };
+        let plan = plan_task_table(table, 0, true).unwrap();
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|b| b.contains("incomplete data for DEMO-1"))
+        );
+        let path = plan.table.tasks[0].task.note.path.clone();
+        assert!(
+            finish_task_with(
+                plan,
+                true,
+                &mut |_| panic!("no steps allowed"),
+                &mut |_| panic!("no Jira mutation allowed")
+            )
+            .is_err()
+        );
+        assert!(!Note::read(&path).unwrap().flag("done"));
+    }
+
+    #[test]
+    fn refusal_messages_name_the_blockers_without_suggesting_a_bypass() {
+        let error = not_finished("demo", &["demo: 2 uncommitted files".into()]);
+        assert!(error.contains("2 uncommitted files"));
+        assert!(!error.contains("--force"));
     }
 }

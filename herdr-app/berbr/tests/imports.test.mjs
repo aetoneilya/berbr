@@ -12,8 +12,9 @@ const exportsByModule = new Map([...declarations.matchAll(/^declare module "([^"
 test("named runtime imports in every mod JS file belong to their declared module", async () => {
   assert.ok(exportsByModule.get("gpui-base")?.has("v_virtual_list"));
   assert.equal(exportsByModule.get("gpui-kit")?.has("v_virtual_list"), false);
-  for (const file of (await readdir(root, {recursive:true})).filter(file => file.endsWith(".js"))) {
-    const source = await readFile(new URL(file, root), "utf8");
+  for (const directory of [root, new URL("../../tabs-berbr/", import.meta.url)])
+  for (const file of (await readdir(directory, {recursive:true})).filter(file => file.endsWith(".js"))) {
+    const source = await readFile(new URL(file, directory), "utf8");
     for (const [, names, module] of source.matchAll(/\bimport\s+(?:[\w$]+\s*,\s*)?\{([^}]+)\}\s*from\s*["']([^"']+)["']/g)) {
       if (module.startsWith(".")) continue;
       const exports = exportsByModule.get(module);
@@ -28,8 +29,9 @@ test("interactive mod rows use plain scroll containers, not lazy list renderers"
   // gpui-kit.d.ts: on_item_click / list prohibit handlers inside item renderers.
   // These rows need independent links, hover controls and prompt choice buttons.
   const lazyLists = new Set(["v_virtual_list", "uniform_list", "list"]);
-  for (const file of (await readdir(root, {recursive:true})).filter(file => file.endsWith(".js"))) {
-    const source = await readFile(new URL(file, root), "utf8");
+  for (const directory of [root, new URL("../../tabs-berbr/", import.meta.url)])
+  for (const file of (await readdir(directory, {recursive:true})).filter(file => file.endsWith(".js"))) {
+    const source = await readFile(new URL(file, directory), "utf8");
     for (const [, names] of source.matchAll(/\bimport\s+(?:[\w$]+\s*,\s*)?\{([^}]+)\}\s*from\s*["']gpui-base["']/g)) {
       for (const name of names.split(",").map(name => name.trim().split(/\s+as\s+/)[0]).filter(Boolean))
         assert.ok(!lazyLists.has(name), `${file}: ${name} cannot host the row handlers in this runtime`);

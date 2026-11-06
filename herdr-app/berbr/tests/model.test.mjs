@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { taskSpace, taskSpaceMatches, walk, groupSections, taskSignals, visibleSections, visibleRows, parseMrFlags,
-  normalizeTicketState, isClosedTicket, cleanObsidian, stripFrontmatter, obsidianUri, matchesFilter, ticketTitle, rowState, taskDetail, looseReason, worktreeNameCollision, cleanCliText, parseTreeMarks, looseWhy,
+import { taskSpace, taskSpaceMatches, walk, groupSections, taskSignals, PanelModel, visibleRows, parseMrFlags,
+  normalizeTicketState, isClosedTicket, cleanObsidian, parseFrontmatter, obsidianUri, ticketTitle, taskDetail, looseReason, worktreeNameCollision, cleanCliText, parseTreeMarks, looseWhy,
   agentActivity, formatElapsed, classifyBlocked, closePlan, rowMenu } from "../model.js";
 
 const snapshot = JSON.parse(await readFile(new URL("../fixtures/sample-snapshot.json", import.meta.url)));
@@ -194,6 +194,42 @@ test("subtasks stay out of panel sections while direct header tasks are included
   assert.ok(sections.every(item => !item.rows.includes(child) && !item.rows.includes(grandchild)));
 });
 
+test("open descendants of done ancestors stay visible exactly once, including blocked work", () => {
+  const child = {id:"task:demo-1", kind:"task", task:"demo-1", title:"Open child", done:false, state:"active",
+    children:[{kind:"agent", terminal:"child-agent"}]};
+  const parent = {id:"task:demo-0", kind:"task", done:true,
+    children:[{kind:"task", id:"done-child", done:true, children:[child]}]};
+  const panel = new PanelModel().update({rows:[parent, child]}, [{address:"child-agent", status:"blocked"}], [], {showDone:false});
+  assert.deepEqual(panel.rows, [child]);
+  assert.equal(panel.visible[0].id, "needs");
+  assert.ok(!panel.visible.some(section => section.id === "done"));
+});
+
+test("one agent change invalidates its owning tasks and ancestors, retaining unrelated caches", () => {
+  const first = {kind:"task", id:"first", children:[{kind:"agent", terminal:"pane-a"}]};
+  const other = {kind:"task", id:"other", children:[{kind:"agent", terminal:"pane-b"}]};
+  const parent = {kind:"task", id:"parent", children:[first]};
+  const data = {rows:[parent, other]}, live = [{address:"agent", pane:"pane-a", seq:1, status:"working"}];
+  const panel = new PanelModel().update(data, live);
+  const untouched = [panel.signal(other), panel.detail(other), panel.plan(other)];
+  const before = [panel.signal(parent), panel.signal(first), panel.detail(first)];
+  live[0].seq++; live[0].status = "blocked";
+  panel.update(data, live);
+  assert.notEqual(panel.signal(parent), before[0]);
+  assert.notEqual(panel.signal(first), before[1]);
+  assert.notEqual(panel.detail(first), before[2]);
+  assert.deepEqual([panel.signal(other), panel.detail(other), panel.plan(other)], untouched);
+  assert.equal(panel.signal(other), untouched[0]);
+  assert.equal(panel.detail(other), untouched[1]);
+  // In-place movement must invalidate both the old and the new owner.
+  live[0].pane = "pane-b"; live[0].seq++;
+  panel.update(data, live);
+  assert.equal(panel.signal(parent).agents.length, 0);
+  assert.equal(panel.signal(other).status, "blocked");
+  panel.update(data, []);
+  assert.equal(panel.signal(other).agents.length, 0);
+});
+
 test("nested headers, missing labels and unknown kinds are safe", () => {
   const ticket = {id:"ticket", kind:"ticket", label:"Ticket"};
   const tree = {id:"tree", kind:"tree", label:"Tree"};
@@ -273,10 +309,6 @@ test("ticket and MR states are normalized", () => {
   assert.equal(normalizeTicketState(null), "");
   assert.ok(isClosedTicket({state:"Commited"}));
   assert.ok(!isClosedTicket({state:null}));
-  assert.equal(rowState({kind:"mr", state:"opened"}), "Open");
-  assert.equal(rowState({kind:"mr", state:"merged"}), "Merged");
-  assert.equal(rowState({kind:"mr", state:"closed"}), "Closed");
-  assert.equal(rowState({kind:"tree", state:"active"}), "");
 });
 
 test("Obsidian embeds are removed and wikilinks become readable text", () => {
@@ -288,28 +320,28 @@ test("Obsidian embeds are removed and wikilinks become readable text", () => {
 });
 
 test("filter matches titles, task keys, tags and every descendant label, branch and ticket target", () => {
-  const task = {title:"Readable title", task:"internal-key", tags:["feature"], children:[
+  const task = {kind:"task", id:"task", title:"Readable title", task:"internal-key", tags:["feature"], children:[
     {kind:"tree", label:"Checkout", branch:"dev/branch", children:[{kind:"ticket", target:"DEMO-123"}]},
   ]};
   for (const query of ["TITLE", "internal-key", "feature", "checkout", "DEV/branch", "demo-123", " "])
-    assert.ok(matchesFilter(task, query), query);
-  assert.ok(!matchesFilter(task, "missing"));
-  assert.ok(!matchesFilter({children:null}, "anything"));
-  assert.ok(matchesFilter(snapshot.rows[0], "demo-checkout-06"));
+    assert.ok(new PanelModel().update({rows:[task]}, [], [], {query}).rows.includes(task), query);
+  assert.deepEqual(new PanelModel().update({rows:[task]}, [], [], {query:"missing"}).rows, []);
+  assert.deepEqual(new PanelModel().update({rows:[{kind:"task", children:null}]}, [], [], {query:"anything"}).rows, []);
+  assert.ok(new PanelModel().update(snapshot, [], [], {query:"demo-checkout-06"}).rows.length);
 });
 
 test("visible rows skip collapsed sections, expand during search and honor Done", () => {
-  const sections = groupSections(snapshot.rows);
+  const data = snapshot;
   const collapsed = new Set(["todo", "cleanup"]);
-  const visible = visibleSections(sections, {collapsed});
+  const visible = new PanelModel().update(data, [], [], {collapsed}).visible;
   assert.equal(visibleRows(visible).length, 12);
   assert.ok(!visible.some(item => item.id === "done"));
-  const filtered = visibleSections(sections, {collapsed, query:"demo-44"});
+  const filtered = new PanelModel().update(data, [], [], {collapsed, query:"demo-44"}).visible;
   assert.equal(filtered[0].id, "todo");
   assert.equal(filtered[0].expanded, true);
   assert.equal(visibleRows(filtered)[0].target, "DEMO-44");
-  assert.equal(visibleRows(visibleSections(sections, {collapsed, showDone:true})).length, 31);
-  assert.deepEqual(visibleSections(sections, {query:"no-such-task"}), []);
+  assert.equal(visibleRows(new PanelModel().update(data, [], [], {collapsed, showDone:true}).visible).length, 31);
+  assert.deepEqual(new PanelModel().update(data, [], [], {query:"no-such-task"}).visible, []);
 });
 
 test("Assigned ticket title prefills remove only the leading ticket key", () => {
@@ -541,7 +573,7 @@ test("frontmatter is stripped only when a leading block is terminated", () => {
     ["---\ntitle: Task\nBody", "---\ntitle: Task\nBody"],
     ["---\ntitle: Task\n---suffix\nBody", "---\ntitle: Task\n---suffix\nBody"],
     ["Body", "Body"], ["", ""], [null, ""],
-  ]) assert.equal(stripFrontmatter(source), expected);
+  ]) assert.equal(parseFrontmatter(source).body, expected);
 });
 
 test("Obsidian URIs encode the complete path as a query value", () => {
@@ -559,7 +591,6 @@ test("snapshot merge metadata drives worktree state, reasons and safe bulk fallb
     assert.equal(treeMarks(tree).merged, true);
     assert.equal(looseReason(tree), "merged · worktree left");
     assert.equal(looseReason({kind:"ticket", children:[tree]}), "merged · worktree left");
-    assert.equal(rowState(tree), "Merged");
   }
   const plan = mergedPlan([
     {kind:"tree", tree:"clean", cwd:"/home/dev/demo/clean", merged:true},
@@ -630,16 +661,17 @@ test("panel memoization survives focus redraws and invalidates live, snapshot an
 });
 
 test("all section kinds are collapsible and filtering temporarily expands them without losing counts", () => {
-  const sections = groupSections([{id:"task", kind:"task", title:"Demo", children:[]}]);
+  const data = {rows:[{id:"task", kind:"task", title:"Demo", children:[]}]};
+  const sections = new PanelModel().update(data).sections;
   assert.deepEqual(sections.map(section => section.id), ["needs", "running", "progress", "todo", "notInTask", "cleanup", "done"]);
   assert.ok(sections.every(section => section.collapsible));
   const collapsed = new Set(sections.map(section => section.id));
-  const hidden = visibleSections(sections, {collapsed});
+  const hidden = new PanelModel().update(data, [], [], {collapsed}).visible;
   assert.equal(hidden[0].id, "progress");
   assert.equal(hidden[0].rows.length, 1);
   assert.equal(hidden[0].expanded, false);
   assert.deepEqual(visibleRows(hidden), []);
-  const filtered = visibleSections(sections, {collapsed, query:"demo"});
+  const filtered = new PanelModel().update(data, [], [], {collapsed, query:"demo"}).visible;
   assert.equal(filtered[0].expanded, true);
   assert.equal(visibleRows(filtered)[0].id, "task");
   assert.equal(collapsed.size, 7);

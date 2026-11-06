@@ -29,6 +29,8 @@ pub struct GitLabConfig {
 pub struct WorkflowConfig {
     /// Prepended to new task branches, e.g. "demo/".
     pub branch_prefix: String,
+    /// Repository-relative root for new checkouts; legacy checkouts stay in place.
+    pub worktree_dir: PathBuf,
     /// CLI used for new conversations; existing conversations keep their owner.
     pub agent: AgentKind,
     /// Optional separate CLI for reviews.
@@ -48,6 +50,7 @@ impl Default for WorkflowConfig {
     fn default() -> Self {
         WorkflowConfig {
             branch_prefix: String::new(),
+            worktree_dir: PathBuf::from(crate::client::worktree::DEFAULT_DIRECTORY),
             agent: AgentKind::Claude,
             review_agent: None,
             agent_override: None,
@@ -116,6 +119,7 @@ struct ProjectFile {
     new_task_dir: Option<PathBuf>,
     /// Default: `[workflow] branch_prefix`.
     branch_prefix: Option<String>,
+    worktree_dir: Option<PathBuf>,
     /// Default: [workflow] agent.
     agent: Option<AgentKind>,
     #[serde(default, rename = "repo")]
@@ -137,6 +141,11 @@ impl FileConfig {
                 if let Some(prefix) = p.branch_prefix {
                     workflow.branch_prefix = prefix;
                 }
+                if let Some(dir) = p.worktree_dir {
+                    workflow.worktree_dir = dir;
+                }
+                crate::client::worktree::validate_directory(&workflow.worktree_dir)
+                    .map_err(|e| e.to_string())?;
                 if let Some(agent) = p.agent {
                     workflow.agent = agent;
                 }
@@ -361,17 +370,19 @@ mod tests {
             path = "/v"
             [workflow]
             branch_prefix = "me/"
+            worktree_dir = ".herdr/shared"
 
             [[project]]
-            name = "demoapp"
+            name = "demo"
             task_dirs = ["30-work/tasks"]
             jira = { host = "https://jira" }
             [[project.repo]]
-            path = "/code/demoapp"
+            path = "/code/demo"
             gitlab_project = "demo/service"
 
             [[project]]
             name = "vpn"
+            worktree_dir = "dev/trees"
             task_dirs = ["10/projects/vpn"]
             branch_prefix = ""
             [[project.repo]]
@@ -380,10 +391,12 @@ mod tests {
         )
         .unwrap();
         let projects = file.projects().unwrap();
-        let (demoapp, vpn) = (&projects[0], &projects[1]);
-        assert_eq!(demoapp.vault.new_task_dir, PathBuf::from("30-work/tasks"));
-        assert_eq!(demoapp.workflow.branch_prefix, "me/");
-        assert!(demoapp.jira.is_some() && demoapp.gitlab.is_none());
+        let (demo, vpn) = (&projects[0], &projects[1]);
+        assert_eq!(demo.vault.new_task_dir, PathBuf::from("30-work/tasks"));
+        assert_eq!(demo.workflow.branch_prefix, "me/");
+        assert_eq!(demo.workflow.worktree_dir, PathBuf::from(".herdr/shared"));
+        assert_eq!(vpn.workflow.worktree_dir, PathBuf::from("dev/trees"));
+        assert!(demo.jira.is_some() && demo.gitlab.is_none());
         assert_eq!(vpn.vault.path, PathBuf::from("/v"));
         assert_eq!(vpn.workflow.branch_prefix, "");
         assert!(vpn.jira.is_none() && vpn.repos[0].gitlab_project.is_none());
@@ -443,7 +456,7 @@ mod tests {
     #[test]
     fn an_added_project_goes_last_with_its_repo() {
         let mut text =
-            "[vault]\npath = \"/v\"\n\n[[project]]\nname = \"demoapp\"\ntask_dirs = [\"t\"]\n"
+            "[vault]\npath = \"/v\"\n\n[[project]]\nname = \"demo\"\ntask_dirs = [\"t\"]\n"
                 .to_string();
         text.push_str(&project_block(
             "kcal \"bot\"",
@@ -454,7 +467,7 @@ mod tests {
         let file: FileConfig = toml::from_str(&text).unwrap();
         let projects = file.projects().unwrap();
         let names: Vec<_> = projects.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["demoapp", "kcal \"bot\"", "notes"]);
+        assert_eq!(names, ["demo", "kcal \"bot\"", "notes"]);
         assert_eq!(
             projects[1].vault.new_task_dir,
             PathBuf::from("10/projects/kcal")

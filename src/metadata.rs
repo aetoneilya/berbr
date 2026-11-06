@@ -386,7 +386,10 @@ mod tests {
                 mr(11, "DEMO-1-first", "first", "opened"),
                 mr(22, "DEMO-2-second", "second", "opened"),
             ],
-            vec![tree("first", "DEMO-1-first"), tree("second", "DEMO-2-second")],
+            vec![
+                tree("first", "DEMO-1-first"),
+                tree("second", "DEMO-2-second"),
+            ],
         );
         table.tasks[0].space = Some("w1".into());
         table.mrs[0].review = Some(MrReview {

@@ -12,6 +12,9 @@ pub enum NoteError {
     #[error("{0}: invalid frontmatter: {1}")]
     Yaml(PathBuf, serde_yaml::Error),
 
+    #[error("{0}: frontmatter update could not preserve its values, skipped")]
+    UnsafeUpdate(PathBuf),
+
     #[error("{0}: changed while being updated, skipped")]
     Changed(PathBuf),
 }
@@ -118,6 +121,7 @@ impl Note {
         for (key, value) in keys {
             text = set_key(&text, key, value);
         }
+        parse_frontmatter(&text).map_err(|e| NoteError::Yaml(path.into(), e))?;
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(io_err)?;
         }
@@ -142,10 +146,8 @@ impl Note {
         let body_start = frontmatter_range(&self.text)
             .and_then(|(_, end)| self.text[end..].find('\n').map(|n| end + n + 1))
             .unwrap_or(0);
-        let cut = self.text[body_start..]
-            .match_indices(AGENT_NOTES)
-            .map(|(i, _)| body_start + i)
-            .find(|&i| i == body_start || self.text[..i].ends_with('\n'))
+        let cut = agent_notes_start(&self.text[body_start..])
+            .map(|i| body_start + i)
             .unwrap_or(self.text.len());
         let (before, after) = self.text.split_at(cut);
         let mut text = before.trim_end_matches('\n').to_string();
@@ -174,6 +176,11 @@ impl Note {
     /// Writes the note if `set` changed it. Refuses when the file was modified
     /// since it was read; writes a temp file and renames it over the note.
     pub fn save(&mut self) -> Result<bool> {
+        let parsed =
+            parse_frontmatter(&self.text).map_err(|e| NoteError::Yaml(self.path.clone(), e))?;
+        if parsed != self.frontmatter {
+            return Err(NoteError::UnsafeUpdate(self.path.clone()));
+        }
         let io_err = |err| NoteError::Io(self.path.clone(), err);
         let on_disk = fs::read_to_string(&self.path).map_err(io_err)?;
         if on_disk == self.text {
@@ -199,19 +206,47 @@ impl Note {
 
 const AGENT_NOTES: &str = "## Agent notes";
 
+/// ATX headings outside backtick/tilde fences (up to three leading spaces).
+fn markdown_headings(body: &str) -> Vec<(usize, usize, &str)> {
+    let mut headings = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\n', '\r']);
+        let trimmed = text.trim_start_matches(' ');
+        let indent = text.len() - trimmed.len();
+        if indent <= 3 {
+            let marker = trimmed.chars().next().unwrap_or(' ');
+            let count = trimmed.chars().take_while(|c| *c == marker).count();
+            if let Some((open, n)) = fence {
+                if marker == open && count >= n && trimmed[count..].trim().is_empty() {
+                    fence = None;
+                }
+            } else if (marker == '`' || marker == '~') && count >= 3 {
+                fence = Some((marker, count));
+            } else if marker == '#' && count <= 6 && trimmed[count..].starts_with([' ', '\t']) {
+                headings.push((
+                    offset,
+                    count,
+                    trimmed[count..].trim().trim_end_matches('#').trim_end(),
+                ));
+            }
+        }
+        offset += line.len();
+    }
+    headings
+}
+
 fn agent_notes_start(body: &str) -> Option<usize> {
-    body.match_indices(AGENT_NOTES).map(|(i, _)| i).find(|&i| {
-        (i == 0 || body[..i].ends_with('\n'))
-            && (body[i + AGENT_NOTES.len()..].is_empty()
-                || body[i + AGENT_NOTES.len()..].starts_with(['\n', '\r']))
-    })
+    markdown_headings(body)
+        .into_iter()
+        .find(|(_, level, title)| *level == 2 && *title == "Agent notes")
+        .map(|(offset, _, _)| offset)
 }
 
 fn append_under_heading(text: &str, heading: &str, line: &str) -> String {
     let item = format!("- {line}\n");
-    let Some(pos) = text.match_indices(heading).map(|(i, _)| i).find(|&i| {
-        (i == 0 || text[..i].ends_with('\n')) && text[i + heading.len()..].starts_with(['\n', '\r'])
-    }) else {
+    let Some(pos) = agent_notes_start(text) else {
         let sep = if text.is_empty() || text.ends_with("\n\n") {
             ""
         } else if text.ends_with('\n') {
@@ -223,13 +258,10 @@ fn append_under_heading(text: &str, heading: &str, line: &str) -> String {
     };
     // the section ends at the next heading of the same or a higher level
     let body_start = pos + heading.len();
-    let section_end = text[body_start..]
-        .match_indices("\n#")
-        .map(|(i, _)| body_start + i + 1)
-        .find(|&i| {
-            let level = text[i..].chars().take_while(|&c| c == '#').count();
-            level <= 2 && text[i + level..].starts_with(' ')
-        })
+    let section_end = markdown_headings(text)
+        .into_iter()
+        .find(|(offset, level, _)| *offset > body_start && *level <= 2)
+        .map(|(offset, _, _)| offset)
         .unwrap_or(text.len());
     let mut section = text[..section_end].trim_end_matches('\n').to_string();
     section.push('\n');
@@ -280,6 +312,7 @@ fn parse_frontmatter(text: &str) -> std::result::Result<Mapping, serde_yaml::Err
 /// Renders `key: value` the way Obsidian writes properties: lists as block lists
 /// indented by two spaces, scalars quoted only when YAML needs it.
 fn render_key(key: &str, value: &Value) -> String {
+    let key = render_scalar(&Value::String(key.into()));
     match value {
         Value::Sequence(items) if items.is_empty() => format!("{key}: []\n"),
         Value::Sequence(items) => {
@@ -302,15 +335,25 @@ fn render_scalar(value: &Value) -> String {
 
 /// True for the line that starts top-level `key`.
 fn starts_key(line: &str, key: &str) -> bool {
-    line.strip_prefix(key)
-        .and_then(|rest| rest.strip_prefix(':'))
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t', '\n', '\r']))
+    top_level_key(line).as_deref() == Some(key)
 }
 
-/// Lines after a key line that still belong to its value: indented lines and
-/// block list items, which YAML also allows at column zero.
-fn continues_value(line: &str) -> bool {
-    line.starts_with([' ', '\t']) || line.starts_with("- ") || line.trim_end() == "-"
+/// Parse the key token with YAML itself, including quoted/escaped keys. A
+/// top-level property ends the previous property's entire multiline value.
+fn top_level_key(line: &str) -> Option<String> {
+    if line.starts_with([' ', '\t', '#', '-']) {
+        return None;
+    }
+    for (i, _) in line.match_indices(':') {
+        if !line[i + 1..].is_empty() && !line[i + 1..].starts_with(char::is_whitespace) {
+            continue;
+        }
+        let key = serde_yaml::from_str::<Value>(&line[..i]).ok();
+        if let Some(Value::String(key)) = key {
+            return Some(key);
+        }
+    }
+    None
 }
 
 fn set_key(text: &str, key: &str, value: &Value) -> String {
@@ -327,10 +370,18 @@ fn set_key(text: &str, key: &str, value: &Value) -> String {
     let mut replaced = false;
     while let Some(line) = lines.next() {
         if !replaced && starts_key(line, key) {
-            while lines.peek().is_some_and(|next| continues_value(next)) {
-                lines.next();
+            let mut comments = String::new();
+            while lines
+                .peek()
+                .is_some_and(|next| top_level_key(next).is_none())
+            {
+                let next = lines.next().unwrap();
+                if next.trim().is_empty() || next.trim_start().starts_with('#') {
+                    comments.push_str(next);
+                }
             }
             out.push_str(&rendered);
+            out.push_str(&comments);
             replaced = true;
         } else {
             out.push_str(line);
@@ -455,5 +506,104 @@ mod tests {
         };
         bare.append_line("x");
         assert_eq!(bare.text, "---\ndone: false\n---\n- x\n");
+    }
+}
+
+#[cfg(test)]
+mod regressions {
+    use super::*;
+    #[test]
+    fn quoted_yaml_property_must_be_updated_without_duplicate() {
+        let text = "---\n\"state\": active\nother: preserved\n---\nBody\n";
+        let out = set_key(text, "state", &Value::String("review".into()));
+        assert!(
+            parse_frontmatter(&out).is_ok(),
+            "valid note becomes unreadable: {out}"
+        );
+    }
+    #[test]
+    fn commented_multiline_list_must_remain_valid_yaml() {
+        let text =
+            "---\nsessions:\n  - first\n# user comment\n  - second\nother: preserved\n---\nBody\n";
+        assert!(parse_frontmatter(text).is_ok());
+        let out = set_key(
+            text,
+            "sessions",
+            &Value::Sequence(vec![Value::String("new".into())]),
+        );
+        assert_eq!(
+            parse_frontmatter(&out).unwrap()["sessions"]
+                .as_sequence()
+                .unwrap()
+                .len(),
+            1,
+            "old list item survives replacement: {out}"
+        );
+    }
+    #[test]
+    fn description_must_preserve_heading_inside_code_fence() {
+        let text = "---\n---\nExample:\n```md\n## Agent notes\nexample only\n```\n\nReal description end\n\n## Agent notes\n- actual finding\n";
+        let mut note = Note {
+            path: "dummy.md".into(),
+            text: text.into(),
+            modified: SystemTime::now(),
+            frontmatter: Mapping::new(),
+        };
+        note.set_description("New description");
+        assert_eq!(
+            note.body().trim(),
+            "New description\n\n## Agent notes\n- actual finding"
+        );
+    }
+}
+
+#[cfg(test)]
+mod preservation_tests {
+    use super::*;
+
+    #[test]
+    fn quoted_keys_and_comments_inside_lists_keep_other_source_text() {
+        for key in ["'sessions'", "\"sessions\""] {
+            let text = format!(
+                "---\n# before\n{key}:\n  - old\n\n# inside\n  - stale\n# after\nother: yes # unchanged\n---\nBody\n"
+            );
+            let value = Value::Sequence(vec![Value::String("new".into())]);
+            let out = set_key(&text, "sessions", &value);
+            let parsed = parse_frontmatter(&out).unwrap();
+            assert_eq!(parsed["sessions"], value);
+            assert!(out.contains("# before"));
+            assert!(out.contains("# inside"));
+            assert!(out.contains("# after\nother: yes # unchanged\n---\nBody\n"));
+        }
+    }
+
+    #[test]
+    fn unrepresentable_source_edit_is_rejected_before_writing() {
+        let root = crate::table::fixtures::temp_dir();
+        let path = root.join("demo.md");
+        let text = "---\n{state: active, other: preserved}\n---\nBody\n";
+        fs::write(&path, text).unwrap();
+        let mut note = Note::read(&path).unwrap();
+        note.set("state", Value::String("review".into()));
+        assert!(note.save().is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn fenced_headings_never_become_agent_note_boundaries() {
+        for fence in ["```", "~~~~"] {
+            let body = format!(
+                "Example:\n{fence}md\n## Agent notes\n## Another example\n{fence}\nStill description\n\n## Agent notes\n- real\n{fence}md\n## Sample\n{fence}\n\n## Personal\nKeep\n"
+            );
+            let out = append_under_heading(&body, AGENT_NOTES, "new");
+            assert!(out.contains(&format!("{fence}\n- new\n\n## Personal\nKeep")));
+            let note = Note {
+                path: "demo.md".into(),
+                text: body,
+                modified: SystemTime::now(),
+                frontmatter: Mapping::new(),
+            };
+            assert!(note.description().ends_with("Still description"));
+        }
     }
 }

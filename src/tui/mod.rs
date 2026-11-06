@@ -88,7 +88,7 @@ enum Update {
     /// herdr's agents and tabs.
     Agents(Vec<herdr::Agent>, Vec<herdr::Tab>),
     /// A dialog's action checked, or why it can't be.
-    Plan(Result<Action, String>),
+    Plan(u64, Result<Action, String>),
     /// A line of a running command's report.
     Said(String),
     /// A running command's question: a pick of `items`, yes or no without them.
@@ -127,6 +127,7 @@ struct App {
     filter: String,
     prompt: Option<(Prompt, String)>,
     dialog: Option<Dialog>,
+    plan_generation: u64,
     /// Shown in the footer for a few seconds instead of the key hints.
     message: Option<(String, Instant)>,
     help: bool,
@@ -191,6 +192,7 @@ impl App {
             filter: String::new(),
             prompt: None,
             dialog: None,
+            plan_generation: 0,
             message: None,
             help: false,
             preview: None,
@@ -348,6 +350,7 @@ impl App {
         self.agents_polling = true;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
+            let _operation = herdr::operation();
             let agents = herdr::list_agents().unwrap_or_default();
             let tabs = herdr::list_tabs().unwrap_or_default();
             let _ = tx.send(Update::Agents(agents, tabs));
@@ -427,7 +430,7 @@ impl App {
                 self.pending.remove(&detail);
                 self.details.insert(detail, text);
             }
-            Update::Plan(plan) => self.on_plan(plan),
+            Update::Plan(generation, plan) => self.on_plan(generation, plan),
             Update::Said(line) => self.on_said(line),
             Update::Ask {
                 prompt,
@@ -616,4 +619,51 @@ fn report_skipped(table: &mut Table, skipped: &[NoteError]) {
     table
         .warnings
         .extend(skipped.iter().map(|err| format!("skipped {err}")));
+}
+
+#[cfg(test)]
+mod close_plan_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_close_check_preserves_new_form_and_newer_generation() {
+        let dir = crate::table::fixtures::temp_dir();
+        let config = Config {
+            name: "demo".into(),
+            jira: None,
+            gitlab: None,
+            workflow: Default::default(),
+            repos: vec![],
+            vault: crate::config::VaultConfig {
+                path: dir,
+                task_dirs: vec![],
+                new_task_dir: "tasks".into(),
+            },
+        };
+        let mut app = App::new(vec![config], Some(0)).unwrap();
+        app.open_new_task();
+        if let Some(Dialog::NewTask(form)) = &mut app.dialog {
+            form.paste("Unsaved task title");
+        }
+        app.on_plan(1, Err("late cancelled result".into()));
+        let Some(Dialog::NewTask(form)) = &app.dialog else {
+            panic!("late result discarded the form")
+        };
+        assert!(
+            new_task::lines(form)
+                .iter()
+                .any(|line| line.to_string().contains("Unsaved task title"))
+        );
+        app.dialog = Some(Dialog::Checking {
+            title: "newer check".into(),
+            generation: 2,
+        });
+        app.on_plan(1, Err("stale check".into()));
+        assert!(matches!(
+            app.dialog,
+            Some(Dialog::Checking { generation: 2, .. })
+        ));
+        app.on_plan(2, Err("current check".into()));
+        assert!(matches!(app.dialog, Some(Dialog::Report(_))));
+    }
 }

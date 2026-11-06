@@ -7,22 +7,22 @@ the Obsidian vault joined into one table, shown in Obsidian and in a TUI.
 
 ## Why
 
-- Task notes in `30-work/tasks/` stopped being maintained (newest is DEMO-53289,
-  current work is DEMO-6108x): linking tickets, MRs and branches by hand is tedious.
+- Task notes in `30-work/tasks/` stopped being maintained (newest is DEMO-41,
+  current work is DEMO-4x): linking tickets, MRs and branches by hand is tedious.
 - `jg` knows how tickets, MRs and worktrees relate, but only prints it; nothing is
   remembered and there is no place for context.
 - Context is per task, not per ticket: one piece of work spans several tickets,
   several stacked MRs and one shared worktree, and agents on neighbouring tickets
   should read the same notes.
-- Finished worktrees pile up (10 in demoapp at the time of writing).
+- Finished worktrees pile up (10 in demo at the time of writing).
 
 ## Model
 
 ```
 task  (note: shared context; any size — a "project" is just a big task)
- ├─ tickets    DEMO-61083, DEMO-61084        manual, plus keys found on the task's worktrees/MRs
- ├─ MRs        !16428 !16266 !16170        auto: ticket key in source branch or title
- ├─ branches   demo/DEMO-61083-…        auto: from MRs and local refs with the key
+ ├─ tickets    DEMO-42, DEMO-43        manual, plus keys found on the task's worktrees/MRs
+ ├─ MRs        !42 !43 !44        auto: ticket key in source branch or title
+ ├─ branches   demo/DEMO-42-…        auto: from MRs and local refs with the key
  ├─ worktrees  a2i-config                  auto: worktree whose branch is one of the above
  ├─ agents     a2i-config, …-review        auto: herdr agent whose cwd is inside a worktree
  └─ sessions   a9c0419b (a2i-config, 10-08) auto, append-only: claude sessions run in its worktrees
@@ -73,7 +73,7 @@ A ticket listed in two tasks is a conflict: shown in both, flagged in loose ends
 
 ## Note format
 
-Existing conventions are kept: file `DEMO-61083 Title.md` or any free name, keys
+Existing conventions are kept: file `DEMO-42 Title.md` or any free name, keys
 `done`, `project`, `jira`, `start`, `status`, `aliases` keep working.
 
 Decided 2026-10-09: the TUI is the daily view; Obsidian is archive and search,
@@ -82,7 +82,7 @@ task notes are not edited on the phone. So notes carry almost no live data.
 ```yaml
 ---
 # user-owned (berbr writes these on a command; sync only appends to tickets)
-tickets: [DEMO-61083, DEMO-61084]
+tickets: [DEMO-42, DEMO-43]
 tags: [a2i, selectors, cache]
 parent: "[[единый образ]]"
 done: false
@@ -90,8 +90,8 @@ done: false
 state: active
 sessions: ["a9c0419b-e9d1-… a2i-config 2026-10-08", "6db598b3-… a2i-config-review 2026-10-09"]
 # written once by `berbr done`, frozen afterwards
-mrs: ["https://gitlab.example.com/…/-/merge_requests/16428", "https://gitlab.example.com/…/-/merge_requests/16266"]
-branches: [demo/DEMO-61083-a2i-config-folder, demo/DEMO-61083-selectors-3-level]
+mrs: ["https://gitlab.example.com/…/-/merge_requests/42", "https://gitlab.example.com/…/-/merge_requests/43"]
+branches: [demo/DEMO-42-a2i-config-folder, demo/DEMO-42-selectors-3-level]
 closed: 2026-11-02
 ---
 ```
@@ -195,9 +195,9 @@ berbr status                   the table in plain text
 
 ### `berbr start <task name | KEY> [-k KEY]... [-t tag]... [-m text] [-n name] [-b branch] [--bg] [--new-ticket] [--no-worktree] [--no-agent]`
 
-- **A ticket key** (`DEMO-12345`) — a new task named after the ticket's summary
+- **A ticket key** (`DEMO-44`) — a new task named after the ticket's summary
   (characters a file name can't hold dropped), with that ticket: the same as
-  `berbr start "<summary>" -k DEMO-12345`. Work never runs without a task — the note
+  `berbr start "<summary>" -k DEMO-44`. Work never runs without a task — the note
   is where the context and agents' findings go. If the ticket already belongs to
   a task, this is `berbr add <that task> <KEY>`.
 - **A name** — a new task: creates the note `<new_task_dir>/<name>.md` (`-k`
@@ -214,7 +214,7 @@ berbr status                   the table in plain text
 - **No argument** — fuzzy picker over my open Jira tickets not in any task, plus
   "new task…".
 
-`berbr start` and `berbr add` return at once: fetch and checkout of demoapp take ~30 s, so
+`berbr start` and `berbr add` return at once: fetch and checkout of demo take ~30 s, so
 the new tab runs the hidden `berbr prepare <spec>` — step lines with a spinner and
 git's own checkout progress, then the brief; the tab's shell then cds into the
 worktree and starts `command claude` — herdr shows the branch of the shell's
@@ -266,15 +266,18 @@ kept stable.
 ```
 berbr review [<worktree>]   reviewer agent next to the task agent
                          (model: `[workflow] review_model`)
-berbr done [<task | worktree>] [--merged] [--force] [-y]
+berbr done [<task>] [--tree <name-or-path> [--repo <path>]] [--merged] [-y]
                     remove worktrees, branches, herdr views. On a task: asks yes/no,
                     refuses while an MR is open or commits are unpushed,
-                    uncommitted changes are lost once confirmed,
+                    lists dirty checkout names and uncommitted file counts before
+                    confirmation; accepting the task plan discards those files,
                     closes my open tickets of it in Jira (a done-category
                     transition like Closed, never Cancelled; others' tickets are
                     left open), writes done: true, closed, mrs, branches, and
                     last closes the task's herdr workspace.
-                    --merged: sweep all finished worktrees
+                    failed removal/Jira steps leave the note and workspace open;
+                    --tree: explicit checkout only, optionally scoped with --repo;
+                    --merged: sweep all finished clean worktrees
 berbr attach <KEY> [<task>]   put a ticket into a task, no worktree or agent
 berbr note "<text>"    (agents) append to the task's `## Agent notes`
 berbr completions <shell>     shell completion script
@@ -364,18 +367,19 @@ path = "~/demo-vault"
 
 [workflow]                  # defaults for every project
 branch_prefix = "demo/"
+worktree_dir = ".herdr/worktrees" # repository-relative; per-project override allowed
 # review_model = "claude-fable-5-1"
 # ide = "IntelliJ IDEA"
 
-[[project]]                 # a tab in the TUI, `berbr -p demoapp`
-name = "demoapp"
+[[project]]                 # a tab in the TUI, `berbr -p demo`
+name = "demo"
 task_dirs = ["30-work/tasks"]
 # new_task_dir = "30-work/tasks"   # default: the first of task_dirs
 jira = { host = "https://jira.example.com", project = "DEMO", issue_type = "Задача" }
 gitlab = { host = "gitlab.example.com", project = "demo/service" }
 
 [[project.repo]]
-path = "~/projects/demoapp"
+path = "~/projects/demo"
 gitlab_project = "demo/service"
 
 [[project]]                 # no Jira, no GitLab: notes, worktrees, agents
@@ -464,3 +468,8 @@ close. Planning reads fresh remote data, falling back to caches under the same
 rules as execution, but saves neither remote nor transcript caches. Git status
 uses `--no-optional-locks` so inspection does not refresh the worktree index.
 Unknown counts in forced removals are null rather than fabricated zeroes.
+
+New checkouts live in the configured `worktree_dir` (default `.herdr/worktrees`).
+The CLI discovers configured and legacy `.claude/worktrees` roots together,
+keeps canonical paths for association/resume, and never moves a legacy checkout.
+Creation excludes the chosen root through `.git/info/exclude`, once per repository.

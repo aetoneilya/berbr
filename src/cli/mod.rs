@@ -102,8 +102,8 @@ enum CliCommands {
     /// Start a reviewer agent next to the task's agent
     Review { name: Option<String> },
     /// Close a task: `berbr done "<task>"` (or a ticket of it) removes its finished
-    /// worktrees, closes my tickets in Jira and marks the note done. With a
-    /// worktree name, or none inside one: remove that worktree
+    /// worktrees, closes my tickets in Jira and marks the note done. Use --tree
+    /// to remove one checkout, or omit the target inside that checkout
     Done(DoneArgs),
     /// Shell completion script
     Completions {
@@ -134,7 +134,8 @@ pub(crate) struct StartArgs {
     /// With no task name, the agent generates a name from this text first
     #[arg(long)]
     pub(crate) description: Option<String>,
-    /// Worktree, tab and agent name; default: ticket summary, title slug, or task ID
+    /// Worktree, tab and agent name; checkout root: [workflow] worktree_dir
+    /// (default .herdr/worktrees). Name defaults to ticket summary/title/task ID
     #[arg(long, short = 'n')]
     pub(crate) name: Option<String>,
     /// Default: <branch_prefix><KEY>-<name>
@@ -239,7 +240,15 @@ struct DoneArgs {
     /// Print the dry-run plan as one JSON object
     #[arg(long, requires = "dry_run")]
     json: bool,
+    /// Task ID, title or ticket alias; checkout removal requires --tree
+    #[arg(conflicts_with_all = ["tree", "merged"])]
     name: Option<String>,
+    /// Remove only this worktree; never resolve a task or ticket alias
+    #[arg(long, conflicts_with = "merged")]
+    tree: Option<String>,
+    /// Main repository path to disambiguate --tree
+    #[arg(long, requires = "tree")]
+    repo: Option<PathBuf>,
     /// Remove every clean worktree whose MR is merged or closed
     #[arg(long)]
     merged: bool,
@@ -289,9 +298,11 @@ pub fn run() -> Result<(), String> {
     };
     let chosen = choose_project(&projects, cli.project.as_deref(), cwd.as_deref())?;
     if let CliCommands::AppSnapshot { cached } = command {
+        let _operation = crate::client::herdr::operation();
         return app::snapshot(&projects, chosen, cached);
     }
     let config = projects.swap_remove(chosen);
+    let _operation = crate::client::herdr::operation();
     match command {
         CliCommands::AppSnapshot { .. } => unreachable!(),
         CliCommands::Status(args) => table::cli_status(&config, args),

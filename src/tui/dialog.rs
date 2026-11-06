@@ -16,7 +16,7 @@ use std::sync::mpsc::{Sender, channel};
 
 pub(super) enum Dialog {
     /// Checks before a confirmation; Esc stops waiting for them.
-    Checking(String),
+    Checking { title: String, generation: u64 },
     /// What the action will do and its question: yes runs it, no or Esc
     /// doesn't. Blocked, it only closes.
     Confirm {
@@ -47,7 +47,7 @@ impl Dialog {
     /// Waiting on something: its spinner has to move.
     pub(super) fn busy(&self) -> bool {
         match self {
-            Dialog::Checking(_) => true,
+            Dialog::Checking { .. } => true,
             Dialog::Report(report) => !report.finished && report.question.is_none(),
             _ => false,
         }
@@ -202,7 +202,7 @@ impl Action {
         lines = vec!["not finished:".to_string()];
         lines.extend(blockers.iter().map(|b| format!("  {b}")));
         lines.push(String::new());
-        lines.push("finish these, or berbr done --force in a terminal".to_string());
+        lines.push("resolve these blockers before closing".to_string());
         (lines, true)
     }
 
@@ -255,10 +255,12 @@ impl App {
     where
         F: FnOnce(&Config) -> Result<Action, String> + Send + 'static,
     {
-        self.dialog = Some(Dialog::Checking(title));
+        self.plan_generation += 1;
+        let generation = self.plan_generation;
+        self.dialog = Some(Dialog::Checking { title, generation });
         let (config, tx) = (self.config.clone(), self.tx.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(Update::Plan(plan(&config)));
+            let _ = tx.send(Update::Plan(generation, plan(&config)));
         });
     }
 
@@ -278,14 +280,19 @@ impl App {
         }));
         let (config, tx) = (self.config.clone(), self.tx.clone());
         std::thread::spawn(move || {
+            let _operation = crate::client::herdr::operation();
             let result = command(&config, &mut Remote(tx.clone()));
             let _ = tx.send(Update::Finished(result));
         });
     }
 
-    pub(super) fn on_plan(&mut self, plan: Result<Action, String>) {
+    pub(super) fn on_plan(&mut self, generation: u64, plan: Result<Action, String>) {
         // given up on meanwhile
-        let Some(Dialog::Checking(title)) = self.dialog.take() else {
+        if !matches!(&self.dialog, Some(Dialog::Checking {generation: active, ..}) if *active == generation)
+        {
+            return;
+        }
+        let Some(Dialog::Checking { title, .. }) = self.dialog.take() else {
             return;
         };
         match plan {
@@ -362,7 +369,7 @@ impl App {
     pub(super) fn on_dialog_key(&mut self, key: KeyEvent) {
         let close = matches!(key.code, KeyCode::Esc | KeyCode::Char('q'));
         match self.dialog.take() {
-            Some(Dialog::Checking(_)) if close => {}
+            Some(Dialog::Checking { .. }) if close => {}
             Some(Dialog::Confirm { .. }) if close => {}
             Some(Dialog::Confirm {
                 title,
@@ -429,7 +436,7 @@ impl App {
             Line::from(Span::styled(l.clone(), style))
         };
         let (title, mut text, hint): (&str, Vec<Line>, &str) = match dialog {
-            Dialog::Checking(title) => (
+            Dialog::Checking { title, .. } => (
                 title,
                 vec![Line::raw(format!("{} checking", super::anim::spinner()))],
                 "Esc cancel",

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 /// Everything the table is built from, as fetched.
 pub struct Inputs {
+    pub mains: Vec<PathBuf>,
     pub tasks: Vec<Task>,
     pub tickets: HashMap<String, Ticket>,
     pub mrs: Vec<Mr>,
@@ -21,7 +22,7 @@ pub struct Inputs {
     pub workspaces: Vec<herdr::Workspace>,
     /// Agent sessions by id.
     pub sessions: HashMap<String, Session>,
-    /// `<main checkout>/.claude/worktrees` of every repo.
+    /// Configured and legacy worktree roots of every repo.
     pub roots: Vec<PathBuf>,
     /// Jira and GitLab both answered in full: task states can be derived.
     pub complete: bool,
@@ -33,6 +34,7 @@ pub struct Inputs {
 
 pub fn assemble(inputs: Inputs) -> Table {
     let Inputs {
+        mains,
         tasks,
         tickets,
         mrs,
@@ -44,7 +46,7 @@ pub fn assemble(inputs: Inputs) -> Table {
         complete,
         jira,
         gitlab,
-        warnings,
+        mut warnings,
         jira_host,
     } = inputs;
 
@@ -57,11 +59,7 @@ pub fn assemble(inputs: Inputs) -> Table {
             .enumerate()
             .filter(|(_, m)| Some(m.mr.source_branch()) == branch)
             // the same branch name in another repo is another branch
-            .filter(|(_, m)| {
-                tree.project
-                    .as_deref()
-                    .is_none_or(|p| m.project.is_empty() || m.project == p)
-            })
+            .filter(|(_, m)| tree.project.as_deref() == Some(m.project.as_str()))
             .max_by_key(|(_, m)| m.mr.iid())
             .map(|(i, _)| i);
         // a branch named without a ticket key still carries one in its MR title
@@ -97,9 +95,38 @@ pub fn assemble(inputs: Inputs) -> Table {
     conflicts.sort();
     let mut owned: HashSet<String> = owners.keys().map(|k| k.to_string()).collect();
 
+    let mut spaces = HashMap::new();
+    for task in &tasks {
+        let space = match crate::vault::task::task_space_in(task, &workspaces, &tasks) {
+            Ok(space) => space.map(|s| s.workspace_id.clone()),
+            Err(warning) => {
+                warnings.push(warning);
+                None
+            }
+        };
+        spaces.insert(task.name.clone(), space);
+        for reference in task
+            .note
+            .strings("worktrees")
+            .into_iter()
+            .chain(task.sessions.iter().map(|s| s.worktree.clone()))
+        {
+            if !Path::new(&reference).is_absolute()
+                && trees.iter().filter(|t| t.wt.name() == reference).count() > 1
+            {
+                warnings.push(format!(
+                    "{}: ambiguous worktree {reference}; save its full path",
+                    task.name
+                ));
+            }
+        }
+    }
     let mut rows: Vec<TaskRow> = tasks
         .into_iter()
-        .map(|task| task_row(task, &trees, &mrs, &workspaces, &owned))
+        .map(|task| {
+            let space = spaces.remove(&task.name).flatten();
+            task_row(task, &trees, &mrs, space, &owned)
+        })
         .collect();
     // a key found on the work of several tasks is none of theirs to write down:
     // which one it is for is mine to say
@@ -171,15 +198,15 @@ pub fn assemble(inputs: Inputs) -> Table {
         .copied()
         .filter(|&i| trees[i].keys.is_empty())
         .collect();
-    let tree_branches: HashSet<&str> = trees
+    let tree_branches: HashSet<_> = trees
         .iter()
-        .filter_map(|t| t.wt.branch.as_deref())
+        .filter_map(|t| Some((t.project.as_deref()?, t.wt.branch.as_deref()?)))
         .collect();
     let other_mrs = (0..mrs.len())
         .filter(|&i| {
             mrs[i].opened()
                 && mrs[i].keys.is_empty()
-                && !tree_branches.contains(mrs[i].mr.source_branch())
+                && !tree_branches.contains(&(mrs[i].project.as_str(), mrs[i].mr.source_branch()))
         })
         .collect();
 
@@ -202,6 +229,7 @@ pub fn assemble(inputs: Inputs) -> Table {
     loose.sort_by(|a, b| (loose_rank(a), created(b)).cmp(&(loose_rank(b), created(a))));
 
     Table {
+        mains,
         tasks: rows,
         loose,
         other_trees,
@@ -218,6 +246,31 @@ pub fn assemble(inputs: Inputs) -> Table {
     }
 }
 
+pub(super) fn task_trees(task: &Task, trees: &[Tree], space: Option<&str>) -> Vec<usize> {
+    let has_key = |keys: &[String]| keys.iter().any(|k| task.tickets.contains(k));
+    let in_space =
+        |tree: &Tree| space.is_some_and(|s| tree.agents.iter().any(|a| a.workspace == s));
+    let from_session = |tree: &Tree| {
+        task.sessions
+            .iter()
+            .any(|s| tree_reference_matches(&s.worktree, tree, trees))
+    };
+    let saved_worktrees = task.note.strings("worktrees");
+    let row_trees: Vec<usize> = (0..trees.len())
+        .filter(|&i| {
+            has_key(&trees[i].keys)
+                || saved_worktrees
+                    .iter()
+                    .any(|r| tree_reference_matches(r, &trees[i], trees))
+                || in_space(&trees[i])
+                || from_session(&trees[i])
+                || (task.note.string("id").as_deref() == Some(task.name.as_str())
+                    && tree_reference_matches(&task.name, &trees[i], trees))
+        })
+        .collect();
+    row_trees
+}
+
 /// The task with its worktrees and MRs. A worktree belongs to the task by its
 /// branch's ticket key, a saved session, or an agent in the task's workspace;
 /// an MR by a ticket key, or by the branch of one of those worktrees.
@@ -225,40 +278,20 @@ fn task_row(
     task: Task,
     trees: &[Tree],
     mrs: &[Mr],
-    workspaces: &[herdr::Workspace],
+    space: Option<String>,
     owned: &HashSet<String>,
 ) -> TaskRow {
-    let space = workspaces
-        .iter()
-        .find(|w| crate::vault::task::task_space_matches(&task, &w.label))
-        .map(|w| w.workspace_id.clone());
     let has_key = |keys: &[String]| keys.iter().any(|k| task.tickets.contains(k));
-    let in_space = |tree: &Tree| {
-        space
-            .as_ref()
-            .is_some_and(|s| tree.agents.iter().any(|a| &a.workspace == s))
-    };
-    let from_session = |tree: &Tree| {
-        let name = tree.wt.name();
-        task.sessions.iter().any(|s| s.worktree == name)
-    };
-    let saved_worktrees = task.note.strings("worktrees");
-    let row_trees: Vec<usize> = (0..trees.len())
-        .filter(|&i| {
-            has_key(&trees[i].keys)
-                || saved_worktrees.contains(&trees[i].wt.name())
-                || in_space(&trees[i])
-                || from_session(&trees[i])
-                || (task.note.string("id").as_deref() == Some(task.name.as_str())
-                    && trees[i].wt.name() == task.name)
-        })
-        .collect();
-    let branches: Vec<&str> = row_trees
+    let row_trees = task_trees(&task, trees, space.as_deref());
+    let branches: Vec<_> = row_trees
         .iter()
-        .filter_map(|&i| trees[i].wt.branch.as_deref())
+        .filter_map(|&i| Some((trees[i].project.as_deref()?, trees[i].wt.branch.as_deref()?)))
         .collect();
     let row_mrs: Vec<usize> = (0..mrs.len())
-        .filter(|&i| has_key(&mrs[i].keys) || branches.contains(&mrs[i].mr.source_branch()))
+        .filter(|&i| {
+            has_key(&mrs[i].keys)
+                || branches.contains(&(mrs[i].project.as_str(), mrs[i].mr.source_branch()))
+        })
         .collect();
     // keys on its worktrees and MRs that no note lists are the task's too
     let mut found_tickets: Vec<String> = Vec::new();
@@ -286,6 +319,13 @@ fn task_row(
         state: None,
         parent: None,
     }
+}
+
+fn tree_reference_matches(reference: &str, tree: &Tree, trees: &[Tree]) -> bool {
+    if Path::new(reference).is_absolute() {
+        return Path::new(reference) == tree.wt.path;
+    }
+    tree.wt.name() == reference && trees.iter().filter(|t| t.wt.name() == reference).count() == 1
 }
 
 /// `active` or `review` for a ticket with a live worktree or an open MR, None
@@ -368,8 +408,30 @@ fn discover_sessions(
     roots: &[PathBuf],
     sessions: &HashMap<String, Session>,
 ) -> Vec<SessionRef> {
-    let mut names: Vec<String> = row.trees.iter().map(|&i| trees[i].wt.name()).collect();
-    names.extend(row.task.sessions.iter().map(|s| s.worktree.clone()));
+    let mut paths: HashSet<PathBuf> = row
+        .trees
+        .iter()
+        .map(|&i| trees[i].wt.path.clone())
+        .collect();
+    paths.extend(
+        row.task
+            .note
+            .strings("worktrees")
+            .into_iter()
+            .filter(|p| Path::new(p).is_absolute())
+            .map(PathBuf::from),
+    );
+    for saved in &row.task.sessions {
+        let scoped: Vec<_> = paths
+            .iter()
+            .filter(|p| p.file_name().is_some_and(|n| n == saved.worktree.as_str()))
+            .collect();
+        if Path::new(&saved.worktree).is_absolute() {
+            paths.insert(saved.worktree.clone().into());
+        } else if scoped.is_empty() && roots.len() == 1 {
+            paths.insert(roots[0].join(&saved.worktree));
+        }
+    }
 
     let mut found: Vec<SessionRef> = sessions
         .values()
@@ -377,8 +439,15 @@ fn discover_sessions(
         .filter_map(|s| {
             let worktree = roots
                 .iter()
-                .flat_map(|root| s.worktrees_under(root))
-                .find(|name| names.contains(name))?;
+                .flat_map(|root| {
+                    s.worktrees_under(root)
+                        .into_iter()
+                        .map(move |name| (root.join(&name), name))
+                })
+                .find(|(path, _)| paths.contains(path))?
+                .0
+                .to_string_lossy()
+                .into_owned();
             Some(SessionRef {
                 id: s.id.clone(),
                 worktree,
@@ -473,10 +542,19 @@ mod tests {
 
     #[test]
     fn numbered_task_keeps_its_tree_without_live_agents_after_a_title_change() {
-        let task = task_note("demo-0", "id: demo-0\ntitle: Новое название\n", "2026-11-02");
+        let task = task_note(
+            "demo-0",
+            "id: demo-0\ntitle: Новое название\n",
+            "2026-11-02",
+        );
         assert_eq!(task.name, "demo-0");
         assert_eq!(task.title().as_deref(), Some("Новое название"));
-        let table = table(vec![task], vec![], vec![], vec![tree("demo-0", "me/demo-0")]);
+        let table = table(
+            vec![task],
+            vec![],
+            vec![],
+            vec![tree("demo-0", "me/demo-0")],
+        );
         assert_eq!(table.tasks[0].trees, vec![0]);
         assert!(
             table.tasks[0]
@@ -783,7 +861,10 @@ mod tests {
         );
         assert!(table.tree(table.tree_index("old")).finished);
         // worked on first (in review after active), then nothing done
-        assert_eq!(table.loose_keys(), vec!["DEMO-5", "DEMO-7", "DEMO-9", "DEMO-6"]);
+        assert_eq!(
+            table.loose_keys(),
+            vec!["DEMO-5", "DEMO-7", "DEMO-9", "DEMO-6"]
+        );
         let states: Vec<Option<TaskState>> = table.loose.iter().map(|l| l.state).collect();
         assert_eq!(
             states,
@@ -845,7 +926,12 @@ mod tests {
             TaskState::Active
         );
         assert_eq!(
-            state_of(vec![ticket("DEMO-1", New, true)], vec![], vec![], &["DEMO-1"]),
+            state_of(
+                vec![ticket("DEMO-1", New, true)],
+                vec![],
+                vec![],
+                &["DEMO-1"]
+            ),
             TaskState::Idea
         );
         assert_eq!(state_of(vec![], vec![], vec![], &[]), TaskState::Idea);
@@ -923,7 +1009,13 @@ mod tests {
             .map(|s| (s.id.as_str(), s.worktree.as_str()))
             .collect();
         // in a current worktree, or in one the note already has sessions of
-        assert_eq!(found, vec![("s1", "a"), ("s2", "gone")]);
+        assert_eq!(
+            found,
+            vec![
+                ("s1", "/r/.claude/worktrees/a"),
+                ("s2", "/r/.claude/worktrees/gone")
+            ]
+        );
     }
 
     #[test]
@@ -950,7 +1042,10 @@ mod tests {
             assert!(table.trees[0].finished);
             assert_eq!(table.tasks[0].trees, vec![0]);
             assert_eq!(table.tasks[0].new_sessions[0].id, "codex:demo");
-            assert_eq!(table.tasks[0].new_sessions[0].worktree, "done");
+            assert_eq!(
+                table.tasks[0].new_sessions[0].worktree,
+                "/r/.claude/worktrees/done"
+            );
         }
     }
 
@@ -987,7 +1082,10 @@ mod tests {
         assert_eq!(task.state, Some(TaskState::Active));
         assert_eq!(task.note.strings("tickets"), vec!["[[DEMO-1]]", "DEMO-2"]);
         let sessions: Vec<String> = task.sessions.iter().map(|s| s.entry()).collect();
-        assert_eq!(sessions, vec!["s0 a 2026-10-01", "s1 a 2026-10-08"]);
+        assert_eq!(
+            sessions,
+            vec!["s0 a 2026-10-01", "s1 /r/.claude/worktrees/a 2026-10-08"]
+        );
         // the table now matches the note: nothing more to write
         assert!(write_back(&mut table).is_empty());
     }
@@ -1032,5 +1130,122 @@ mod naming_tests {
             vec![tree("old-title", "dev/old-title")],
         );
         assert_eq!(table.tasks[0].trees, vec![0]);
+    }
+}
+
+#[cfg(test)]
+mod regressions {
+    use super::*;
+    use crate::table::fixtures::*;
+    #[test]
+    fn space_identity_must_win_over_title_collision() {
+        let tasks = vec![
+            task_note("demo-0", "id: demo-0\ntitle: Shared", "2026-11-01"),
+            task_note("demo-1", "id: demo-1\ntitle: Shared", "2026-11-01"),
+        ];
+        let mut data = inputs(tasks, vec![], vec![], vec![]);
+        data.workspaces = vec![
+            workspace("space-zero", "Shared"),
+            workspace("space-one", "demo-1"),
+        ];
+        let table = assemble(data);
+        assert_eq!(table.task_row("demo-1").space.as_deref(), Some("space-one"));
+    }
+    #[test]
+    fn task_mrs_must_be_scoped_to_repository() {
+        let mut wt = tree("work", "same-branch");
+        wt.project = Some("demo/alpha".into());
+        let mut own = mr(1, "same-branch", "alpha", "merged");
+        own.project = "demo/alpha".into();
+        let mut other = mr(2, "same-branch", "DEMO-99 beta", "opened");
+        other.project = "demo/beta".into();
+        let table = table(
+            vec![task_note("demo-0", "worktrees: [work]", "2026-11-01")],
+            vec![],
+            vec![own, other],
+            vec![wt],
+        );
+        assert_eq!(
+            table.task_row("demo-0").mrs,
+            vec![0],
+            "other repository MR and ticket are attached to this task"
+        );
+    }
+    #[test]
+    fn saved_tree_name_must_not_claim_another_repo() {
+        let mut a = tree("work", "alpha");
+        a.repo = "/demo/alpha".into();
+        a.wt.path = "/demo/alpha/.claude/worktrees/work".into();
+        let mut b = tree("work", "beta");
+        b.repo = "/demo/beta".into();
+        b.wt.path = "/demo/beta/.claude/worktrees/work".into();
+        let table = table(
+            vec![task_note("demo-0", "worktrees: [work]", "2026-11-01")],
+            vec![],
+            vec![],
+            vec![a, b],
+        );
+        assert!(
+            table.task_row("demo-0").trees.is_empty(),
+            "ambiguous bare worktree basename must not claim any repository"
+        );
+    }
+}
+
+#[cfg(test)]
+mod scoped_identity_tests {
+    use super::*;
+    use crate::table::fixtures::*;
+
+    #[test]
+    fn duplicate_titles_are_refused_but_a_task_id_space_wins() {
+        let tasks = vec![
+            task_note("demo-0", "title: Shared", "2026-11-01"),
+            task_note("demo-1", "title: Shared", "2026-11-01"),
+        ];
+        let mut data = inputs(tasks, vec![], vec![], vec![]);
+        data.workspaces = vec![workspace("s0", "Shared")];
+        let table = assemble(data);
+        assert!(table.tasks.iter().all(|r| r.space.is_none()));
+        assert_eq!(table.warnings.len(), 2);
+        let task = task_note("demo-1", "title: Shared", "2026-11-01");
+        let spaces = vec![workspace("s0", "Shared"), workspace("s1", "Shared")];
+        assert!(crate::vault::task::task_space(&task, &spaces).is_err());
+    }
+
+    #[test]
+    fn scoped_paths_and_session_discovery_stay_in_the_owning_repository() {
+        let mut a = tree("work", "alpha");
+        a.repo = "/home/dev/alpha".into();
+        a.wt.path = a.repo.join(".claude/worktrees/work");
+        let mut b = tree("work", "beta");
+        b.repo = "/home/dev/beta".into();
+        b.wt.path = b.repo.join(".claude/worktrees/work");
+        let task = task_note(
+            "demo-0",
+            "worktrees: [/home/dev/alpha/.claude/worktrees/work]",
+            "2026-11-01",
+        );
+        let paths = [a.wt.path.clone(), b.wt.path.clone()];
+        let mut data = inputs(vec![task], vec![], vec![], vec![a, b]);
+        data.roots = paths.iter().map(|p| p.parent().unwrap().into()).collect();
+        for (id, path) in ["own", "foreign"].into_iter().zip(paths) {
+            data.sessions.insert(
+                id.into(),
+                Session {
+                    id: id.into(),
+                    date: "2026-11-01".into(),
+                    cwds: vec![(path.to_string_lossy().into_owned(), 1)],
+                    first_cwd: None,
+                    last_cwd: None,
+                    modified: 0,
+                },
+            );
+        }
+        let table = assemble(data);
+        let row = table.task_row("demo-0");
+        assert_eq!(row.trees, [0]);
+        assert_eq!(row.new_sessions.len(), 1);
+        assert_eq!(row.new_sessions[0].id, "own");
     }
 }

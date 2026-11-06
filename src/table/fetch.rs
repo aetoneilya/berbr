@@ -3,15 +3,15 @@
 
 use super::matching::Inputs;
 use super::{Fresh, Mr, Source, Ticket, Tree};
-use crate::client::gitlab::{GitLab, MrReview};
+use crate::client::gitlab::GitLab;
 use crate::client::jira::{JiraClient, JiraIssue};
 use crate::client::worktree::{self, Worktree};
 use crate::client::{herdr, joined, parallel, sessions};
 use crate::config::Config;
 use crate::trace;
 use crate::vault::task::{Task, ticket_keys};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 /// Merged and closed MRs older than this are not fetched.
 const MR_LOOKBACK_DAYS: i64 = 90;
@@ -57,16 +57,141 @@ impl RemoteCache {
     }
 }
 
+pub(super) struct Options {
+    pub online: bool,
+    pub cached: bool,
+    pub persist: bool,
+    pub with_diff: bool,
+    pub closing: Option<String>,
+}
+
+struct Repository {
+    main: PathBuf,
+    project: Option<String>,
+    trees: Vec<Worktree>,
+    refs: Option<worktree::Refs>,
+    default: Option<String>,
+}
+
+fn repositories(config: &Config, refs: bool) -> (Vec<Repository>, Vec<String>) {
+    let mut found = Vec::new();
+    let mut warnings = Vec::new();
+    for repo in &config.repos {
+        let result = (|| {
+            let main = worktree::main_checkout(&repo.path).map_err(|e| e.to_string())?;
+            let trees = worktree::linked_worktrees(&main).map_err(|e| e.to_string())?;
+            let refs = if refs {
+                Some(worktree::Refs::read(&main).map_err(|e| e.to_string())?)
+            } else {
+                None
+            };
+            let default = refs
+                .as_ref()
+                .and_then(|r| r.default_branch(repo.main_branch.as_deref()));
+            Ok::<_, String>(Repository {
+                main,
+                trees,
+                refs,
+                default,
+                project: repo
+                    .gitlab_project
+                    .clone()
+                    .or_else(|| config.gitlab.as_ref().map(|g| g.project.clone())),
+            })
+        })();
+        match result {
+            Ok(repo) => found.push(repo),
+            Err(e) => warnings.push(format!("Git {}: {e}", repo.path.display())),
+        }
+    }
+    (found, warnings)
+}
+
+struct ClosingScope {
+    tickets: Vec<String>,
+    branches: HashSet<(String, String)>,
+}
+
+impl ClosingScope {
+    fn new(task: &Task, trees: &[Tree], space: Option<&str>) -> Self {
+        let owned = super::matching::task_trees(task, trees, space);
+        let mut tickets = task.tickets.clone();
+        for key in owned.iter().flat_map(|&i| &trees[i].keys) {
+            if !tickets.contains(key) {
+                tickets.push(key.clone());
+            }
+        }
+        let branches = owned
+            .iter()
+            .filter_map(|&i| Some((trees[i].project.clone()?, trees[i].wt.branch.clone()?)))
+            .collect();
+        Self { tickets, branches }
+    }
+
+    fn select(&self, mrs: Vec<Mr>) -> Vec<Mr> {
+        let mut branches = self.branches.clone();
+        branches.extend(
+            mrs.iter()
+                .filter(|m| m.keys.iter().any(|k| self.tickets.contains(k)))
+                .map(|m| (m.project.clone(), m.mr.source_branch().to_string())),
+        );
+        mrs.into_iter()
+            .filter(|m| {
+                m.keys.iter().any(|k| self.tickets.contains(k))
+                    || branches.contains(&(m.project.clone(), m.mr.source_branch().to_string()))
+            })
+            .collect()
+    }
+}
+
 /// `online: false` skips Jira and GitLab and git status. `cached`: what Jira
 /// and GitLab said last time stands in for what they do not say now, offline or
 /// failing.
-pub(super) fn fetch(
-    config: &Config,
-    tasks: Vec<Task>,
-    online: bool,
-    cached: bool,
-    persist: bool,
-) -> Inputs {
+pub(super) fn fetch(config: &Config, tasks: Vec<Task>, options: Options) -> Inputs {
+    let Options {
+        online,
+        cached,
+        persist,
+        with_diff,
+        closing,
+    } = options;
+    let (repos, repository_warnings) = repositories(config, online || with_diff);
+    let _operation = herdr::operation();
+    let mut roots: Vec<_> = repos
+        .iter()
+        .flat_map(|r| worktree::worktree_roots(&r.main, &config.workflow.worktree_dir))
+        .collect();
+    roots.extend(
+        repos
+            .iter()
+            .flat_map(|r| &r.trees)
+            .filter_map(|wt| wt.path.parent().map(|p| p.to_path_buf())),
+    );
+    let mut seen = HashSet::new();
+    roots.retain(|root| seen.insert(root.clone()));
+    let mains: Vec<_> = repos.iter().map(|r| r.main.clone()).collect();
+    let early_herdr = closing.as_ref().map(|_| live_herdr());
+    let mut raw_trees = collect_trees(&repos, false, false);
+    let early_sessions = closing
+        .as_ref()
+        .map(|_| load_sessions(&roots, &mains, &raw_trees, &tasks, false));
+    let closing = closing
+        .as_deref()
+        .and_then(|name| tasks.iter().find(|t| t.name == name))
+        .map(|task| {
+            let (agents, spaces, _) = early_herdr.as_ref().expect("closing inventory");
+            for tree in &mut raw_trees {
+                tree.agents = super::matching::agents_in(
+                    &tree.wt.path,
+                    agents,
+                    early_sessions.as_ref().expect("closing sessions"),
+                );
+            }
+            let space = crate::vault::task::task_space_in(task, spaces, &tasks)
+                .ok()
+                .flatten();
+            ClosingScope::new(task, &raw_trees, space.map(|s| s.workspace_id.as_str()))
+        });
     // a project without Jira or GitLab asks them nothing, as offline
     let jira = (online && config.jira.is_some()).then(|| config.jira_client());
     let gitlab = config
@@ -78,13 +203,22 @@ pub(super) fn fetch(
     // the keys of open tasks and worktree branches, and those of open MRs as soon
     // as GitLab lists them
     let known: Vec<String> = if online {
-        trace::time("known keys", || known_keys(config, &tasks))
+        trace::time("known keys", || {
+            closing
+                .as_ref()
+                .map_or_else(|| known_keys(&repos, &tasks), |scope| scope.tickets.clone())
+        })
     } else {
         Vec::new()
     };
     let (mine, by_key, mrs, trees, herdr) = std::thread::scope(|scope| {
         let mine = scope.spawn(|| match &jira {
-            Some(jira) => trace::time("jira: mine", || fetch_my_tickets(jira.as_ref()?)),
+            Some(jira) => trace::time("jira: mine", || {
+                fetch_my_tickets(
+                    jira.as_ref()?,
+                    closing.as_ref().map(|s| s.tickets.as_slice()),
+                )
+            }),
             None => Ok(HashMap::new()),
         });
         let by_key = scope.spawn(|| match &jira {
@@ -94,27 +228,43 @@ pub(super) fn fetch(
             _ => Ok(HashMap::new()),
         });
         let mrs = scope.spawn(|| match &gitlab {
-            Some(gitlab) => fetch_mrs(config, gitlab.as_ref()?, jira.as_ref(), &known),
+            Some(gitlab) => fetch_mrs(
+                config,
+                gitlab.as_ref()?,
+                jira.as_ref(),
+                &known,
+                closing.as_ref(),
+            ),
             None => Ok((Vec::new(), Ok(HashMap::new()))),
         });
-        let herdr = scope.spawn(|| trace::time("herdr", live_herdr));
-        let trees = trace::time("git: worktrees", || collect_trees(config, online));
+        let herdr = scope.spawn(herdr::inherit(move || {
+            early_herdr.unwrap_or_else(|| trace::time("herdr", live_herdr))
+        }));
+        let trees = trace::time("git: worktrees", || {
+            collect_trees(&repos, online, with_diff)
+        });
         (
             joined(mine, "the fetch"),
             joined(by_key, "the fetch"),
             joined(mrs, "the fetch"),
             trees,
-            herdr.join().unwrap_or_default(),
+            herdr.join().unwrap_or_else(|_| {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    vec!["Herdr inventory panicked".into()],
+                )
+            }),
         )
     });
-    let (agents, workspaces) = herdr;
+    let (agents, workspaces, mut warnings) = herdr;
+    warnings.extend(repository_warnings);
     let (mrs, of_mrs) = match mrs {
         Ok((mrs, tickets)) => (Ok(mrs), tickets),
         Err(err) => (Err(err), Ok(HashMap::new())),
     };
     let tickets = all_tickets(mine, by_key, of_mrs);
 
-    let mut warnings = Vec::new();
     let complete = online && tickets.is_ok() && mrs.is_ok();
     let mut cache = (cached && !complete)
         .then(|| RemoteCache::load(&config.name))
@@ -135,11 +285,13 @@ pub(super) fn fetch(
         RemoteCache::save(&config.name, &tickets, &mrs);
     }
 
-    let roots = worktree_roots(config);
-    let sessions = trace::time("sessions", || {
-        load_sessions(&roots, &trees, &tasks, persist)
+    let sessions = early_sessions.unwrap_or_else(|| {
+        trace::time("sessions", || {
+            load_sessions(&roots, &mains, &trees, &tasks, persist)
+        })
     });
     Inputs {
+        mains,
         tasks,
         tickets,
         mrs,
@@ -208,28 +360,16 @@ fn or_cached<T: Default>(
     (cached.unwrap_or_default(), Source { fresh, warning })
 }
 
-/// `<main checkout>/.claude/worktrees` of every configured repo.
-fn worktree_roots(config: &Config) -> Vec<PathBuf> {
-    config
-        .repos
-        .iter()
-        .filter_map(|r| worktree::main_checkout(&r.path).ok())
-        .map(|main| main.join(".claude/worktrees"))
-        .collect()
-}
-
 /// Agent sessions launched in the main checkouts, in current worktrees and in
 /// worktrees open tasks already list sessions for, by id.
 fn load_sessions(
     roots: &[PathBuf],
+    mains: &[PathBuf],
     trees: &[Tree],
     tasks: &[Task],
     persist: bool,
 ) -> HashMap<String, sessions::Session> {
-    let mut dirs: Vec<PathBuf> = roots
-        .iter()
-        .filter_map(|r| r.parent()?.parent().map(Path::to_path_buf))
-        .collect();
+    let mut dirs = mains.to_vec();
     dirs.extend(trees.iter().map(|t| t.wt.path.clone()));
     for task in tasks.iter().filter(|t| !t.done) {
         for known in &task.sessions {
@@ -254,14 +394,12 @@ fn load_sessions(
 
 /// Ticket keys of open tasks and of worktree branches: `git worktree list` is
 /// instant, unlike the worktrees' status.
-fn known_keys(config: &Config, tasks: &[Task]) -> Vec<String> {
+fn known_keys(repos: &[Repository], tasks: &[Task]) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
-    let branches: Vec<String> = config
-        .repos
+    let branches: Vec<_> = repos
         .iter()
-        .filter_map(|r| worktree::main_checkout(&r.path).ok())
-        .flat_map(|main| worktree::linked_worktrees(&main).unwrap_or_default())
-        .filter_map(|wt| wt.branch)
+        .flat_map(|r| &r.trees)
+        .filter_map(|wt| wt.branch.as_deref())
         .collect();
     let task_keys = tasks
         .iter()
@@ -276,10 +414,17 @@ fn known_keys(config: &Config, tasks: &[Task]) -> Vec<String> {
 }
 
 /// My tickets that are not done (resolution alone misses Declined/Cancelled).
-fn fetch_my_tickets(jira: &JiraClient) -> Tickets {
+fn fetch_my_tickets(jira: &JiraClient, keys: Option<&[String]>) -> Tickets {
+    if keys.is_some_and(|keys| keys.is_empty()) {
+        return Ok(HashMap::new());
+    }
+    let query = keys.map_or_else(
+        || "assignee = currentUser() AND statusCategory != Done".to_string(),
+        |keys| format!("assignee = currentUser() AND key in ({})", keys.join(",")),
+    );
     let issues = jira
-        .search_issues_brief("assignee = currentUser() AND statusCategory != Done", 200)
-        .map_err(|err| err.to_string())?;
+        .search_issues_brief(&query, keys.map_or(usize::MAX, |keys| keys.len()))
+        .map_err(|e| e.to_string())?;
     Ok(issues
         .iter()
         .map(|issue| (issue.key.clone(), Ticket::from_issue(issue, true)))
@@ -308,11 +453,44 @@ fn fetch_tickets_by_key(jira: &JiraClient, keys: &[String]) -> Tickets {
             .collect(),
             Err(err) => return Err(err.to_string()),
         };
+        let mut issues = issues;
+        for key in chunk
+            .iter()
+            .filter(|key| !issues.iter().any(|i| &i.key == *key))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            match existing(jira.get_issue_by_key(&key))? {
+                Some(issue) => issues.push(issue),
+                None => {
+                    return Err(format!(
+                        "incomplete Jira data: {key} was not returned or is inaccessible"
+                    ));
+                }
+            }
+        }
         for issue in &issues {
             tickets.insert(issue.key.clone(), Ticket::from_issue(issue, false));
         }
     }
+    require_known_keys(keys, &tickets)?;
     Ok(tickets)
+}
+
+fn require_known_keys(keys: &[String], tickets: &HashMap<String, Ticket>) -> Result<(), String> {
+    let missing: Vec<_> = keys
+        .iter()
+        .filter(|key| !tickets.contains_key(*key))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "incomplete Jira data: missing {}",
+            missing.join(", ")
+        ))
+    }
 }
 
 /// The issue Jira answered with, None for a key it does not know (404, or 400).
@@ -332,8 +510,9 @@ fn fetch_mrs(
     gitlab: &GitLab,
     jira: Option<&Result<JiraClient, String>>,
     known: &[String],
+    closing: Option<&ClosingScope>,
 ) -> Result<(Vec<Mr>, Tickets), String> {
-    let mut projects: Vec<&str> = config
+    let mut projects: Vec<_> = config
         .repos
         .iter()
         .filter_map(|r| r.gitlab_project.as_deref())
@@ -341,156 +520,163 @@ fn fetch_mrs(
     if projects.is_empty()
         && let Some(gitlab) = &config.gitlab
     {
-        projects.push(gitlab.project.as_str());
+        projects.push(&gitlab.project);
     }
     projects.sort_unstable();
     projects.dedup();
-
     std::thread::scope(|scope| {
         let recent = scope.spawn(|| {
-            let _span = trace::span("gitlab: recent MRs");
             let mut found = Vec::new();
             for &project in &projects {
-                let listed = gitlab.my_recent_merge_requests(project, MR_LOOKBACK_DAYS)?;
-                found.extend(listed.into_iter().map(|mr| (project, mr)));
+                found.extend(
+                    gitlab
+                        .my_recent_merge_requests(project, MR_LOOKBACK_DAYS)?
+                        .into_iter()
+                        .map(|mr| Mr::new(mr, project)),
+                );
             }
             Ok::<_, String>(found)
         });
-
-        let mut found: Vec<(&str, Mr)> = Vec::new();
+        let mut found = Vec::new();
         for &project in &projects {
-            let listed = trace::time("gitlab: open MRs", || {
-                gitlab.my_open_merge_requests(project)
-            })?;
-            found.extend(listed.into_iter().map(|mr| (project, Mr::new(mr, project))));
+            found.extend(
+                gitlab
+                    .my_open_merge_requests(project)?
+                    .into_iter()
+                    .map(|mr| Mr::new(mr, project)),
+            );
         }
-        let mut keys: Vec<String> = Vec::new();
-        for key in found.iter().flat_map(|(_, m)| &m.keys) {
-            if !known.contains(key) && !keys.contains(key) {
-                keys.push(key.clone());
-            }
-        }
-        let tickets = scope.spawn(move || match jira {
-            Some(Ok(jira)) => trace::time(&format!("jira: {} MR keys", keys.len()), || {
-                fetch_tickets_by_key(jira, &keys)
-            }),
-            _ => Ok(HashMap::new()),
-        });
-        // review state of the open ones, all at once
-        let reviews: Vec<Option<MrReview>> = {
-            let _span = trace::span(format!("gitlab: review of {} open MRs", found.len()));
-            parallel(&found, REQUESTS, |(project, m)| {
-                gitlab.mr_review(project, m.mr.iid()).ok()
-            })
-            .into_iter()
-            .map(Option::flatten)
-            .collect()
-        };
-        for ((_, mr), review) in found.iter_mut().zip(reviews) {
-            mr.review = review;
-        }
-
-        for (project, mr) in joined(recent, "the fetch")? {
+        for mr in joined(recent, "GitLab MR listing")? {
             if !found
                 .iter()
-                .any(|(p, m)| *p == project && m.mr.iid() == mr.iid())
+                .any(|m| m.project == mr.project && m.mr.iid() == mr.mr.iid())
             {
-                found.push((project, Mr::new(mr, project)));
+                found.push(mr);
             }
         }
-        let tickets = joined(tickets, "the fetch");
-        Ok((found.into_iter().map(|(_, m)| m).collect(), tickets))
+        if let Some(closing) = closing {
+            found = closing.select(found);
+        }
+        let keys: Vec<_> = found
+            .iter()
+            .flat_map(|m| m.keys.iter().cloned())
+            .filter(|k| !known.contains(k))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let tickets = scope.spawn(move || match jira {
+            Some(Ok(jira)) => {
+                let mut tickets = fetch_tickets_by_key(jira, &keys)?;
+                if closing.is_some() {
+                    tickets.extend(fetch_my_tickets(jira, Some(&keys))?);
+                }
+                Ok(tickets)
+            }
+            _ => Ok(HashMap::new()),
+        });
+        let jobs: Vec<_> = found
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.opened())
+            .map(|(i, _)| i)
+            .collect();
+        let reviews = parallel(&jobs, REQUESTS, |&i| {
+            gitlab.mr_review(&found[i].project, found[i].mr.iid())
+        });
+        for (i, result) in jobs.into_iter().zip(reviews) {
+            match result.unwrap_or_else(|| Err("GitLab review request panicked".into())) {
+                Ok(review) => found[i].review = Some(review),
+                Err(error) if closing.is_some() => {
+                    return Err(format!(
+                        "{} !{}: incomplete review: {error}",
+                        found[i].project,
+                        found[i].mr.iid()
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+        Ok((found, joined(tickets, "Jira MR keys")))
     })
 }
 
 /// Linked worktrees of every configured repo; git status and the unpushed count
 /// take ~0.5s per worktree in a big repo, so they run in parallel.
-fn collect_trees(config: &Config, with_status: bool) -> Vec<Tree> {
-    let mut found = Vec::new();
-    for repo in &config.repos {
-        let Ok(main) = worktree::main_checkout(&repo.path) else {
-            continue;
-        };
-        let default = worktree::default_branch(&main, repo.main_branch.as_deref());
-        for wt in worktree::linked_worktrees(&main).unwrap_or_default() {
-            found.push((
-                main.clone(),
-                repo.gitlab_project.clone(),
-                wt,
-                default.clone(),
-            ));
-        }
+fn collect_trees(repos: &[Repository], with_status: bool, with_diff: bool) -> Vec<Tree> {
+    let found: Vec<_> = repos
+        .iter()
+        .flat_map(|repo| repo.trees.iter().map(move |wt| (repo, wt)))
+        .collect();
+    if !with_status && !with_diff {
+        return found
+            .iter()
+            .map(|(repo, wt)| inspect_tree(repo, wt, false, false))
+            .collect();
     }
-
-    // a worktree whose inspection panicked is left out
-    parallel(&found, GIT_RUNS, |(repo, project, wt, default)| {
-        let mut tree = inspect_tree(repo.clone(), wt.clone(), with_status, default.as_deref());
-        tree.project = project.clone();
-        tree
+    parallel(&found, GIT_RUNS, |(repo, wt)| {
+        inspect_tree(repo, wt, with_status, with_diff)
     })
     .into_iter()
     .flatten()
     .collect()
 }
 
-/// `git status` is the slow part; offline callers skip it.
-fn inspect_tree(repo: PathBuf, wt: Worktree, with_status: bool, default: Option<&str>) -> Tree {
-    // The diff runs alongside status, also for cached app snapshots: only
-    // remote data is cached, the working tree is always local and current.
+fn inspect_tree(repo: &Repository, wt: &Worktree, with_status: bool, with_diff: bool) -> Tree {
     std::thread::scope(|scope| {
-        let path = wt.path.clone();
-        let attached = wt.branch.is_some();
-        let diff = scope.spawn(move || {
-            if !attached {
-                return None;
-            }
-            worktree::diff(&path, default?).ok()
-        });
+        let diff = (with_diff && wt.branch.is_some())
+            .then(|| scope.spawn(|| worktree::diff(&wt.path, repo.default.as_deref()?).ok()));
         let changes = with_status
             .then(|| worktree::changed_files(&wt.path).ok())
             .flatten();
         let unpushed = with_status
             .then(|| {
-                wt.branch
-                    .as_deref()
-                    .and_then(|b| worktree::unpushed_commits(&wt.path, b).ok())
+                repo.refs
+                    .as_ref()?
+                    .unpushed(&wt.path, wt.branch.as_deref()?)
+                    .ok()
             })
             .flatten();
-        // only `branch_finished` needs it, and only with unpushed commits
-        let head = match (unpushed, wt.branch.as_deref()) {
-            (Some(n), Some(branch)) if n > 0 => worktree::branch_head(&wt.path, branch).ok(),
-            _ => None,
+        let head = if unpushed.is_some_and(|n| n > 0) {
+            repo.refs
+                .as_ref()
+                .and_then(|r| r.head(wt.branch.as_deref()?))
+        } else {
+            None
         };
-        let keys = wt.branch.as_deref().map(ticket_keys).unwrap_or_default();
         let last_commit = with_status
-            .then(|| worktree::last_commit_time(&wt.path).ok())
+            .then(|| repo.refs.as_ref()?.time(wt.branch.as_deref()?))
             .flatten();
-        let diff = diff.join().unwrap_or_default();
         Tree {
-            repo,
-            project: None,
-            wt,
-            keys,
+            repo: repo.main.clone(),
+            project: repo.project.clone(),
+            wt: wt.clone(),
+            keys: wt.branch.as_deref().map(ticket_keys).unwrap_or_default(),
             changes,
-            diff,
             unpushed,
             head,
+            last_commit,
+            diff: diff.and_then(|h| h.join().ok()).flatten(),
             agents: Vec::new(),
             mr: None,
             finished: false,
-            last_commit,
         }
     })
 }
 
-fn live_herdr() -> (Vec<herdr::Agent>, Vec<herdr::Workspace>) {
-    if !herdr::available() {
-        return (Vec::new(), Vec::new());
+fn live_herdr() -> (Vec<herdr::Agent>, Vec<herdr::Workspace>, Vec<String>) {
+    if !herdr::available() && !std::env::var("BERBR_BACKEND").is_ok_and(|s| s == "herdr-app") {
+        return (Vec::new(), Vec::new(), Vec::new());
     }
-    (
-        herdr::list_agents().unwrap_or_default(),
-        herdr::list_workspaces().unwrap_or_default(),
-    )
+    let mut warnings = Vec::new();
+    let agents = herdr::list_agents().unwrap_or_else(|e| {
+        warnings.push(format!("Herdr agents unavailable: {e}"));
+        Vec::new()
+    });
+    let spaces = herdr::list_workspaces().unwrap_or_else(|e| {
+        warnings.push(format!("Herdr spaces unavailable: {e}"));
+        Vec::new()
+    });
+    (agents, spaces, warnings)
 }
 
 #[cfg(test)]
@@ -568,5 +754,58 @@ mod tests {
             )
         );
         assert_eq!(warnings.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod completeness_tests {
+    use super::*;
+    use crate::table::{Category, fixtures::ticket};
+
+    #[test]
+    fn every_known_jira_key_must_be_accounted_for() {
+        let keys: Vec<_> = ["DEMO-1", "DEMO-2", "DEMO-3"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut tickets =
+            HashMap::from([("DEMO-1".into(), ticket("DEMO-1", Category::Done, true))]);
+        let error = require_known_keys(&keys, &tickets).unwrap_err();
+        assert!(error.contains("DEMO-2, DEMO-3"));
+        for key in &keys {
+            tickets.insert(key.clone(), ticket(key, Category::Done, true));
+        }
+        assert!(require_known_keys(&keys, &tickets).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod closing_scope_tests {
+    use super::*;
+    use crate::table::fixtures::{mr, task_note, tree};
+
+    #[test]
+    fn closing_scope_uses_repository_branches_and_discovers_mr_ticket_branches() {
+        let task = task_note(
+            "demo-0",
+            "tickets: [DEMO-1]\nworktrees: [/r/.claude/worktrees/own]",
+            "2026-11-01",
+        );
+        let mut own = tree("own", "same");
+        own.project = Some("demo/alpha".into());
+        let scope = ClosingScope::new(&task, &[own], None);
+        let mut a = mr(1, "same", "own", "opened");
+        a.project = "demo/alpha".into();
+        let mut b = mr(2, "same", "foreign", "opened");
+        b.project = "demo/beta".into();
+        let mut ticket = mr(3, "discovered", "DEMO-1 initial", "merged");
+        ticket.project = "demo/alpha".into();
+        let mut followup = mr(4, "discovered", "followup", "opened");
+        followup.project = "demo/alpha".into();
+        let selected = scope.select(vec![a, b, ticket, followup]);
+        assert_eq!(
+            selected.iter().map(|m| m.mr.iid()).collect::<Vec<_>>(),
+            [1, 3, 4]
+        );
     }
 }
