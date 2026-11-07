@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { taskSpace, taskSpaceMatches, walk, groupSections, taskSignals, PanelModel, visibleRows, parseMrFlags,
   normalizeTicketState, isClosedTicket, cleanObsidian, parseFrontmatter, obsidianUri, ticketTitle, taskDetail, looseReason, worktreeNameCollision, cleanCliText, parseTreeMarks, looseWhy,
-  agentActivity, formatElapsed, classifyBlocked, closePlan, rowMenu, smartTarget, newTaskArgs, freeTickets } from "../model.js";
+  agentActivity, formatElapsed, classifyBlocked, closePlan, rowMenu, smartTarget, targetHint, newTaskArgs, freeTickets } from "../model.js";
 
 const snapshot = JSON.parse(await readFile(new URL("../fixtures/sample-snapshot.json", import.meta.url)));
 const section = (sections, id) => sections.find(item => item.id === id);
@@ -738,7 +738,7 @@ test("Smart input tells a Jira key or link, a branch and a task name apart", () 
   assert.deepEqual(smartTarget("Fix the login / logout race"), {kind:"name", name:"Fix the login / logout race"});
 });
 
-test("New task arguments follow the source tab and the advanced options", () => {
+test("New task arguments follow the source tab and the worktree and ticket switches", () => {
   const base = {source:"smart", agent:"codex", worktree:true};
   assert.deepEqual(newTaskArgs({...base, text:""}).args, ["start", "--unnamed", "--bg", "--agent", "codex"]);
   assert.deepEqual(newTaskArgs({...base, text:"DEMO-7"}).args, ["start", "DEMO-7", "--bg", "--agent", "codex"]);
@@ -746,21 +746,70 @@ test("New task arguments follow the source tab and the advanced options", () => 
     ["start", "fix-login", "--branch", "dev/fix-login", "--bg", "--agent", "codex"]);
   assert.deepEqual(newTaskArgs({...base, source:"name", text:"DEMO-7", agent:"none", worktree:false, newTicket:true}).args,
     ["start", "DEMO-7", "--bg", "--no-agent", "--no-worktree", "--new-ticket"]);
-  assert.deepEqual(newTaskArgs({...base, source:"jira", text:"login", ticket:"DEMO-9", name:"x", branch:"dev/x"}).args,
-    ["start", "DEMO-9", "--bg", "--agent", "codex", "--name", "x", "--branch", "dev/x"]);
-  // the branch tab's branch wins over the advanced one; a worktree's name/branch need a worktree
-  assert.deepEqual(newTaskArgs({...base, source:"branch", text:"dev/a", branch:"dev/b"}).args,
+  assert.deepEqual(newTaskArgs({...base, source:"jira", text:"login", ticket:"DEMO-9"}).args,
+    ["start", "DEMO-9", "--bg", "--agent", "codex"]);
+  assert.deepEqual(newTaskArgs({...base, source:"jira", text:"https://jira.example.com/browse/DEMO-12?focusedId=1"}).args,
+    ["start", "DEMO-12", "--bg", "--agent", "codex"]);
+  assert.deepEqual(newTaskArgs({...base, source:"branch", text:"dev/a"}).args,
     ["start", "a", "--branch", "dev/a", "--bg", "--agent", "codex"]);
-  assert.deepEqual(newTaskArgs({...base, text:"Task", worktree:false, name:"x", branch:"dev/x"}).args,
+  assert.deepEqual(newTaskArgs({...base, text:"Task", worktree:false}).args,
     ["start", "Task", "--bg", "--agent", "codex", "--no-worktree"]);
   for (const [form, error] of [
     [{source:"jira", text:"login"}, /valid Jira ticket key/],
+    [{source:"jira", text:"https://git.example.com/mr/1"}, /valid Jira ticket key/],
     [{source:"branch", text:""}, /Enter a branch/],
     [{source:"branch", text:"two words"}, /no spaces/],
     [{source:"branch", text:"dev/a", worktree:false}, /needs a worktree/],
     [{source:"smart", text:"https://git.example.com/mr/1"}, /Jira key or link/],
     [{source:"name", text:"", newTicket:true}, /Name the task/],
   ]) assert.match(newTaskArgs({...base, ...form}).error, error);
+});
+
+test("New task descriptions preserve context and let the CLI name an empty target without --unnamed", () => {
+  const base = {source:"smart", agent:"codex", worktree:true};
+  const description = "Context: login fails\nGoal: restore access. https://example.com/issue";
+  for (const [form, targetArgs] of [
+    [{text:""}, []],
+    [{source:"name", text:"  "}, []],
+    [{text:"Fix login"}, ["Fix login"]],
+    [{text:"DEMO-7"}, ["DEMO-7"]],
+    [{source:"jira", text:"https://jira.example.com/browse/DEMO-7"}, ["DEMO-7"]],
+    [{source:"jira", text:"login", ticket:"DEMO-7"}, ["DEMO-7"]],
+    [{source:"branch", text:"dev/login"}, ["login", "--branch", "dev/login"]],
+    [{text:"dev/login"}, ["login", "--branch", "dev/login"]],
+  ]) {
+    const result = newTaskArgs({...base, ...form, description:`  ${description}\n`});
+    assert.deepEqual(result.args, ["start", ...targetArgs, "--description", description, "--bg", "--agent", "codex"]);
+    assert.ok(!result.args.includes("--unnamed"));
+  }
+  for (const description of [undefined, null, "", " \n\t "]) {
+    assert.deepEqual(newTaskArgs({...base, text:"", description}).args,
+      ["start", "--unnamed", "--bg", "--agent", "codex"]);
+    assert.match(newTaskArgs({...base, text:"", description, newTicket:true}).error, /Name the task/);
+  }
+});
+
+test("Description-based naming works without an agent or worktree and can create a Jira ticket", () => {
+  const base = {source:"smart", text:"", description:"Fix login", agent:"none", worktree:false};
+  assert.deepEqual(newTaskArgs(base).args,
+    ["start", "--description", "Fix login", "--bg", "--no-agent", "--no-worktree"]);
+  assert.deepEqual(newTaskArgs({...base, newTicket:true}).args,
+    ["start", "--description", "Fix login", "--bg", "--no-agent", "--no-worktree", "--new-ticket"]);
+  assert.deepEqual(newTaskArgs({...base, worktree:true, agent:"claude", newTicket:true}).args,
+    ["start", "--description", "Fix login", "--bg", "--agent", "claude", "--new-ticket"]);
+  assert.deepEqual(newTaskArgs({...base, text:"DEMO-7", newTicket:true}).args,
+    ["start", "DEMO-7", "--description", "Fix login", "--bg", "--no-agent", "--no-worktree"]);
+  assert.match(newTaskArgs({...base, source:"jira"}).error, /valid Jira ticket key/);
+  assert.match(newTaskArgs({...base, source:"branch"}).error, /Enter a branch/);
+});
+
+test("New task hints explain description-based naming only for empty targets", () => {
+  const empty = {kind:"empty"};
+  assert.match(targetHint(empty, [], "Context and goal"), /small model.*task and branch.*description.*few seconds/);
+  for (const description of [undefined, null, "", " \n "])
+    assert.equal(targetHint(empty, [], description), "Leave empty and the agent will name it.");
+  for (const target of [{kind:"name", name:"Login"}, {kind:"branch", branch:"dev/login"}, {kind:"ticket", key:"DEMO-7"}])
+    assert.equal(targetHint(target, [], "Context"), targetHint(target));
 });
 
 test("the Jira tab lists open tickets with no task once each", () => {

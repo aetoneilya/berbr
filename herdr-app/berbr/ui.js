@@ -39,6 +39,7 @@ export function button(t, id, label, action, variant = "ghost", disabled = false
 // Plain elements need both a tab stop and keyboard activation in this runtime.
 export function keyboardControl(element, action, disabled = false) {
   return element.tab_index(0).tab_stop(!disabled).on_key_down((event, cx) => {
+    if (event.key === "enter" && event.modifiers?.platform) return;
     if (!["enter", "space", " "].includes(event.key)) return;
     cx.stop_propagation();
     if (!disabled) action(cx);

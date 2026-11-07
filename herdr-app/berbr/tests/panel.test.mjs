@@ -2790,8 +2790,6 @@ test("V04: confirm and segmented controls are tab stops with Enter/Space activat
     assert.equal(read(), expected);
     root = view.render(cx);
   }
-  byId(root, "advanced").attributes.on_key_down[0]({key:"enter"}, cx);
-  assert.equal(view.advanced, true);
   key("escape"); assert.deepEqual(state.calls.at(-1), ["closeOverlay", "new"]);
 });
 
@@ -3013,4 +3011,304 @@ test("New task: the project picker sets --project, Create more keeps the form an
   view.createMore = false; view.values.title = "Second";
   view.submitNew(cx); await jobs.shift()(cx);
   assert.deepEqual(state.calls.at(-1), ["closeOverlay", "new"]);
+});
+
+test("New task dropdowns use popup content, toggle, dismiss outside, and open one at a time", () => {
+  const {view, cx, key} = setup({props:{form:"new", overlay:"new", project:"demo", projects:["demo", "other"]}});
+  const focused = [];
+  view.choiceFocus = Object.fromEntries(["project", "agent", "list"].map(id => [id, {focus:() => focused.push(id)}]));
+  assert.equal(byId(view.render(cx), "project-options"), undefined);
+  click(byId(view.render(cx), "project-choice"), cx);
+  let root = view.render(cx);
+  assert.equal(byId(root, "project-popup").attributes.anchor[0], "bottom_left");
+  assert.equal(byId(root, "project-popup").attributes.content[0], byId(root, "project-options"));
+  assert.equal(focused.at(-1), "list");
+  click(byId(root, "project-choice"), cx);
+  assert.equal(view.choosing, null);
+  assert.equal(focused.at(-1), "project");
+  click(byId(view.render(cx), "project-choice"), cx);
+  const oldList = byId(view.render(cx), "project-options");
+  click(byId(view.render(cx), "agent-choice"), cx);
+  oldList.attributes.on_mouse_down_out[0]({}, cx);
+  root = view.render(cx);
+  assert.equal(byId(root, "project-options"), undefined);
+  assert.ok(byId(root, "agent-options"));
+  key("escape");
+  assert.equal(view.choosing, null);
+  assert.equal(focused.at(-1), "agent");
+  assert.deepEqual(state.calls, [], "Escape dismisses the picker first");
+  click(byId(view.render(cx), "agent-choice"), cx);
+  byId(view.render(cx), "agent-options").attributes.on_mouse_down_out[0]({}, cx);
+  assert.equal(view.choosing, null);
+  click(byId(view.render(cx), "agent-choice"), cx);
+  key("tab"); assert.equal(view.choosing, null);
+  click(byId(view.render(cx), "agent-choice"), cx);
+  click(byId(view.render(cx), "agent-none"), cx);
+  assert.equal(view.agent, "none"); assert.equal(view.choosing, null);
+  assert.equal(focused.at(-1), "agent");
+  key("escape"); assert.deepEqual(state.calls.at(-1), ["closeOverlay", "new"]);
+});
+
+test("New task project dropdown shows all options in a bounded scroll list and keeps keyboard selection", () => {
+  for (const projects of [[], ["only"], Array.from({length:23}, (_, index) => `project-${index}`)]) {
+    const {view, cx} = setup({props:{form:"new", projects}});
+    view.project = null;
+    click(byId(view.render(cx), "project-choice"), cx);
+    const root = view.render(cx), list = byId(root, "project-options");
+    assert.ok(list.attributes.overflow_y_scrollbar);
+    assert.equal(list.attributes.h[0], Math.min(Math.max(projects.length, 1), 6) * 30 + 8);
+    assert.equal(byId(root, "project-next"), undefined);
+    assert.equal(byId(root, "project-previous"), undefined);
+    for (const name of projects) assert.ok(byId(list, `project-${name}`));
+    if (!projects.length) {
+      assert.match(text(root), /No projects available/);
+      list.attributes.on_key_down[0]({key:"down"}, cx);
+      list.attributes.on_key_down[0]({key:"enter"}, cx);
+      assert.equal(view.project, null);
+      continue;
+    }
+    byId(view.render(cx), "project-options").attributes.on_key_down[0]({key:"up"}, cx);
+    assert.equal(view.choiceIndex, projects.length - 1);
+    byId(view.render(cx), "project-options").attributes.on_key_down[0]({key:"enter"}, cx);
+    assert.equal(view.project, projects.at(-1));
+    assert.equal(view.choosing, null);
+    click(byId(view.render(cx), "project-choice"), cx);
+    click(byId(view.render(cx), `project-${projects[0]}`), cx);
+    assert.equal(view.project, projects[0]);
+  }
+});
+
+test("New task close button cancels by mouse or keyboard and is disabled while busy", () => {
+  for (const keyboard of [false, true]) {
+    const {view, cx} = setup({props:{form:"new", overlay:"new"}});
+    const activate = node => keyboard ? node.attributes.on_key_down[0]({key:"enter"}, cx) : click(node, cx);
+    activate(byId(view.render(cx), "new-close"));
+    assert.deepEqual(state.calls, [["closeOverlay", "new"]]);
+    state.calls.length = 0; view.busy = true;
+    activate(byId(view.render(cx), "new-close"));
+    view.keyEvent({key:"escape"}, cx);
+    assert.deepEqual(state.calls, []);
+  }
+});
+
+test("New task has equal Project and Agent columns, matching popup widths, and picker-specific placeholders", () => {
+  const {view, cx} = setup({props:{form:"new", projects:[]}});
+  view.project = null; view.agent = null;
+  const row = byId(view.render(cx), "new-pickers");
+  assert.equal(row.attributes.flex_none.length, 0);
+  assert.equal(row.nodes.length, 2);
+  assert.ok(byId(row.nodes[0], "project-choice"));
+  assert.ok(byId(row.nodes[1], "agent-choice"));
+  for (const [index, id, width, placeholder] of [[0, "project", 210, "Choose a project"], [1, "agent", 214, "Choose an agent"]]) {
+    assert.ok(row.nodes[index].attributes.flex_1);
+    const picker = row.nodes[index].nodes[0];
+    assert.ok(picker.attributes.flex_none);
+    assert.ok(!picker.attributes.flex_1, "a picker never grows vertically");
+    const trigger = byId(view.render(cx), `${id}-choice`);
+    assert.match(text(trigger), new RegExp(placeholder));
+    trigger.attributes.on_size_change[0]({width, height:34}, cx);
+    click(byId(view.render(cx), `${id}-choice`), cx);
+    assert.equal(byId(view.render(cx), `${id}-options`).attributes.w[0], width);
+    byId(view.render(cx), `${id}-choice`).attributes.on_size_change[0]({width:width - 10, height:34}, cx);
+    assert.equal(byId(view.render(cx), `${id}-options`).attributes.w[0], width - 10);
+  }
+});
+
+test("New task has a compact Smart body, scrolling Jira tickets without paging, and a separate shortcut chip", () => {
+  const tickets = Array.from({length:21}, (_, index) => ({key:`DEMO-${index}`, title:"Long title ".repeat(20)}));
+  const {view, cx} = setup({props:{form:"new", project:"demo", tickets:{demo:tickets}}});
+  view.formOverlay("new");
+  assert.equal(state.overlays.at(-1).width, 480);
+  assert.equal(state.overlays.at(-1).height, 480);
+  let root = view.render(cx);
+  assert.ok(!nodes(root).some(node => node.attributes.overflow_y_scrollbar));
+  assert.ok(byId(root, "new-body").attributes.flex_none);
+  assert.ok(!byId(root, "new-body").attributes.flex_1);
+  assert.equal(byId(root, "new-status"), undefined, "no empty status band above the footer");
+  assert.equal(byId(root, "create").nodes[0], "Create task");
+  assert.ok(nodes(byId(root, "create")).some(node => node.nodes.includes("⌘↵") && node.attributes.border_1));
+  click(byId(root, "source-jira"), cx);
+  root = view.render(cx);
+  const list = byId(root, "new-tickets");
+  assert.ok(byId(root, "new-body").attributes.overflow_y_scrollbar);
+  assert.ok(list.attributes.overflow_y_scrollbar);
+  assert.equal(list.attributes.h[0], 150);
+  for (const ticket of tickets) assert.ok(byId(list, `new-ticket-${ticket.key}`));
+  assert.equal(byId(root, "new-tickets-previous"), undefined);
+  assert.equal(byId(root, "new-tickets-next"), undefined);
+  click(byId(root, "new-ticket-DEMO-20"), cx);
+  assert.equal(view.ticket, "DEMO-20");
+  view.inputs.title.set_value("not found"); view.inputs.title.emit("change", cx);
+  root = view.render(cx);
+  assert.equal(view.ticket, null);
+  assert.match(text(root), /No matching tickets/);
+  assert.equal(byId(root, "new-tickets").attributes.h[0], 30);
+  click(byId(root, "source-smart"), cx);
+  assert.ok(!byId(view.render(cx), "new-body").attributes.overflow_y_scrollbar);
+});
+
+test("New task hints stay neutral before submit and validation errors appear only in the error line", () => {
+  for (const [source, hint, error] of [["branch", /checked out if it exists/, /Enter a branch/],
+    ["jira", /Pick a ticket below or paste a key or link/, /valid Jira ticket key/]]) {
+    const {view, cx, jobs} = setup({props:{form:"new", project:"demo"}});
+    click(byId(view.render(cx), `source-${source}`), cx);
+    let root = view.render(cx);
+    assert.match(text(byId(root, "new-hint")), hint);
+    assert.doesNotMatch(text(byId(root, "new-hint")), error);
+    assert.equal(byId(root, "new-status"), undefined);
+    click(byId(root, "create"), cx);
+    root = view.render(cx);
+    assert.match(text(byId(root, "new-status")), error);
+    assert.match(text(byId(root, "new-hint")), hint);
+    assert.equal(jobs.length, 0);
+  }
+});
+
+test("New task tabs preserve text and description, focus the input, and show the compact switches", () => {
+  const {view, cx} = setup({props:{form:"new", project:"demo", tickets:{demo:[{key:"DEMO-1", title:"Login"}]}}});
+  let focuses = 0; view.inputs.title.focus = () => focuses++;
+  view.inputs.title.set_value("Login"); view.inputs.title.emit("change", cx);
+  view.inputs.description.set_value("Context\nGoal"); view.inputs.description.emit("change", cx);
+  assert.equal(view.worktree, true);
+  assert.ok(byId(view.render(cx), "new-worktree"));
+  assert.ok(byId(view.render(cx), "new-jira-ticket"));
+  click(byId(view.render(cx), "source-jira"), cx);
+  assert.equal(byId(view.render(cx), "new-jira-ticket"), undefined);
+  click(byId(view.render(cx), "new-ticket-DEMO-1"), cx);
+  assert.equal(byId(view.render(cx), "new-ticket-DEMO-1").attributes.bg[0], "selected");
+  click(byId(view.render(cx), "source-branch"), cx);
+  assert.equal(view.values.title, "Login"); assert.equal(view.inputs.title.value(), "Login");
+  assert.equal(view.values.description, "Context\nGoal");
+  assert.equal(view.ticket, null); assert.equal(focuses, 2);
+  assert.equal(byId(view.render(cx), "advanced"), undefined);
+  assert.ok(!("name" in view.inputs)); assert.ok(!("branch" in view.inputs));
+  const options = byId(view.render(cx), "new-options");
+  assert.ok(byId(options, "new-worktree")); assert.ok(byId(options, "new-jira-ticket"));
+  assert.match(text(options), /Worktree.*New Jira ticket/);
+  byId(options, "new-worktree").attributes.on_change[0](false, cx);
+  assert.equal(view.worktree, false);
+});
+
+test("New task Enter submits once, blocks controls while busy, and displays CLI failure without closing", async () => {
+  const {view, cx, jobs} = setup({props:{form:"new", project:"demo", overlay:"new", projects:["demo", "other"]}});
+  view.values.title = "Task";
+  state.execResult = {code:1, stderr:"Cannot create: branch already exists", stdout:""};
+  view.inputs.title.emit("submit", cx);
+  view.inputs.title.emit("submit", cx);
+  view.keyEvent({key:"enter", modifiers:{platform:true}}, cx);
+  assert.equal(jobs.length, 1);
+  let root = view.render(cx);
+  assert.ok(nodes(byId(root, "create")).some(node => node.attributes.spin));
+  for (const id of ["project-choice", "source-jira", "agent-choice", "create", "cancel", "new-close"]) {
+    const control = byId(root, id);
+    assert.equal(control.attributes.tab_stop[0], false, id);
+    click(control, cx);
+    control.attributes.on_key_down[0]({key:"enter"}, cx);
+  }
+  for (const node of nodes(root).filter(node => Object.hasOwn(node, "input"))) {
+    assert.equal(node.attributes.disabled[0], true);
+    assert.equal(node.attributes.tab_stop[0], false);
+  }
+  for (const id of ["create-more", "new-worktree", "new-jira-ticket"])
+    byId(root, id).attributes.on_change[0](id !== "new-worktree", cx);
+  assert.equal(view.source, "smart"); assert.equal(view.choosing, null);
+  assert.equal(view.worktree, true); assert.equal(view.newTicket, false); assert.equal(view.createMore, false);
+  assert.deepEqual(state.calls, []);
+  await jobs.shift()(cx);
+  assert.equal(view.busy, false);
+  assert.match(text(byId(view.render(cx), "new-status")), /Cannot create: branch already exists/);
+  assert.ok(!state.calls.some(call => call[0] === "closeOverlay"));
+});
+
+test("New task cmd-enter bubbles from keyboard controls to submit instead of activating them", () => {
+  const {view, cx, jobs} = setup({props:{form:"new", project:"demo", projects:["demo"]}});
+  view.values.title = "Task";
+  let stopped = false;
+  const context = {...cx, stop_propagation:() => { stopped = true; }};
+  const event = {key:"enter", modifiers:{platform:true}};
+  for (const id of ["project-choice", "source-jira", "agent-choice", "cancel", "create"]) {
+    stopped = false;
+    byId(view.render(cx), id).attributes.on_key_down[0](event, context);
+    assert.equal(stopped, false, id);
+  }
+  assert.equal(view.source, "smart");
+  assert.deepEqual(state.calls, []);
+  view.keyEvent(event, context);
+  assert.equal(jobs.length, 1); assert.equal(stopped, true);
+});
+
+test("New task Create more clears the title and description, refocuses input, confirms success and sends the chosen project", async () => {
+  const {view, cx, jobs} = setup({props:{form:"new", project:"demo", overlay:"new", projects:["demo", "other"]}});
+  click(byId(view.render(cx), "project-choice"), cx);
+  click(byId(view.render(cx), "project-other"), cx);
+  view.createMore = true;
+  for (const [key, value] of [["title", "First"], ["description", "Context\nGoal"]]) {
+    view.inputs[key].set_value(value); view.inputs[key].emit("change", cx);
+  }
+  let focuses = 0; view.inputs.title.focus = () => focuses++;
+  click(byId(view.render(cx), "create"), cx);
+  await jobs.shift()(cx);
+  const argv = state.execs[0][1];
+  assert.deepEqual(argv.slice(argv.indexOf("--project")), ["--project", "other", "start", "First", "--description", "Context\nGoal", "--bg", "--agent", "codex"]);
+  for (const key of ["title", "description"]) {
+    assert.equal(view.values[key], ""); assert.equal(view.inputs[key].value(), "");
+  }
+  assert.equal(focuses, 1); assert.equal(view.ticket, null);
+  assert.equal(state.notices.length, 1);
+  assert.match(text(byId(view.render(cx), "new-status")), /Task created/);
+  assert.ok(!state.calls.some(call => call[0] === "closeOverlay"));
+  view.inputs.title.set_value("Second"); view.inputs.title.emit("change", cx);
+  assert.doesNotMatch(text(byId(view.render(cx), "new-status")), /Task created/);
+});
+
+test("New task description uses four multiline rows; Enter does not submit and cmd-enter names without an agent", async () => {
+  const {view, cx, jobs} = setup({props:{form:"new", project:"demo", overlay:"new", agent:"none"}});
+  const description = view.inputs.description;
+  const textarea = byId(view.render(cx), "description");
+  assert.equal(textarea.input, description);
+  assert.equal(description.multiline, true);
+  assert.equal(description.rows, 4);
+  assert.equal(textarea.attributes.h[0], 96);
+  assert.equal(description.placeholder, "Describe the task: context, goal, links. Berbr names the task and its branch from it.");
+  description.set_value("Context: login fails\nGoal: fix it. https://example.com/issue");
+  description.emit("change", cx);
+  description.emit("submit", cx);
+  view.keyEvent({key:"enter"}, cx);
+  assert.equal(jobs.length, 0, "plain Enter in the textarea never submits");
+  assert.equal(view.values.description, description.value());
+  assert.match(text(byId(view.render(cx), "new-hint")), /small model.*task and branch.*few seconds/);
+  description.emit("submit", cx, {secondary:true});
+  view.keyEvent({key:"enter", modifiers:{platform:true}}, cx);
+  assert.equal(jobs.length, 1, "a secondary textarea submit and its bubbling key create only once");
+  const pending = view.render(cx);
+  assert.equal(byId(pending, "create").nodes[0], "Naming…");
+  assert.ok(nodes(byId(pending, "create")).some(node => node.attributes.spin));
+  assert.ok(!byId(pending, "new-body").attributes.overflow_y_scrollbar);
+  assert.equal(byId(pending, "description").attributes.disabled[0], true);
+  await jobs.shift()(cx);
+  const argv = state.execs[0][1];
+  assert.deepEqual(argv.slice(argv.indexOf("start")), ["start", "--description", description.value(), "--bg", "--no-agent"]);
+  assert.ok(!argv.includes("--unnamed"));
+  assert.deepEqual(state.calls.at(-1), ["closeOverlay", "new"]);
+});
+
+test("New task can create a ticket from only a description, clears it for Create more and keeps the body fixed", async () => {
+  const {view, cx, jobs} = setup({props:{form:"new", project:"demo", overlay:"new"}});
+  view.inputs.description.set_value("Context and goal"); view.inputs.description.emit("change", cx);
+  byId(view.render(cx), "new-worktree").attributes.on_change[0](false, cx);
+  byId(view.render(cx), "new-jira-ticket").attributes.on_change[0](true, cx);
+  byId(view.render(cx), "create-more").attributes.on_change[0](true, cx);
+  click(byId(view.render(cx), "create"), cx);
+  await jobs.shift()(cx);
+  const argv = state.execs[0][1];
+  assert.deepEqual(argv.slice(argv.indexOf("start")),
+    ["start", "--description", "Context and goal", "--bg", "--agent", "codex", "--no-worktree", "--new-ticket"]);
+  assert.equal(view.inputs.description.value(), ""); assert.equal(view.values.description, "");
+  assert.ok(!state.calls.some(call => call[0] === "closeOverlay"));
+  assert.match(text(byId(view.render(cx), "new-status")), /Task created/);
+  assert.ok(!byId(view.render(cx), "new-body").attributes.overflow_y_scrollbar);
+  click(byId(view.render(cx), "create"), cx);
+  assert.match(text(byId(view.render(cx), "new-status")), /Name the task or describe it/);
+  assert.ok(!byId(view.render(cx), "new-body").attributes.overflow_y_scrollbar);
+  assert.equal(jobs.length, 0);
 });

@@ -1,5 +1,5 @@
 import { div } from "gpui-kit";
-import { h_flex, v_flex, TextView, EditorState, Editor } from "gpui-base";
+import { h_flex, v_flex, Popup, TextView, EditorState, Editor } from "gpui-base";
 import { props, closeOverlay, readTextFile, writeTextFile, watchFolder, settings } from "herdr";
 import { exists } from "fs/promises";
 import { parseFrontmatter, transformWikilinks, wikiTargets, wikiPath, obsidianUri, treeMarks, newTaskArgs, targetHint } from "./model.js";
@@ -221,32 +221,62 @@ function cancel(view, t) {
   return button(t, "cancel", "Cancel", () => closeOverlay(props().overlay), "ghost", view.busy);
 }
 
-function field(t, label, control) {
-  return h_flex().gap(12).items_center()
-    .child(div().w(84).flex_none().text_size(12).text_color(t.muted).child(label)).child(control);
-}
-
 const sources = [["smart", "Smart", "search"], ["jira", "Jira", "file-text"], ["branch", "Branch", "git-branch"], ["name", "Name", "square-pen"]];
 
-/** A field whose value opens a list of choices under it. */
-function choice(view, t, id, label, options, value, choose) {
-  const open = view.choosing === id;
-  const current = options.find(([key]) => key === value)?.[1] ?? value ?? "—";
-  return v_flex().flex_1().min_w(0).gap(4)
+/** Popup paints above the dialog; its options never take space in the form. */
+function choice(view, t, id, label, options, value, choose, placeholder, empty) {
+  const open = view.choosing === id && !view.busy;
+  const current = options.find(([key]) => key === value)?.[1] ?? value ?? placeholder;
+  const toggle = cx => {
+    if (view.busy) return;
+    view.choosing = open ? null : id;
+    view.choiceIndex = Math.max(0, options.findIndex(([key]) => key === value));
+    (open ? view.choiceFocus[id] : view.choiceFocus.list).focus(); cx.notify();
+  };
+  const pick = (key, cx) => {
+    if (view.busy) return;
+    choose(key, cx); view.choosing = null;
+    view.choiceFocus[id].focus(); cx.notify();
+  };
+  const trigger = keyboardControl(h_flex().id(`${id}-choice`), toggle, view.busy)
+    .track_focus(view.choiceFocus[id]).h(34).w_full().px(10).gap(8).items_center().rounded(6)
+    .border_1().border_color(open ? t.accent : t.border).bg(t.background)
+    .on_size_change(({width}, cx) => {
+      if (view.choiceWidths[id] !== width) { view.choiceWidths[id] = width; cx.notify(); }
+    })
+    .accessibility_label(label).opacity(view.busy ? 0.4 : 1).cursor_pointer().hover(el => el.bg(t.hover))
+    .on_click((_event, cx) => { cx.stop_propagation(); toggle(cx); })
+    .child(icon(id === "project" ? "folder" : "terminal", 14).text_color(t.dim))
+    .child(div().flex_1().min_w(0).text_size(13).truncate().tooltip(current).child(current))
+    .child(icon("chevron-down", 12).text_color(t.dim));
+  const list = v_flex().id(`${id}-options`).track_focus(view.choiceFocus.list)
+    .when(Boolean(view.choiceWidths[id]), el => el.w(view.choiceWidths[id]))
+    .h(Math.min(Math.max(options.length, 1), 6) * 30 + 8).overflow_y_scrollbar().p(4).gap(2).rounded(6)
+    .border_1().border_color(t.border).bg(t.popover).text_color(t.foreground)
+    .on_mouse_down_out((_event, cx) => {
+      if (view.choosing === id) { view.choosing = null; view.choiceFocus[id].focus(); cx.notify(); }
+    })
+    .on_key_down((event, cx) => {
+      if (view.busy || !["up", "down", "enter"].includes(event.key) || event.modifiers?.platform) return;
+      if (event.key === "enter") {
+        const option = options[view.choiceIndex];
+        if (option) pick(option[0], cx);
+      } else if (options.length) {
+        view.choiceIndex = (view.choiceIndex + (event.key === "down" ? 1 : -1) + options.length) % options.length;
+        cx.notify();
+      }
+      cx.stop_propagation();
+    })
+    .children(options.map(([key, text], index) => keyboardControl(h_flex().id(`${id}-${key}`), cx => pick(key, cx), view.busy)
+      .h(28).flex_none().px(8).gap(8).items_center().rounded(4).cursor_pointer()
+      .when(index === view.choiceIndex, el => el.bg(t.selected)).hover(el => el.bg(t.hover))
+      .on_click((_event, cx) => { cx.stop_propagation(); pick(key, cx); })
+      .child(div().flex_1().min_w(0).text_size(13).truncate().tooltip(text).child(text))
+      .when(key === value, el => el.child(icon("check", 12).text_color(t.dim)))))
+    .when(!options.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(empty)));
+  return v_flex().w_full().flex_none().min_w(0).gap(6)
     .child(div().text_size(12).text_color(t.muted).child(label))
-    .child(keyboardControl(h_flex().id(`${id}-choice`), cx => { view.choosing = open ? null : id; cx.notify(); }, view.busy)
-      .h(32).px(10).gap(8).items_center().rounded(6).border_1().border_color(open ? t.accent : t.border)
-      .cursor_pointer().hover(el => el.bg(t.hover))
-      .on_click((_event, cx) => { if (!view.busy) { view.choosing = open ? null : id; cx.notify(); } })
-      .child(div().flex_1().min_w(0).text_size(13).truncate().child(current))
-      .child(icon("chevron-down", 12)))
-    .when(open, el => el.child(v_flex().id(`${id}-options`).max_h(160).overflow_y_scrollbar().p(4).gap(2).rounded(6)
-      .border_1().border_color(t.border).bg(t.popover)
-      .children(options.map(([key, text]) => keyboardControl(h_flex().id(`${id}-${key}`), cx => choose(key, cx), view.busy)
-        .h(28).px(8).gap(8).items_center().rounded(4).cursor_pointer().hover(el => el.bg(t.hover))
-        .on_click((_event, cx) => choose(key, cx))
-        .child(div().flex_1().min_w(0).text_size(13).truncate().child(text))
-        .when(key === value, el => el.child(icon("check", 12).text_color(t.dim)))))));
+    .child(Popup.new(`${id}-popup`, trigger).w_full().anchor("bottom_left").when(open, el => el.content(list)));
 }
 
 function newForm(view, t) {
@@ -255,17 +285,21 @@ function newForm(view, t) {
   const tickets = view.newTaskTickets();
   const text = view.values.title?.trim() ?? "";
   const plan = newTaskArgs({source:view.source, text, ticket:view.ticket, agent:view.agent, worktree:view.worktree,
-    newTicket:view.newTicket, name:view.values.name, branch:view.values.branch});
-  const hint = plan.error ? null : targetHint(plan.target, tickets);
+    newTicket:view.newTicket, description:view.values.description});
+  const neutralHint = {jira:"Pick a ticket below or paste a key or link",
+    branch:"The branch is checked out if it exists, else created from origin.",
+    smart:"Type a name, a branch, or a Jira key or link", name:targetHint({kind:"empty"})};
+  const hint = plan.error ? neutralHint[view.source] : targetHint(plan.target, tickets, view.values.description);
   const setSource = (source, cx) => {
     if (view.busy) return;
-    view.source = source; view.error = null;
+    view.source = source; view.error = null; view.choosing = null;
     if (source !== "jira") view.ticket = null;
     view.inputs.title.focus(); cx.notify();
   };
   const tabs = h_flex().gap(16).items_center().border_b_1().border_color(t.border)
     .children(sources.map(([id, label, glyph]) => keyboardControl(h_flex().id(`source-${id}`), cx => setSource(id, cx), view.busy)
-      .h(32).gap(6).items_center().cursor_pointer().border_b_2()
+      .h(32).flex_none().gap(6).items_center().cursor_pointer().border_b_2()
+      .opacity(view.busy ? 0.4 : 1)
       .border_color(view.source === id ? t.foreground : t.popover)
       .text_color(view.source === id ? t.foreground : t.muted).hover(el => el.text_color(t.foreground))
       .on_click((_event, cx) => setSource(id, cx))
@@ -274,47 +308,59 @@ function newForm(view, t) {
   const shown = view.source === "jira"
     ? tickets.filter(ticket => !needle || ticket.key.toLowerCase().includes(needle) || ticket.title.toLowerCase().includes(needle))
     : [];
-  const ticketList = view.source !== "jira" ? null : v_flex().id("new-tickets").max_h(150).overflow_y_scrollbar().gap(2)
+  const ticketList = view.source !== "jira" ? null : v_flex().id("new-tickets").flex_none()
+    .h(Math.min(Math.max(shown.length, 1), 5) * 30).overflow_y_scrollbar().gap(2)
     .children(shown.map(ticket => keyboardControl(h_flex().id(`new-ticket-${ticket.key}`), cx => {
       view.ticket = view.ticket === ticket.key ? null : ticket.key; view.error = null; cx.notify();
-    }, view.busy).h(28).px(8).gap(8).items_center().rounded(4).cursor_pointer().hover(el => el.bg(t.hover))
+    }, view.busy).h(28).flex_none().px(8).gap(8).items_center().rounded(4).cursor_pointer().opacity(view.busy ? 0.4 : 1).hover(el => el.bg(t.hover))
       .when(view.ticket === ticket.key, el => el.bg(t.selected))
       .on_click((_event, cx) => { if (!view.busy) { view.ticket = view.ticket === ticket.key ? null : ticket.key; view.error = null; cx.notify(); } })
       .child(div().flex_none().text_size(12).text_color(t.muted).child(ticket.key))
-      .child(div().flex_1().min_w(0).text_size(13).truncate().child(ticket.title))))
-    .when(!shown.length, el => el.child(div().px(8).text_size(12).text_color(t.dim)
+      .child(div().flex_1().min_w(0).text_size(13).truncate().tooltip(ticket.title).child(ticket.title))))
+    .when(!shown.length, el => el.child(div().h(28).px(8).text_size(12).text_color(t.dim).truncate()
       .child(tickets.length ? "No matching tickets; a typed key works too" : "No open tickets without a task; type a key")));
-  const toggle = (id, value, label, flip) => h_flex().gap(8).items_center()
-    .child(worktreeSwitch(t, value, (next, cx) => { flip(next); view.error = null; cx.notify(); }, view.busy, id))
+  const toggle = (id, value, label, flip) => h_flex().flex_none().gap(8).items_center()
+    .child(worktreeSwitch(t, value, (next, cx) => { if (!view.busy) { flip(next); view.error = null; cx.notify(); } }, view.busy, id)
+      .tab_index(0).tab_stop(!view.busy).accessibility_label(label))
     .child(div().text_size(12).text_color(t.foreground).child(label));
-  const body = v_flex().flex_1().min_h(0).gap(14).overflow_y_scrollbar()
-    .child(choice(view, t, "project", "Project", projects, view.project, (name, cx) => view.chooseNewProject(name, cx)))
-    .child(v_flex().gap(8).child(tabs).child(view.input("title"))
-      .when(Boolean(hint), el => el.child(div().text_size(11).text_color(t.dim).whitespace_normal().child(hint)))
+  const scrollBody = view.source === "jira";
+  const body = v_flex().id("new-body").min_h(0).gap(12)
+    .when(scrollBody, el => el.flex_1().overflow_y_scrollbar())
+    .when(!scrollBody, el => el.flex_none())
+    .child(h_flex().id("new-pickers").flex_none().gap(12).items_start()
+      .child(div().flex_1().min_w(0).child(choice(view, t, "project", "Project", projects, view.project,
+        (name, cx) => view.chooseNewProject(name, cx), "Choose a project", "No projects available")))
+      .child(div().flex_1().min_w(0).child(choice(view, t, "agent", "Agent",
+        [["codex", "Codex"], ["claude", "Claude"], ["none", "None (a shell)"]], view.agent,
+        (agent, cx) => { view.agent = agent; view.choosing = null; cx.notify(); }, "Choose an agent", "No agents available"))))
+    .child(v_flex().flex_none().gap(8).child(tabs)
+      .child(h_flex().h(36).gap(6).items_center()
+        .child(icon("search", 14).text_color(t.dim))
+        .child(div().flex_1().min_w(0).child(view.input("title").h(36))))
+      .child(div().id("new-hint").text_size(11).text_color(t.dim).truncate().tooltip(hint).child(hint))
       .when(Boolean(ticketList), el => el.child(ticketList)))
-    .child(choice(view, t, "agent", "Agent", [["codex", "Codex"], ["claude", "Claude"], ["none", "None, a shell"]], view.agent,
-      (agent, cx) => { view.agent = agent; view.choosing = null; cx.notify(); }))
-    .child(v_flex().gap(8)
-      .child(keyboardControl(h_flex().id("advanced"), cx => {view.advanced = !view.advanced; cx.notify();}, view.busy).h(28).gap(6).items_center().cursor_pointer().text_color(t.muted)
-        .hover(el => el.text_color(t.foreground))
-        .on_click((_event, cx) => {if (!view.busy) {view.advanced = !view.advanced; cx.notify();}})
-        .child(div().text_size(13).child("Advanced"))
-        .child(icon(view.advanced ? "chevron-down" : "chevron-right", 12)))
-      .when(view.advanced, el => el.child(v_flex().gap(8)
-        .child(toggle("new-worktree", view.worktree, "Create a worktree (off: the agent works in the main checkout)", next => { view.worktree = next; }))
-        .when(view.worktree, el => el
-          .child(field(t, "Worktree name", div().flex_1().min_w(0).child(view.input("name"))))
-          .when(view.source !== "branch", el => el.child(field(t, "Branch", div().flex_1().min_w(0).child(view.input("branch"))))))
-        .when(view.source !== "jira", el => el.child(toggle("new-jira-ticket", view.newTicket, "Create a Jira ticket for it", next => { view.newTicket = next; }))))));
-  return v_flex().size_full().min_h(0).p(24).gap(16).bg(t.popover).text_color(t.foreground)
-    .child(div().text_size(20).font_semibold().child("New task"))
+    .child(v_flex().flex_none().gap(6)
+      .child(div().text_size(12).text_color(t.muted).child("Description"))
+      .child(view.input("description").id("description")))
+    .child(h_flex().id("new-options").flex_none().gap(16).items_center()
+      .child(toggle("new-worktree", view.worktree, "Worktree", next => { view.worktree = next; }))
+      .when(view.source !== "jira", el => el.child(toggle("new-jira-ticket", view.newTicket, "New Jira ticket", next => { view.newTicket = next; })))
+      .when(Boolean(view.error) || view.created, el => el.child(div().id("new-status").flex_1().min_w(0).h(16)
+        .when(Boolean(view.error), el => el.child(errorLine(view, t).truncate().tooltip(view.error)))
+        .when(!view.error && view.created, el => el.child(div().text_size(12).text_color(t.done).child("Task created."))))));
+  return v_flex().size_full().min_h(0).p(24).gap(16).line_height(1.25).bg(t.popover).text_color(t.foreground)
+    .child(h_flex().h(28).flex_none().items_center()
+      .child(div().flex_1().text_size(20).font_semibold().child("New task"))
+      .child(keyboardControl(iconButton(t, "new-close", "x", "Close", () => closeOverlay(p.overlay), {disabled:view.busy}),
+        () => closeOverlay(p.overlay), view.busy).tab_index(1)))
     .child(body)
-    .when(Boolean(view.error), el => el.child(errorLine(view, t).whitespace_normal()))
-    .child(h_flex().pt(12).gap(8).items_center().border_t_1().border_color(t.border)
-      .child(toggle("create-more", view.createMore, "Create more", next => { view.createMore = next; }))
-      .child(div().flex_1())
-      .child(cancel(view, t))
-      .child(button(t, "create", "Create task  ⌘↵", cx => view.submitNew(cx), "primary", view.busy, view.busyAction === "start")));
+    .child(v_flex().flex_none().gap(8)
+      .child(h_flex().pt(12).gap(8).items_center().border_t_1().border_color(t.border)
+        .child(toggle("create-more", view.createMore, "Create more", next => { view.createMore = next; }))
+        .child(div().flex_1())
+        .child(cancel(view, t))
+        .child(button(t, "create", view.busyAction === "start" && plan.target?.kind === "empty" && view.values.description?.trim() ? "Naming…" : "Create task", cx => view.submitNew(cx), "primary", view.busy, view.busyAction === "start")
+          .child(kbd(t, "⌘↵").px(4).py(2).rounded(4).border_1().border_color(t.border).text_color(t.solid_foreground)))));
 }
 
 function ticketForm(view, t, p) {

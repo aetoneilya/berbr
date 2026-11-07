@@ -1,5 +1,5 @@
 import { View, div, svg, image } from "gpui-kit";
-import { h_flex, v_flex, Input, InputState, TextView } from "gpui-base";
+import { h_flex, v_flex, Input, InputState, Textarea, TextareaState, TextView } from "gpui-base";
 import { appHome, exec, focused, spaces, agents, panes, theme, run, props,
   openOverlay, closeOverlay, notify, shared, setShared, nextCommand, hc } from "herdr";
 import { walk, sectionLabels, taskSpace, rowMenu,
@@ -52,22 +52,30 @@ export default class Berbr extends View {
     if (this.form === "note") { initNote(this, cx); return; }
     this.inputs = {}; this.values = {}; this.searchFocused = false;
     const placeholders = { search: {jump:"Jump to…", projects:"Filter projects"}[this.form] ?? "Filter tasks", title: this.form === "new" ? "Type a name, a branch, or a Jira key or link" : "What are you working on?",
-      ticket: "DEMO-123", branch: "Automatic", name: "Automatic" };
+      ticket: "DEMO-123", ...(this.form === "new"
+        ? {description:"Describe the task: context, goal, links. Berbr names the task and its branch from it."}
+        : {name:"Automatic"}) };
     for (const key of Object.keys(placeholders)) {
       const value = p.prefill?.[key] ?? "";
-      const input = InputState.new({ value, placeholder: placeholders[key] });
+      const input = key === "description" ? TextareaState.new({value, placeholder:placeholders[key], rows:4})
+        : InputState.new({value, placeholder:placeholders[key]});
       this.values[key] = value;
       input.on("change", (_event, cx) => {
         this.values[key] = input.value();
+        if (this.form === "new") {
+          this.created = false; this.error = null;
+          if (key === "title") this.ticket = null;
+        }
         if (key === "search") this.filter = input.value();
         if (key === "search") this.pickerIndex = 0;
         if (key === "search" && this.form === "jump") { this.jumpQuery = input.value(); this.jumpIndex = 0; }
         cx.notify();
       });
-      input.on("submit", (_event, cx) => {
+      input.on("submit", (event, cx) => {
         if (this.form === "jump" && key === "search") this.chooseJump(cx);
         if (["projects", "attach-task"].includes(this.form) && key === "search") this.choosePicker(cx);
-        if (this.form === "new" && ["title", "ticket"].includes(key)) this.submitNew(cx);
+        // A textarea can consume Cmd-Enter and emit a secondary submit instead.
+        if (this.form === "new" && (["title", "ticket"].includes(key) || (key === "description" && event.secondary))) this.submitNew(cx);
         if (this.form === "rename" && key === "title") this.submitRename(cx);
         if (this.form === "ticket" && key === "ticket") this.submitTicket(cx, true);
       });
@@ -82,7 +90,10 @@ export default class Berbr extends View {
     this.source = p.prefill?.ticket ? "jira" : "smart";
     this.ticket = p.prefill?.ticket ?? null;
     this.newTicket = false; this.createMore = false; this.choosing = null;
-    this.advanced = false;
+    if (this.form === "new") {
+      this.created = false; this.choiceIndex = 0; this.choiceWidths = {};
+      this.choiceFocus = {project:cx.focus_handle(), agent:cx.focus_handle(), list:cx.focus_handle()};
+    }
     if (!this.form) {
       this.refresh(cx, true);
       cx.timer.every(1000, cx => {
@@ -578,8 +589,8 @@ export default class Berbr extends View {
     if (this.busy) return;
     const popup = ["projects", "attach-task", "menu"].includes(form);
     openOverlay({ mod:"berbr", kind: popup ? "popup" : "dialog",
-      width: ["done", "remove-merged"].includes(form) ? 520 : ["projects", "menu"].includes(form) ? 220 : form === "attach-task" ? 300 : ["jump", "new"].includes(form) ? 560 : form === "remove-tree" ? 440 : 480,
-      height: ["projects", "attach-task"].includes(form) ? 0.6 : popup ? undefined : form === "jump" ? 0.6 : ["done", "remove-merged"].includes(form) ? 0.75 : form === "new" ? 520 : form === "ticket" ? 420 : form === "remove-tree" ? 360 : 240,
+      width: ["done", "remove-merged"].includes(form) ? 520 : ["projects", "menu"].includes(form) ? 220 : form === "attach-task" ? 300 : form === "jump" ? 560 : form === "remove-tree" ? 440 : 480,
+      height: ["projects", "attach-task"].includes(form) ? 0.6 : popup ? undefined : form === "jump" ? 0.6 : ["done", "remove-merged"].includes(form) ? 0.75 : form === "new" ? 480 : form === "ticket" ? 420 : form === "remove-tree" ? 360 : 240,
       modal: ["new", "rename", "stop-agent", "remove-tree", "done", "remove-merged"].includes(form),
       ...(popup ? {at:"pointer"} : {}),
       props:{ form, project:this.project, binary:this.binary, agent:this.agent,
@@ -705,12 +716,14 @@ export default class Berbr extends View {
   submitNew(cx) {
     if (this.busy) return;
     const {args, error} = newTaskArgs({source:this.source, text:this.values.title, ticket:this.ticket,
-      agent:this.agent, worktree:this.worktree, newTicket:this.newTicket, name:this.values.name, branch:this.values.branch});
+      agent:this.agent, worktree:this.worktree, newTicket:this.newTicket, description:this.values.description});
     if (error) { this.error = error; cx.notify(); return; }
+    this.choosing = null; this.created = false;
     // Create more: the form stays for the next task, its text cleared
     const more = this.createMore;
     this.perform(cx, args, {close:!more, action:"start", after:more ? () => {
-      this.inputs.title.set_value(""); this.values.title = ""; this.ticket = null; this.inputs.title.focus();
+      for (const key of ["title", "description"]) { this.inputs[key].set_value(""); this.values[key] = ""; }
+      this.ticket = null; this.created = true; this.inputs.title.focus();
     } : null});
   }
 
@@ -817,6 +830,12 @@ export default class Berbr extends View {
     if (this.form === "new" && event.key === "enter" && event.modifiers?.platform) {
       this.submitNew(cx); cx.stop_propagation(); return;
     }
+    if (this.form === "new" && this.choosing && ["escape", "tab"].includes(event.key)) {
+      const id = this.choosing;
+      this.choosing = null;
+      this.choiceFocus[id].focus(); cx.notify();
+      if (event.key === "escape") { cx.stop_propagation(); return; }
+    }
     if (["projects", "attach-task"].includes(this.form) && ["up", "down", "enter"].includes(event.key)) {
       if (event.key === "enter") this.choosePicker(cx);
       else if (!this.busy) this.pickerIndex = Math.max(0, Math.min(this.pickerMatches().length - 1,
@@ -882,8 +901,10 @@ export default class Berbr extends View {
 
   input(key) {
     const t = theme();
-    return Input.new(this.inputs[key]).h(32).w_full().px(10).rounded(6)
-      .border_1().border_color(t.border).bg(t.background).text_color(t.foreground).text_size(13);
+    return (key === "description" ? Textarea.new(this.inputs[key]).h(96).py(8) : Input.new(this.inputs[key]).h(32))
+      .w_full().px(10).rounded(6)
+      .border_1().border_color(t.border).bg(t.background).text_color(t.foreground).text_size(13)
+      .when(this.form === "new", el => el.disabled(this.busy).tab_index(0).tab_stop(!this.busy));
   }
 
   panelFocused() { return this.handle.is_focused() || this.searchFocused; }

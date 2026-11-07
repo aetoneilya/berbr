@@ -12,6 +12,7 @@ export function div() {
     return (...args) => {
       if (key === "child") node.nodes.push(args[0]);
       else if (key === "children") node.nodes.push(...args[0]);
+      else if (key === "content") { node.attributes.content = args; node.nodes.push(args[0]); }
       else if (key === "when") { if (args[0]) args[1](proxy); }
       else node.attributes[key] = args;
       if (["on_mouse_down", "on_mouse_up"].includes(key)) {
@@ -24,16 +25,19 @@ export function div() {
   return proxy;
 }
 export const h_flex = div, v_flex = div;
+export const Popup = {new:(id, trigger) => div().id(String(id)).child(trigger)};
 export const svg = path => Object.assign(div().child(path), {asset:{kind:"svg", path}});
 export const image = path => Object.assign(div().child(path), {asset:{kind:"image", path}});
 export class View {}
 export const Input = {new:input => Object.assign(div(), {input})};
-export const Switch = {new:() => div()};
+export const Switch = {new:id => div().id(id)};
 export const InputState = {new:({value, placeholder}) => {
   const listeners = new Map();
   return {placeholder, on:(event, fn) => listeners.set(event, fn), focus() {}, value:() => value,
-    set_value(next) {value = next;}, emit:(event, cx) => listeners.get(event)?.({}, cx)};
+    set_value(next) {value = next;}, emit:(event, cx, payload = {}) => listeners.get(event)?.(payload, cx)};
 }};
+export const Textarea = {new:input => Object.assign(div(), {input})};
+export const TextareaState = {new:options => Object.assign(InputState.new(options), {rows:options.rows, multiline:true})};
 export const TextView = {html:(_id, text) => div().child(text), markdown:(_id, text) => div().child(text)};
 export const state = {props:{}, spaces:[], agents:[], shared:new Map(), calls:[], overlays:[], notices:[], execs:[]};
 export const appHome = () => "/test";

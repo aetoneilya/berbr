@@ -731,7 +731,7 @@ export function smartTarget(text) {
 }
 
 /** One line under the input: what Create task will do with it. */
-export function targetHint(target, tickets = []) {
+export function targetHint(target, tickets = [], description = "") {
   switch (target.kind) {
     case "ticket": {
       const title = tickets.find(ticket => ticket.key === target.key)?.title;
@@ -740,22 +740,24 @@ export function targetHint(target, tickets = []) {
     case "branch": return `Branch ${target.branch}: checked out if it exists, else created from origin`;
     case "name": return `New task “${target.name}”`;
     case "unsupported": return "Only Jira links are understood here";
-    default: return "Leave empty and the agent will name it.";
+    default: return String(description ?? "").trim()
+      ? "A small model will name the task and branch from the description; takes a few seconds."
+      : "Leave empty and the agent will name it.";
   }
 }
 
 /**
  * `berbr start` arguments for the New task form, or why there are none.
- * form: {source: smart|jira|branch|name, text, ticket, agent, worktree, newTicket, name, branch}
+ * form: {source: smart|jira|branch|name, text, description, ticket, agent, worktree, newTicket}
  */
 export function newTaskArgs(form) {
   const text = String(form.text ?? "").trim();
+  const description = String(form.description ?? "").trim();
   const fail = error => ({error});
   let target;
   if (form.source === "jira") {
-    const key = form.ticket || text;
-    if (!JIRA_KEY.test(key)) return fail("Pick a Jira ticket or enter a valid Jira ticket key (for example DEMO-123).");
-    target = {kind:"ticket", key};
+    target = smartTarget(form.ticket || text);
+    if (target.kind !== "ticket") return fail("Pick a Jira ticket or enter a valid Jira ticket key (for example DEMO-123).");
   } else if (form.source === "branch") {
     if (!text) return fail("Enter a branch.");
     if (/\s/.test(text)) return fail("A branch name has no spaces.");
@@ -767,19 +769,17 @@ export function newTaskArgs(form) {
     if (target.kind === "unsupported") return fail("Paste a Jira key or link, a branch, or type a task name.");
   }
   if (target.kind === "branch" && !form.worktree) return fail("A branch needs a worktree.");
-  if (form.newTicket && target.kind === "empty") return fail("Name the task to create a Jira ticket for it.");
+  if (form.newTicket && target.kind === "empty" && !description) return fail("Name the task or describe it to create a Jira ticket for it.");
   const args = ["start"];
   if (target.kind === "ticket") args.push(target.key);
   else if (target.kind === "branch") args.push(target.branch.split("/").filter(Boolean).pop() ?? target.branch, "--branch", target.branch);
   else if (target.kind === "name") args.push(target.name);
-  else args.push("--unnamed");
+  else if (!description) args.push("--unnamed");
+  if (description) args.push("--description", description);
   args.push("--bg");
   if (form.agent === "none") args.push("--no-agent"); else args.push("--agent", form.agent ?? "codex");
   if (!form.worktree) args.push("--no-worktree");
   if (form.newTicket && target.kind !== "ticket") args.push("--new-ticket");
-  const name = String(form.name ?? "").trim(), branch = String(form.branch ?? "").trim();
-  if (form.worktree && name) args.push("--name", name);
-  if (form.worktree && branch && target.kind !== "branch") args.push("--branch", branch);
   return {args, target};
 }
 
