@@ -221,7 +221,7 @@ function cancel(view, t) {
   return button(t, "cancel", "Cancel", () => closeOverlay(props().overlay), "ghost", view.busy);
 }
 
-const sources = [["smart", "Smart", "search"], ["jira", "Jira", "file-text"], ["branch", "Branch", "git-branch"], ["name", "Name", "square-pen"]];
+const sources = [["smart", "Generate", "search"], ["jira", "Jira", "file-text"], ["branch", "Branch", "git-branch"], ["name", "Name", "square-pen"]];
 
 /** Popup paints above the dialog; its options never take space in the form. */
 function choice(view, t, id, label, options, value, choose, placeholder, empty) {
@@ -283,18 +283,19 @@ function newForm(view, t) {
   const p = props() ?? {};
   const projects = (p.projects?.length ? p.projects : [view.project].filter(Boolean)).map(name => [name, name]);
   const tickets = view.newTaskTickets();
-  const text = view.values.title?.trim() ?? "";
+  const generate = view.source === "smart";
+  const text = generate ? "" : view.values.title?.trim() ?? "";
   const plan = newTaskArgs({source:view.source, text, ticket:view.ticket, agent:view.agent, worktree:view.worktree,
     newTicket:view.newTicket, description:view.values.description});
   const neutralHint = {jira:"Pick a ticket below or paste a key or link",
     branch:"The branch is checked out if it exists, else created from origin.",
-    smart:"Type a name, a branch, or a Jira key or link", name:targetHint({kind:"empty"})};
+    name:targetHint({kind:"empty"})};
   const hint = plan.error ? neutralHint[view.source] : targetHint(plan.target, tickets, view.values.description);
   const setSource = (source, cx) => {
     if (view.busy) return;
     view.source = source; view.error = null; view.choosing = null;
     if (source !== "jira") view.ticket = null;
-    view.inputs.title.focus(); cx.notify();
+    view.inputs[source === "smart" ? "description" : "title"].focus(); cx.notify();
   };
   const tabs = h_flex().gap(16).items_center().border_b_1().border_color(t.border)
     .children(sources.map(([id, label, glyph]) => keyboardControl(h_flex().id(`source-${id}`), cx => setSource(id, cx), view.busy)
@@ -334,10 +335,10 @@ function newForm(view, t) {
         [["codex", "Codex"], ["claude", "Claude"], ["none", "None (a shell)"]], view.agent,
         (agent, cx) => { view.agent = agent; view.choosing = null; cx.notify(); }, "Choose an agent", "No agents available"))))
     .child(v_flex().flex_none().gap(8).child(tabs)
-      .child(h_flex().h(36).gap(6).items_center()
+      .when(!generate, el => el.child(h_flex().h(36).gap(6).items_center()
         .child(icon("search", 14).text_color(t.dim))
         .child(div().flex_1().min_w(0).child(view.input("title").h(36))))
-      .child(div().id("new-hint").text_size(11).text_color(t.dim).truncate().tooltip(hint).child(hint))
+        .child(div().id("new-hint").text_size(11).text_color(t.dim).truncate().tooltip(hint).child(hint)))
       .when(Boolean(ticketList), el => el.child(ticketList)))
     .child(v_flex().flex_none().gap(6)
       .child(div().text_size(12).text_color(t.muted).child("Description"))

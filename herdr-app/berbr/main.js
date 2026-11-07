@@ -86,7 +86,7 @@ export default class Berbr extends View {
       this.inputs[key] = input;
     }
     this.agent = p.agent ?? "codex"; this.worktree = true;
-    // New task: where the input's text comes from, as Orca's Create worktree has it
+    // "smart" is the internal key for the description-only Generate tab.
     this.source = p.prefill?.ticket ? "jira" : "smart";
     this.ticket = p.prefill?.ticket ?? null;
     this.newTicket = false; this.createMore = false; this.choosing = null;
@@ -124,7 +124,8 @@ export default class Berbr extends View {
       this.jumpEntries = jumpItems(p.snapshot, p.agents ?? []); this.inputs.search.focus();
     } else if (["projects", "attach-task"].includes(this.form)) {
       this.inputs.search.focus();
-    } else if (["new", "rename"].includes(this.form)) this.inputs.title.focus();
+    } else if (this.form === "new") this.inputs[this.source === "smart" ? "description" : "title"].focus();
+    else if (this.form === "rename") this.inputs.title.focus();
     else if (this.form === "ticket") this.inputs.ticket.focus();
     if (["done", "remove-merged"].includes(this.form)) this.loadClosePlan(cx);
   }
@@ -715,7 +716,7 @@ export default class Berbr extends View {
 
   submitNew(cx) {
     if (this.busy) return;
-    const {args, error} = newTaskArgs({source:this.source, text:this.values.title, ticket:this.ticket,
+    const {args, error} = newTaskArgs({source:this.source, text:this.source === "smart" ? "" : this.values.title, ticket:this.ticket,
       agent:this.agent, worktree:this.worktree, newTicket:this.newTicket, description:this.values.description});
     if (error) { this.error = error; cx.notify(); return; }
     this.choosing = null; this.created = false;
@@ -723,7 +724,7 @@ export default class Berbr extends View {
     const more = this.createMore;
     this.perform(cx, args, {close:!more, action:"start", after:more ? () => {
       for (const key of ["title", "description"]) { this.inputs[key].set_value(""); this.values[key] = ""; }
-      this.ticket = null; this.created = true; this.inputs.title.focus();
+      this.ticket = null; this.created = true; this.inputs[this.source === "smart" ? "description" : "title"].focus();
     } : null});
   }
 

@@ -3000,15 +3000,15 @@ test("New task: the project picker sets --project, Create more keeps the form an
   assert.ok(!byId(view.render(cx), "new-ticket-DEMO-1"));
 
   const calls = []; view.cli = async args => { calls.push([view.project, ...args]); return "Started"; };
-  view.source = "smart"; view.values.title = "First"; view.inputs.title.set_value("First");
+  view.source = "smart"; view.values.description = "First"; view.inputs.description.set_value("First");
   view.createMore = true;
   view.keyEvent({key:"enter", modifiers:{platform:true}}, cx);
   await jobs.shift()(cx);
-  assert.deepEqual(calls, [["other", "start", "First", "--bg", "--agent", view.agent]]);
+  assert.deepEqual(calls, [["other", "start", "--description", "First", "--bg", "--agent", view.agent]]);
   assert.equal(view.values.title, "");
   assert.ok(!state.calls.some(call => call[0] === "closeOverlay"), "Create more keeps the form open");
 
-  view.createMore = false; view.values.title = "Second";
+  view.createMore = false; view.values.description = "Second";
   view.submitNew(cx); await jobs.shift()(cx);
   assert.deepEqual(state.calls.at(-1), ["closeOverlay", "new"]);
 });
@@ -3114,13 +3114,17 @@ test("New task has equal Project and Agent columns, matching popup widths, and p
   }
 });
 
-test("New task has a compact Smart body, scrolling Jira tickets without paging, and a separate shortcut chip", () => {
+test("New task has a compact Generate body with only Description, scrolling Jira tickets, and a shortcut chip", () => {
   const tickets = Array.from({length:21}, (_, index) => ({key:`DEMO-${index}`, title:"Long title ".repeat(20)}));
   const {view, cx} = setup({props:{form:"new", project:"demo", tickets:{demo:tickets}}});
   view.formOverlay("new");
   assert.equal(state.overlays.at(-1).width, 480);
   assert.equal(state.overlays.at(-1).height, 480);
   let root = view.render(cx);
+  assert.match(text(byId(root, "source-smart")), /Generate/);
+  assert.doesNotMatch(text(root), /Smart|Type a name, a branch/);
+  assert.deepEqual(nodes(root).filter(node => Object.hasOwn(node, "input")).map(node => node.input), [view.inputs.description]);
+  assert.equal(byId(root, "new-hint"), undefined);
   assert.ok(!nodes(root).some(node => node.attributes.overflow_y_scrollbar));
   assert.ok(byId(root, "new-body").attributes.flex_none);
   assert.ok(!byId(root, "new-body").attributes.flex_1);
@@ -3145,6 +3149,25 @@ test("New task has a compact Smart body, scrolling Jira tickets without paging, 
   assert.equal(byId(root, "new-tickets").attributes.h[0], 30);
   click(byId(root, "source-smart"), cx);
   assert.ok(!byId(view.render(cx), "new-body").attributes.overflow_y_scrollbar);
+});
+
+test("Generate ignores other tabs' target drafts, focuses Description, and submits only the description", async () => {
+  for (const [source, draft] of [["jira", "DEMO-123"], ["branch", "fix/login"], ["name", "Login"]]) {
+    const {view, cx, jobs} = setup({props:{form:"new", project:"demo"}});
+    click(byId(view.render(cx), `source-${source}`), cx);
+    view.inputs.title.set_value(draft); view.inputs.title.emit("change", cx);
+    view.inputs.description.set_value("Fix login failures"); view.inputs.description.emit("change", cx);
+    let focuses = 0; view.inputs.description.focus = () => focuses++;
+    click(byId(view.render(cx), "source-smart"), cx);
+    assert.equal(focuses, 1);
+    assert.equal(view.values.title, draft, "other tabs retain their target draft");
+    assert.deepEqual(nodes(view.render(cx)).filter(node => Object.hasOwn(node, "input")).map(node => node.input), [view.inputs.description]);
+    click(byId(view.render(cx), "create"), cx);
+    assert.equal(byId(view.render(cx), "create").nodes[0], "Naming…");
+    await jobs.shift()(cx);
+    const argv = state.execs[0][1];
+    assert.deepEqual(argv.slice(argv.indexOf("start")), ["start", "--description", "Fix login failures", "--bg", "--agent", "codex"]);
+  }
 });
 
 test("New task hints stay neutral before submit and validation errors appear only in the error line", () => {
@@ -3245,11 +3268,11 @@ test("New task Create more clears the title and description, refocuses input, co
   for (const [key, value] of [["title", "First"], ["description", "Context\nGoal"]]) {
     view.inputs[key].set_value(value); view.inputs[key].emit("change", cx);
   }
-  let focuses = 0; view.inputs.title.focus = () => focuses++;
+  let focuses = 0; view.inputs.description.focus = () => focuses++;
   click(byId(view.render(cx), "create"), cx);
   await jobs.shift()(cx);
   const argv = state.execs[0][1];
-  assert.deepEqual(argv.slice(argv.indexOf("--project")), ["--project", "other", "start", "First", "--description", "Context\nGoal", "--bg", "--agent", "codex"]);
+  assert.deepEqual(argv.slice(argv.indexOf("--project")), ["--project", "other", "start", "--description", "Context\nGoal", "--bg", "--agent", "codex"]);
   for (const key of ["title", "description"]) {
     assert.equal(view.values[key], ""); assert.equal(view.inputs[key].value(), "");
   }
@@ -3257,7 +3280,7 @@ test("New task Create more clears the title and description, refocuses input, co
   assert.equal(state.notices.length, 1);
   assert.match(text(byId(view.render(cx), "new-status")), /Task created/);
   assert.ok(!state.calls.some(call => call[0] === "closeOverlay"));
-  view.inputs.title.set_value("Second"); view.inputs.title.emit("change", cx);
+  view.inputs.description.set_value("Second"); view.inputs.description.emit("change", cx);
   assert.doesNotMatch(text(byId(view.render(cx), "new-status")), /Task created/);
 });
 
@@ -3276,7 +3299,7 @@ test("New task description uses four multiline rows; Enter does not submit and c
   view.keyEvent({key:"enter"}, cx);
   assert.equal(jobs.length, 0, "plain Enter in the textarea never submits");
   assert.equal(view.values.description, description.value());
-  assert.match(text(byId(view.render(cx), "new-hint")), /small model.*task and branch.*few seconds/);
+  assert.equal(byId(view.render(cx), "new-hint"), undefined);
   description.emit("submit", cx, {secondary:true});
   view.keyEvent({key:"enter", modifiers:{platform:true}}, cx);
   assert.equal(jobs.length, 1, "a secondary textarea submit and its bubbling key create only once");
