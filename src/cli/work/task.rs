@@ -8,7 +8,7 @@ use crate::table;
 use crate::vault::note::NoteError;
 use crate::vault::task::{Task, same_name};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub(in crate::cli) fn cli_task(config: &Config, command: TaskCommand) -> Result<(), String> {
     let target = match &command {
@@ -224,8 +224,84 @@ fn tool_task(config: &Config, target: Option<&str>) -> Result<Task, String> {
         return Ok(tasks.swap_remove(i));
     }
     let mut table = table::build(config, tasks, false);
-    let i = current_task(&table).ok_or("no task here; pass its ID explicitly")?;
+    let bound = std::env::current_dir()
+        .ok()
+        .and_then(|dir| worktree::worktree_root(&dir).ok())
+        .map(|root| bound_context_task(&table, &root))
+        .transpose()?
+        .flatten();
+    let i = bound
+        .or_else(|| current_task(&table))
+        .ok_or("no task here; pass its ID explicitly")?;
     Ok(table.tasks.swap_remove(i).task)
+}
+
+/// Explicit note bindings win over session/ticket/workspace inference for
+/// context tools. Keep this separate from table ownership and close planning.
+fn bound_context_task(table: &table::Table, root: &Path) -> Result<Option<usize>, String> {
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let root = canonical(root);
+    let references: Vec<_> = table
+        .tasks
+        .iter()
+        .map(|row| {
+            row.task
+                .note
+                .strings("worktrees")
+                .into_iter()
+                .chain(row.task.note.strings_at(&["bindings", "worktrees"]))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    // Absolute paths carry repository identity; a basename alone does not.
+    for absolute in [true, false] {
+        let mut matches = Vec::new();
+        for (i, row) in table
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| !row.task.done)
+        {
+            let matches_root = references[i].iter().any(|reference| {
+                let path = Path::new(reference);
+                if absolute {
+                    path.is_absolute() && canonical(path) == root
+                } else {
+                    !path.is_absolute()
+                        && root.file_name().and_then(|n| n.to_str()) == Some(reference)
+                }
+            });
+            if !matches_root {
+                continue;
+            }
+            if !absolute
+                && table
+                    .trees
+                    .iter()
+                    .filter(|tree| tree.wt.path.file_name() == root.file_name())
+                    .count()
+                    > 1
+            {
+                return Err("ambiguous worktree name; save its full path in the task note or pass the task ID explicitly".into());
+            }
+            matches.push((i, row.task.name.as_str()));
+        }
+        match matches.as_slice() {
+            [] => {}
+            [(i, _)] => return Ok(Some(*i)),
+            _ => {
+                return Err(format!(
+                    "worktree belongs to several tasks ({}); pass the task ID explicitly",
+                    matches
+                        .iter()
+                        .map(|(_, name)| *name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// `berbr note "<text>"`: an agent's finding, appended to `## Agent notes` of the
@@ -258,15 +334,68 @@ pub(in crate::cli) fn cli_note(
 
     let _lock = crate::vault::lock().map_err(err)?;
     for _ in 0..3 {
+        // The pre-lock read may pair old text with a newer file timestamp.
+        // Reload under the shared lock, just like task update does.
+        task.note.reload().map_err(err)?;
         task.note.append_agent_note(&line);
         match task.note.save() {
             Ok(_) => {
                 println!("written to \"{}\"", task.name);
                 return Ok(());
             }
-            Err(NoteError::Changed(_)) => task.note.reload().map_err(err)?,
+            Err(NoteError::Changed(_)) => continue,
             Err(e) => return Err(err(e)),
         }
     }
     Err(format!("\"{}\" keeps changing, not written", task.name))
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    use crate::table::fixtures::{ROOT, table, task_note, tree};
+
+    #[test]
+    fn absolute_binding_wins_over_basename_and_closed_tasks_are_ignored() {
+        let table = table(
+            vec![
+                task_note(
+                    "exact",
+                    &format!("bindings:\n  worktrees: [{ROOT}/parser]"),
+                    "2026-11-01",
+                ),
+                task_note("basename", "worktrees: [parser]", "2026-11-01"),
+                task_note(
+                    "closed",
+                    &format!("done: true\nworktrees: [{ROOT}/parser]"),
+                    "2026-11-01",
+                ),
+            ],
+            vec![],
+            vec![],
+            vec![tree("parser", "parser")],
+        );
+        let i = bound_context_task(&table, &Path::new(ROOT).join("parser"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(table.tasks[i].task.name, "exact");
+    }
+
+    #[test]
+    fn basename_binding_is_refused_when_two_repositories_have_the_same_tree_name() {
+        let mut other = tree("parser", "parser");
+        other.repo = "/other".into();
+        other.wt.path = "/other/.herdr/worktrees/parser".into();
+        let table = table(
+            vec![task_note("owner", "worktrees: [parser]", "2026-11-01")],
+            vec![],
+            vec![],
+            vec![tree("parser", "parser"), other],
+        );
+        assert!(
+            bound_context_task(&table, &Path::new(ROOT).join("parser"))
+                .unwrap_err()
+                .contains("ambiguous worktree name")
+        );
+    }
 }

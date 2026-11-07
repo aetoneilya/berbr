@@ -29,6 +29,22 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 impl Fixture {
+    fn codex_prefix(&self) -> String {
+        let tasks = self.root.join("vault/tasks").canonicalize().unwrap();
+        let cache = if cfg!(target_os = "macos") {
+            self.root.join("home/Library/Caches/berbr")
+        } else {
+            self.root.join("cache/berbr")
+        }
+        .canonicalize()
+        .unwrap();
+        format!(
+            "command codex --no-daemon '--add-dir' '{}' '--add-dir' '{}'",
+            tasks.display(),
+            cache.display()
+        )
+    }
+
     fn new(workflow: &str) -> Self {
         let root = common::temp_dir("berbr-agent-cli");
         fs::create_dir_all(root.join("vault/tasks")).unwrap();
@@ -296,9 +312,9 @@ fn starts_each_cli_with_the_same_task_brief() {
         let commands = fixture.run(&["start", "task", "--no-worktree", "--bg", "--agent", kind]);
         let command = pane_command(&commands);
         let prefix = if kind == "codex" {
-            "command codex --no-daemon"
+            fixture.codex_prefix()
         } else {
-            "command claude '--name' 'task'"
+            "command claude '--name' 'task'".into()
         };
         assert!(command.starts_with(&format!("{prefix} ")), "{command}");
         assert!(
@@ -316,9 +332,9 @@ fn prepared_worktree_command_keeps_the_requested_cli() {
         let commands = fixture.run(&["start", "task", "-n", "task", "--bg", "--agent", kind]);
         let command = pane_command(&commands);
         let prefix = if kind == "codex" {
-            "command codex --no-daemon"
+            fixture.codex_prefix()
         } else {
-            "command claude --name 'task'"
+            "command claude --name 'task'".into()
         };
         assert!(command.contains(&format!("&& {prefix} ")), "{command}");
         assert!(command.contains(" prepare "));
@@ -327,14 +343,16 @@ fn prepared_worktree_command_keeps_the_requested_cli() {
 
 #[test]
 fn resumes_the_owning_cli_even_when_native_ids_collide() {
-    for (kind, expected) in [
-        ("claude", "command claude --name 'task' '--resume' 'shared'"),
-        ("codex", "command codex --no-daemon 'resume' 'shared'"),
-    ] {
+    for kind in ["claude", "codex"] {
         let fixture = Fixture::new("");
         let tree = fixture.tree();
         fixture.sessions(&tree, true);
         let commands = fixture.run(&["select", "task", "--bg", "--agent", kind]);
+        let expected = if kind == "codex" {
+            format!("{} 'resume' 'shared'", fixture.codex_prefix())
+        } else {
+            "command claude --name 'task' '--resume' 'shared'".into()
+        };
         assert_eq!(pane_command(&commands), expected);
     }
 }
@@ -347,7 +365,7 @@ fn select_automatically_resumes_codex_despite_claude_default() {
     let commands = fixture.run(&["select", "task", "--bg"]);
     assert_eq!(
         pane_command(&commands),
-        "command codex --no-daemon 'resume' 'shared'"
+        format!("{} 'resume' 'shared'", fixture.codex_prefix())
     );
 }
 
@@ -384,7 +402,7 @@ fn explicit_tree_resumes_its_latest_session_without_changing_git() {
     let commands = fixture.run(&["select", "task", "--tree", "task", "--bg"]);
     assert_eq!(
         pane_command(&commands),
-        "command codex --no-daemon 'resume' 'recent'"
+        format!("{} 'resume' 'recent'", fixture.codex_prefix())
     );
     assert_eq!(git_snapshot(&fixture.repo), before);
     assert!(
@@ -407,7 +425,7 @@ fn explicit_tree_without_sessions_starts_fresh_without_changing_git() {
     let commands = fixture.run(&[
         "select", "task", "--tree", "task", "--bg", "--agent", "codex",
     ]);
-    assert!(pane_command(&commands).starts_with("command codex --no-daemon 'Context:"));
+    assert!(pane_command(&commands).starts_with(&format!("{} 'Context:", fixture.codex_prefix())));
     assert_eq!(git_snapshot(&fixture.repo), before);
     assert!(
         commands
@@ -537,7 +555,7 @@ fn selecting_codex_does_not_focus_claude_with_the_same_session_id() {
     let commands = fixture.run(&["select", "task", "--bg", "--agent", "codex"]);
     assert_eq!(
         pane_command(&commands),
-        "command codex --no-daemon 'resume' 'shared'"
+        format!("{} 'resume' 'shared'", fixture.codex_prefix())
     );
 }
 
@@ -555,7 +573,7 @@ fn saved_codex_ids_can_resume_without_a_plain_rollout_file() {
     let commands = fixture.run(&["select", "task", "--bg"]);
     assert_eq!(
         pane_command(&commands),
-        "command codex --no-daemon 'resume' 'shared'"
+        format!("{} 'resume' 'shared'", fixture.codex_prefix())
     );
 }
 
@@ -571,9 +589,9 @@ fn new_session_bypasses_live_agents_and_saved_conversations() {
         let commands = fixture.run(&["select", "task", "--new", "--agent", kind]);
         let command = pane_command(&commands);
         let prefix = if kind == "codex" {
-            "command codex --no-daemon"
+            fixture.codex_prefix()
         } else {
-            "command claude --name 'task'"
+            "command claude --name 'task'".into()
         };
         assert!(
             command.starts_with(&format!("{prefix} 'Context:")),
@@ -617,9 +635,9 @@ fn tui_n_can_start_either_cli_despite_the_project_default_and_live_agents() {
         let commands = fixture.tui("", answer);
         let command = pane_command(&commands);
         let prefix = if kind == "codex" {
-            "command codex --no-daemon"
+            fixture.codex_prefix()
         } else {
-            "command claude --name 'task'"
+            "command claude --name 'task'".into()
         };
         assert!(
             command.starts_with(&format!("{prefix} 'Context:")),
@@ -656,7 +674,7 @@ fn tui_n_on_a_worktree_uses_that_worktree_without_asking() {
         create.contains(&tree.to_string_lossy().into_owned()),
         "{create:?}"
     );
-    assert!(pane_command(&commands).starts_with("command codex --no-daemon 'Context:"));
+    assert!(pane_command(&commands).starts_with(&format!("{} 'Context:", fixture.codex_prefix())));
 }
 
 #[test]
@@ -696,7 +714,7 @@ fn tui_n_on_a_task_asks_which_worktree_to_use() {
         create.contains(&tree.to_string_lossy().into_owned()),
         "{create:?}"
     );
-    assert!(pane_command(&commands).starts_with("command codex --no-daemon 'Context:"));
+    assert!(pane_command(&commands).starts_with(&format!("{} 'Context:", fixture.codex_prefix())));
 }
 
 #[test]
@@ -721,5 +739,5 @@ fn fresh_codex_session_restores_a_removed_worktree_from_claude_history() {
     );
     let commands = fixture.run(&["select", "task", "--new", "--agent", "codex", "--bg"]);
     assert!(tree.exists());
-    assert!(pane_command(&commands).starts_with("command codex --no-daemon 'Context:"));
+    assert!(pane_command(&commands).starts_with(&format!("{} 'Context:", fixture.codex_prefix())));
 }

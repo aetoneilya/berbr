@@ -34,6 +34,28 @@ pub(super) struct Context<'a> {
     pub display_name: Option<&'a str>,
 }
 
+/// The task directory is needed for atomic note replacement; the cache holds
+/// the shared note-write lock. Do not grant access to the entire vault/home.
+fn task_agent_args(
+    kind: AgentKind,
+    note: Option<&Path>,
+    args: &[&str],
+) -> Result<Vec<String>, String> {
+    let mut result = Vec::new();
+    if kind == AgentKind::Codex
+        && let Some(parent) = note.and_then(Path::parent)
+    {
+        let cache = crate::config::cache_dir();
+        std::fs::create_dir_all(&cache).map_err(err)?;
+        for dir in [parent, cache.as_path()] {
+            let dir = dir.canonicalize().map_err(err)?;
+            result.extend(["--add-dir".into(), dir.to_string_lossy().into_owned()]);
+        }
+    }
+    result.extend(args.iter().map(|s| (*s).to_string()));
+    Ok(result)
+}
+
 /// A fresh agent in the task's workspace: reads its context, then works on
 /// a supplied description, or waits for a command.
 pub(super) fn launch(
@@ -141,10 +163,12 @@ pub(super) fn open_work(
         let brief = write_brief(&dir, &brief)?;
         if agent {
             let prompt = agent_prompt(note, &brief, description.as_deref()).unwrap_or_default();
+            let args = task_agent_args(kind, note, &[&prompt])?;
+            let args: Vec<_> = args.iter().map(String::as_str).collect();
             ui.say(format!(
                 "not in herdr — run it yourself: cd {} && {}",
                 shell_quote(&dir.to_string_lossy()),
-                kind.named_shell_command(name, &[&prompt])
+                kind.named_shell_command(name, &args)
             ));
         }
         return Ok(());
@@ -181,9 +205,11 @@ pub(super) fn open_work(
         dir = shell_quote(&dir.to_string_lossy()),
     );
     if agent.is_some() {
+        let args = task_agent_args(kind, note, &[])?;
+        let args: Vec<_> = args.iter().map(String::as_str).collect();
         command.push_str(&format!(
             " && {agent_command} \"$(cat {prompt}; rm -f {prompt})\"",
-            agent_command = kind.named_shell_prefix(name),
+            agent_command = kind.named_shell_command(name, &args),
             prompt = shell_quote(&prompt.to_string_lossy()),
         ));
     }
@@ -216,7 +242,9 @@ pub(super) fn open_added_work(
     let prompt = agent_prompt(Some(&task.note.path), &brief, open.description.as_deref());
     let (tab, pane) = open_tab(Space::Task(task), dir, name, ui)?;
     let agent = free_agent_name(name);
-    let args: Vec<&str> = prompt.as_deref().into_iter().collect();
+    let prompt_args: Vec<&str> = prompt.as_deref().into_iter().collect();
+    let args = task_agent_args(open.kind, Some(&task.note.path), &prompt_args)?;
+    let args: Vec<_> = args.iter().map(String::as_str).collect();
     herdr::start_agent_with_label(open.kind, &agent, &pane, name, &args).map_err(err)?;
     if open.focus {
         herdr::focus_tab(&tab).map_err(err)?;
@@ -303,6 +331,13 @@ pub(super) fn open_agent(
     focus: bool,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
+    let note = match space {
+        Space::Task(task) => Some(task.note.path.as_path()),
+        Space::Label(_) => None,
+    };
+    let args = task_agent_args(kind, note, agent_args)?;
+    let agent_args: Vec<_> = args.iter().map(String::as_str).collect();
+    let agent_args = agent_args.as_slice();
     if !herdr::available() {
         ui.say(format!(
             "not in herdr — run it yourself: cd {} && {}",

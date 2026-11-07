@@ -139,7 +139,19 @@ impl Note {
 
     /// A list value, or a single scalar as a one-element list.
     pub fn strings(&self, key: &str) -> Vec<String> {
-        match self.frontmatter.get(key) {
+        self.strings_at(&[key])
+    }
+
+    /// Read a nested list without rewriting legacy frontmatter.
+    pub fn strings_at(&self, keys: &[&str]) -> Vec<String> {
+        let Some((first, rest)) = keys.split_first() else {
+            return Vec::new();
+        };
+        let mut value = self.frontmatter.get(*first);
+        for key in rest {
+            value = value.and_then(|v| v.get(*key));
+        }
+        match value {
             Some(Value::Sequence(items)) => items.iter().filter_map(scalar_string).collect(),
             Some(value) => scalar_string(value).into_iter().collect(),
             None => Vec::new(),

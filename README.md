@@ -114,6 +114,20 @@ berbr done [<task>] [--tree <name-or-path> [--repo <path>]] [--merged] [-y] [--d
 berbr completions <shell>     shell completion script
 ```
 
+For `note` and `task show/update`, an explicit `worktrees` path (including legacy
+`bindings.worktrees`) takes precedence over inferred sessions and workspace.
+Conflicting explicit bindings require `note --task <id>` or `task show/update <id>`;
+use `-p <project>` when the current directory belongs to another project.
+Absolute paths take precedence over basenames; a basename shared by several
+repositories is ambiguous. These rules do not change table ownership or task
+closing plans.
+
+Task agents started or resumed with Codex receive `--add-dir` for the task note's
+directory and Berbr's cache (the shared note-write lock). Existing running agents
+keep their current sandbox permissions until restarted or granted access.
+An inherited `WORKTABLE_CONFIG` still selects that explicit configuration;
+after migration, remove the stale override or point it to `~/.berbr/config.toml`.
+
 `done --dry-run` prints the same plan without changing Jira, notes, worktrees,
 branches, herdr or caches. Add `--json` for one plan object, including blockers,
 removals, kept trees and ticket actions. Blockers still exit 0 in dry-run; the

@@ -982,6 +982,150 @@ fn rename_validates_title_and_shares_note_update_with_task_update() {
 }
 
 #[test]
+fn context_tools_prefer_saved_worktree_bindings_to_shared_sessions() {
+    for legacy in [false, true] {
+        let f = Fixture::new();
+        let tree = f.root.join("repo/.claude/worktrees/parser");
+        f.git(
+            &f.root.join("repo"),
+            &["worktree", "add", "-qb", "parser", tree.to_str().unwrap()],
+        );
+        fs::create_dir(tree.join("subdir")).unwrap();
+        let note = f.root.join("vault/tasks/test-0.md");
+        let binding = if legacy {
+            format!("bindings:\n  worktrees: [{tree:?}]")
+        } else {
+            format!("worktrees: [{tree:?}]")
+        };
+        fs::write(&note, format!("---\nid: test-0\n{binding}\nsessions: ['old parser 2026-11-01']\n---\nRequirements\n\n## Agent notes\n- Keep this finding\n")).unwrap();
+        let other = f.root.join("vault/tasks/other.md");
+        let original = "---\nsessions: ['shared parser 2026-11-01']\n---\nOther requirements\n";
+        fs::write(&other, original).unwrap();
+        let show = success(
+            f.command()
+                .current_dir(tree.join("subdir"))
+                .args(["task", "show"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(show["id"], "test-0");
+        let out = f
+            .command()
+            .current_dir(&tree)
+            .args(["note", "Parser finding"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let updated = success(
+            f.command()
+                .current_dir(&tree)
+                .args(["task", "update", "--description", "Updated requirements"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(updated["id"], "test-0");
+        assert_eq!(updated["description"], "Updated requirements");
+        let text = fs::read_to_string(&note).unwrap();
+        assert!(text.contains("Keep this finding"));
+        assert!(text.contains("Parser finding"));
+        assert!(text.contains(&binding));
+        assert_eq!(fs::read_to_string(other).unwrap(), original);
+    }
+}
+
+#[test]
+fn conflicting_explicit_bindings_require_a_task_even_with_a_caller_workspace() {
+    let f = Fixture::new();
+    let tree = f.root.join("repo/.herdr/worktrees/parser");
+    f.git(
+        &f.root.join("repo"),
+        &["worktree", "add", "-qb", "parser", tree.to_str().unwrap()],
+    );
+    let first = f.root.join("vault/tasks/test-0.md");
+    let second = f.root.join("vault/tasks/other.md");
+    fs::write(
+        &first,
+        format!("---\nid: test-0\nworktrees: [{tree:?}]\n---\nFirst\n"),
+    )
+    .unwrap();
+    fs::write(
+        &second,
+        format!("---\nbindings:\n  worktrees: [{tree:?}]\n---\nSecond\n"),
+    )
+    .unwrap();
+    let before = [fs::read(&first).unwrap(), fs::read(&second).unwrap()];
+    for args in [
+        vec!["task", "show"],
+        vec!["note", "Do not write"],
+        vec!["task", "update", "--description", "Do not write"],
+    ] {
+        let out = f
+            .command()
+            .current_dir(&tree)
+            .env("HERDR_WORKSPACE_ID", "sp-local")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("belongs to several tasks"));
+        assert_eq!(fs::read(&first).unwrap(), before[0]);
+        assert_eq!(fs::read(&second).unwrap(), before[1]);
+    }
+    let out = f
+        .command()
+        .current_dir(&tree)
+        .args(["note", "--task", "other", "Explicit finding"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read(&first).unwrap(), before[0]);
+    assert!(
+        fs::read_to_string(second)
+            .unwrap()
+            .contains("Explicit finding")
+    );
+}
+
+#[test]
+fn concurrent_note_writers_preserve_every_finding_and_the_original_context() {
+    let f = Fixture::new();
+    let note = f.root.join("vault/tasks/test-0.md");
+    let before = fs::read_to_string(&note).unwrap();
+    let mut children = Vec::new();
+    for i in 0..16 {
+        children.push(
+            f.command()
+                .args(["note", "--task", "test-0", &format!("Finding-{i:02}")])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let text = fs::read_to_string(note).unwrap();
+    assert!(text.starts_with(&before));
+    for i in 0..16 {
+        assert_eq!(text.matches(&format!("Finding-{i:02}")).count(), 1);
+    }
+}
+
+#[test]
 fn remove_ticket_named_tree_must_not_resolve_whole_task() {
     let f = Fixture::new();
     fs::write(
