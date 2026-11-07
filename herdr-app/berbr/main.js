@@ -17,6 +17,7 @@ export default class Berbr extends View {
     this.form = p.form ?? null;
     this.project = p.project ?? shared("berbr.project") ?? null;
     this.pendingProject = null;
+    this.snapshots = new Map(); // the last one of every project shown, for instant switching
     this.data = null; this.error = null; this.busy = false; this.loading = false;
     this.filter = ""; this.all = false; this.selected = null; this.hovered = null;
     this.expanded = null; this.busyAction = null;
@@ -188,14 +189,9 @@ export default class Berbr extends View {
         setShared("berbr.project", this.project);
         const firstData = !this.data;
         this.data = data; this.contextRow = null; this.error = null;
+        this.snapshots.set(data.project, data);
         setDebug(data.debug);
-        if (firstData) {
-          const flat = walk(data.rows);
-          const task = focusedTask(data.rows, this.actionContext().opening, spaces(), agents());
-          this.selected = task?.id ?? this.expanded;
-          if (task) this.setExpanded(task.id, cx);
-          if ((task ?? flat.find(row => row.id === this.expanded))?.done) this.all = true;
-        }
+        if (firstData) this.focusInitial(data, cx);
       } catch (error) {
         if (load !== this.load) return;
         this.error = String(error.message ?? error);
@@ -207,7 +203,8 @@ export default class Berbr extends View {
     });
   }
 
-  // A load still running for the old project is dropped, not waited for.
+  // A load still running for the old project is dropped, not waited for. The
+  // project's last snapshot shows at once; the fresh one replaces it.
   switchProject(name, cx) {
     if (this.busy || name === this.project) return;
     this.loading = false;
@@ -215,7 +212,18 @@ export default class Berbr extends View {
     this.contextRow = null;
     this.setExpanded(null, cx);
     this.cwd = this.data?.projects?.find(project => project.name === name)?.cwd ?? null;
-    this.data = null; this.refresh(cx, true);
+    this.data = this.snapshots.get(name) ?? null;
+    if (this.data) this.focusInitial(this.data, cx);
+    this.refresh(cx, true);
+  }
+
+  /** What a project shows first: the task of the focused terminal, else the last expanded one. */
+  focusInitial(data, cx) {
+    const flat = walk(data.rows);
+    const task = focusedTask(data.rows, this.actionContext().opening, spaces(), agents());
+    this.selected = task?.id ?? this.expanded;
+    if (task) this.setExpanded(task.id, cx);
+    if ((task ?? flat.find(row => row.id === this.expanded))?.done) this.all = true;
   }
 
   liveState() {

@@ -2228,6 +2228,35 @@ test("choosing a project mid-load starts it at once and drops the old project's 
   assert.equal(state.shared.get("berbr.project"), "other");
 });
 
+test("switching back shows the project's last snapshot at once, then the fresh one", async () => {
+  const {view, cx, jobs} = setup();
+  const pending = [];
+  state.execHandler = (_program, args) => new Promise(resolve => pending.push({project:args[args.indexOf("--project") + 1], resolve}));
+  const reply = (project, title) => ({code:0, stderr:"",
+    stdout:JSON.stringify({project, rows:[{kind:"task", id:`task:${title}`, task:title, title}], projects:[{name:"demo"}, {name:"other"}]})});
+  view.project = "demo";
+  view.refresh(cx);
+  const first = jobs.shift()(cx);
+  pending.shift().resolve(reply("demo", "old"));
+  await first;
+  jobs.length = 0;
+  state.shared.set("berbr.project", "other");
+  view.switchProject("other", cx);
+  assert.equal(view.data, null, "never shown yet: nothing to show");
+  const other = jobs.shift()(cx);
+  pending.shift().resolve(reply("other", "theirs"));
+  await other;
+  jobs.length = 0;
+  state.shared.set("berbr.project", "demo");
+  view.switchProject("demo", cx);
+  assert.equal(view.project, "demo");
+  assert.equal(view.data.rows[0].title, "old", "the last snapshot, without waiting");
+  const fresh = jobs.shift()(cx);
+  pending.shift().resolve(reply("demo", "new"));
+  await fresh;
+  assert.equal(view.data.rows[0].title, "new");
+});
+
 test("jump opens loose links, focuses agents, switches projects and closes on Escape", async () => {
   const data = {project:"demo", rows:[{kind:"ticket", id:"ticket", target:"DEMO-12", url:"https://example.com/ticket"},
     {kind:"mr", id:"mr", label:"!123", url:"https://example.com/mr"}, {kind:"agent", id:"agent", terminal:"terminal"}], projects:[{name:"other"}]};
