@@ -781,12 +781,25 @@ fn start_uses_title_slug_and_claude_display_name_in_prepare_and_main_checkout() 
             String::from_utf8_lossy(&out.stderr)
         );
         let calls = f.calls();
-        let create = calls.iter().find(|c| c[1][1] == "space.new").unwrap();
-        let args: Value = serde_json::from_str(create[1][2].as_str().unwrap()).unwrap();
-        assert_eq!(args["name"], "Parser: исправить repeated calls with cache");
-        let tab = calls.iter().find(|c| c[1][1] == "tab.rename").unwrap();
-        let args: Value = serde_json::from_str(tab[1][2].as_str().unwrap()).unwrap();
-        assert_eq!(args["name"], "parser-repeated-calls-with");
+        if no_worktree {
+            // no space of its own: a pane beside the project space's terminal
+            // (t1 is in the main checkout), labelled with the task
+            assert!(!calls.iter().any(|c| c[1][1] == "space.new"));
+            let split = calls.iter().find(|c| c[1][1] == "pane.split").unwrap();
+            let args: Value = serde_json::from_str(split[1][2].as_str().unwrap()).unwrap();
+            assert_eq!(args["pane"], "p1");
+            assert!(calls.iter().any(|c| c[0] == "hc"
+                && c[1][0] == "label"
+                && c[1][1] == "t7"
+                && c[1][2].as_str().unwrap().starts_with("berbr.task=")));
+        } else {
+            let create = calls.iter().find(|c| c[1][1] == "space.new").unwrap();
+            let args: Value = serde_json::from_str(create[1][2].as_str().unwrap()).unwrap();
+            assert_eq!(args["name"], "Parser: исправить repeated calls with cache");
+            let tab = calls.iter().find(|c| c[1][1] == "tab.rename").unwrap();
+            let args: Value = serde_json::from_str(tab[1][2].as_str().unwrap()).unwrap();
+            assert_eq!(args["name"], "parser-repeated-calls-with");
+        }
         let send = calls
             .iter()
             .find(|c| c[0] == "hc" && c[1][0] == "send")

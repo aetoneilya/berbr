@@ -202,9 +202,10 @@ then prints one line with the path, tab and terminal IDs. Errors exit nonzero
 with one error line. Herdr is required; a failed launch leaves the worktree for
 inspection/retry with `--in`.
 
-On a worktree without a task, **New agent** opens the configured agent without a
-brief (or a shell when the agent is `none`). It reuses the worktree's live space
-and creates an unnamed main-checkout space if needed so the sidebar nests them.
+On a worktree without a task, **New agent** / **New terminal** run
+`berbr open <path> [--shell]`: the configured agent without a brief (or a shell)
+in a space named after the branch, after making sure the project's main-checkout
+space exists so the sidebar nests it.
 
 New task checkouts reserve a unique name before launch. A slug collision adds
 its task ID (then a counter if needed); a new task never reuses another task's

@@ -170,6 +170,11 @@ impl Agent {
             .unwrap_or_else(|| self.session(sessions).is_some_and(|s| s.id == key))
     }
 
+    /// The task a Herdr App terminal was labelled with (`berbr.task`).
+    pub fn task_label(&self) -> Option<&str> {
+        self.extra.get("berbr_task").and_then(|v| v.as_str())
+    }
+
     pub fn runs_in(&self, dir: &Path) -> bool {
         self.cwd
             .as_deref()
@@ -205,6 +210,59 @@ pub fn list_agents() -> Result<Vec<Agent>> {
 
 pub fn list_workspaces() -> Result<Vec<Workspace>> {
     result_field(run_herdr(&["workspace", "list"])?, "/result/workspaces")
+}
+
+/// Herdr App's sidebar lists a space whose first terminal is in a linked
+/// worktree under the space of the repo's main checkout. Legacy herdr groups
+/// spaces itself, so this is the app only.
+pub fn nests_worktree_spaces() -> bool {
+    app::enabled()
+}
+
+/// Where a space is now, as Herdr App's sidebar sees it.
+#[derive(Debug, Clone)]
+pub struct SpacePlace {
+    pub space: String,
+    /// Its first terminal's folder, else the folder it was made in.
+    pub place: PathBuf,
+    /// That first terminal.
+    pub terminal: Option<String>,
+}
+
+/// Where each space is now; Herdr App only, empty elsewhere.
+pub fn space_places() -> Result<Vec<SpacePlace>> {
+    if !app::enabled() {
+        return Ok(Vec::new());
+    }
+    Ok(app::space_places()?
+        .into_iter()
+        .map(|(space, place, terminal)| SpacePlace {
+            space,
+            place: PathBuf::from(place),
+            terminal,
+        })
+        .collect())
+}
+
+/// Herdr App: marks the terminal in `pane` as working on `task`, for an agent
+/// that runs outside the task's own space.
+pub fn label_task(pane: &str, task: &str) -> Result<()> {
+    herdr_output(&["pane", "label", pane, &format!("berbr.task={task}")]).map(|_| ())
+}
+
+/// Shows `pane` of `space`: the space, the pane's tab, then the pane.
+pub fn focus_pane(space: &str, pane: &str) -> Result<()> {
+    if app::enabled() {
+        let tab = app::tab_of(pane)?.unwrap_or_default();
+        return app::focus_known(space, &tab, pane);
+    }
+    run_herdr(&["workspace", "focus", space])?;
+    run_herdr(&["agent", "focus", pane]).map(|_| ())
+}
+
+/// Closes a pane and ends its terminal.
+pub fn close_pane(pane: &str) -> Result<()> {
+    run_herdr(&["pane", "close", pane]).map(|_| ())
 }
 
 /// Only wt-owned tokens; empty values remove an old token instead of retaining it.

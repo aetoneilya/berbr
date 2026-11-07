@@ -1,13 +1,14 @@
 //! Task context tools and findings appended to task notes.
 
-use super::common::{current_task, err, find_task};
+use super::common::{current_task, err, find_task, name_from_text};
 use crate::cli::{TaskCommand, load};
-use crate::client::herdr;
+use crate::client::{herdr, worktree};
 use crate::config::Config;
 use crate::table;
 use crate::vault::note::NoteError;
-use crate::vault::task::Task;
+use crate::vault::task::{Task, same_name};
 use std::io::Read;
+use std::path::PathBuf;
 
 pub(in crate::cli) fn cli_task(config: &Config, command: TaskCommand) -> Result<(), String> {
     let target = match &command {
@@ -34,7 +35,11 @@ pub(in crate::cli) fn cli_task(config: &Config, command: TaskCommand) -> Result<
         if title.is_none() && description.is_none() {
             return Err("supply --title, --description or --description-file".into());
         }
+        let untitled = task.title().is_none();
         task = update_context(task, title.as_deref(), description.as_deref(), fill_empty)?;
+        if untitled && task.title().is_some() {
+            name_work_after_title(config, &task, &mut |line| eprintln!("{line}"));
+        }
     }
     println!(
         "{}",
@@ -92,6 +97,83 @@ fn update_context(
         return Err("task keeps changing, not written".into());
     }
     Ok(task)
+}
+
+/// A task started without a title runs in a space, tab and branch named
+/// after its ID. Once it has a title they take it: the space its title, each
+/// worktree's tab and branch a slug of it. A branch already on origin (so
+/// maybe with an MR) or not named after the ID keeps its name; worktree
+/// folders and the note never move — the running agent works in them.
+fn name_work_after_title(config: &Config, task: &Task, say: &mut dyn FnMut(String)) {
+    if herdr::available() {
+        let renamed = herdr::list_workspaces().map_err(err).and_then(|spaces| {
+            let identities = load(config)?;
+            let space = crate::vault::task::task_space_in(task, &spaces, &identities)?;
+            match space {
+                Some(space) if !same_name(&space.label, &task.space_name()) => {
+                    herdr::rename_workspace(&space.workspace_id, &task.space_name())
+                        .map_err(err)?;
+                    Ok(Some(task.space_name()))
+                }
+                _ => Ok(None),
+            }
+        });
+        match renamed {
+            Ok(Some(label)) => say(format!("space: {label}")),
+            Ok(None) => {}
+            Err(e) => say(format!("space: not renamed — {e}")),
+        }
+    }
+    let Some(slug) = task.title().as_deref().and_then(name_from_text) else {
+        say("branch: kept — the title has no Latin words to name it after".into());
+        return;
+    };
+    let prefix = &config.workflow.branch_prefix;
+    let tabs = if herdr::available() {
+        herdr::list_tabs().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    for path in task.note.strings("worktrees") {
+        let path = PathBuf::from(path);
+        let Some(dir) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        let Ok(branch) = worktree::current_branch(&path) else {
+            continue;
+        };
+        if !dir.starts_with(&task.name) || branch != format!("{prefix}{dir}") {
+            continue;
+        }
+        if worktree::on_origin(&path, &branch) {
+            say(format!("branch {branch}: kept — it is on origin"));
+            continue;
+        }
+        let name = (1..)
+            .map(|n| {
+                if n == 1 {
+                    slug.clone()
+                } else {
+                    format!("{slug}-{n}")
+                }
+            })
+            .find(|name| !worktree::branch_exists(&path, &format!("{prefix}{name}")))
+            .unwrap_or_else(|| slug.clone());
+        let new = format!("{prefix}{name}");
+        match worktree::rename_branch(&path, &branch, &new) {
+            Ok(()) => say(format!("branch: {branch} → {new}")),
+            Err(e) => {
+                say(format!("branch {branch}: not renamed — {e}"));
+                continue;
+            }
+        }
+        for tab in tabs.iter().filter(|t| t.label == dir) {
+            match herdr::rename_tab(&tab.tab_id, &name) {
+                Ok(()) => say(format!("tab: {dir} → {name}")),
+                Err(e) => say(format!("tab {dir}: not renamed — {e}")),
+            }
+        }
+    }
 }
 
 pub(in crate::cli) fn cli_rename(

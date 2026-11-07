@@ -81,8 +81,8 @@ export function kbd(t, text) {
   return div().text_size(11).text_color(t.dim).child(text);
 }
 
-export function worktreeSwitch(t, value, action, disabled) {
-  return Switch.new("worktree-switch").checked(value).disabled(disabled)
+export function worktreeSwitch(t, value, action, disabled, id = "worktree-switch") {
+  return Switch.new(id).checked(value).disabled(disabled)
     .w(28).h(16).px(2).flex().items_center().rounded(8).cursor_pointer()
     .bg(value ? t.accent : t.raised).when(value, el => el.justify_end())
     .on_change(action).child(div().size(12).rounded(6).bg(t.foreground));

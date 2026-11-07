@@ -14,9 +14,13 @@ pub(super) struct Names {
 
 const SCHEMA: &str = r#"{"type":"object","properties":{"title":{"type":"string"},"worktree":{"type":"string"}},"required":["title","worktree"],"additionalProperties":false}"#;
 
-/// A short, tool-free request; it does not start work or keep a session.
-pub(super) fn from_description(description: &str) -> Result<Names, String> {
+/// A short, tool-free request to `model`, headless; it does not start work or
+/// keep a session.
+pub(super) fn from_description(description: &str, model: &str) -> Result<Names, String> {
+    let model = model.trim();
     let mut child = Command::new("claude")
+        // empty: Claude's own default
+        .args(if model.is_empty() { vec![] } else { vec!["--model", model] })
         .args([
             "--print",
             "--output-format", "json",

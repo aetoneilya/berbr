@@ -4,7 +4,7 @@ import { appHome, exec, focused, spaces, agents, panes, theme, run, props,
   openOverlay, closeOverlay, notify, shared, setShared, nextCommand, hc } from "herdr";
 import { walk, sectionLabels, taskSpace, rowMenu,
   normalizeTicketState, ticketTitle,
-  cleanCliText, isClosedTicket,
+  cleanCliText, isClosedTicket, newTaskArgs, freeTickets,
   agentActivity, formatElapsed, blockedPrompt, mrPills, focusedTask, focusedTree, treeFocusTarget, jumpItems, matchJump, closePlan, PanelModel, treeMarks, isMergedTree, mergedPlan, backendClosePlan } from "./model.js";
 import { icon, iconButton, button, chip, sectionHeader, statusMark, kbd, pill } from "./ui.js";
 import { formView, initNote, noteKey } from "./forms.js";
@@ -51,7 +51,7 @@ export default class Berbr extends View {
     this.handle.focus();
     if (this.form === "note") { initNote(this, cx); return; }
     this.inputs = {}; this.values = {}; this.searchFocused = false;
-    const placeholders = { search: {jump:"Jump to…", projects:"Filter projects"}[this.form] ?? "Filter tasks", title: "What are you working on?",
+    const placeholders = { search: {jump:"Jump to…", projects:"Filter projects"}[this.form] ?? "Filter tasks", title: this.form === "new" ? "Type a name, a branch, or a Jira key or link" : "What are you working on?",
       ticket: "DEMO-123", branch: "Automatic", name: "Automatic" };
     for (const key of Object.keys(placeholders)) {
       const value = p.prefill?.[key] ?? "";
@@ -78,7 +78,10 @@ export default class Berbr extends View {
       this.inputs[key] = input;
     }
     this.agent = p.agent ?? "codex"; this.worktree = true;
-    this.ticketMode = p.prefill?.ticket ? "existing" : "none";
+    // New task: where the input's text comes from, as Orca's Create worktree has it
+    this.source = p.prefill?.ticket ? "jira" : "smart";
+    this.ticket = p.prefill?.ticket ?? null;
+    this.newTicket = false; this.createMore = false; this.choosing = null;
     this.advanced = false;
     if (!this.form) {
       this.refresh(cx, true);
@@ -504,7 +507,7 @@ export default class Berbr extends View {
     if (next !== this.hovered) { this.hovered = next; cx.notify(); }
   }
 
-  perform(cx, args, {close = false, action = args[0], before = null} = {}) {
+  perform(cx, args, {close = false, action = args[0], before = null, after = null} = {}) {
     if (this.busy || this.loading) return;
     this.busy = true; this.busyAction = action; this.error = null;
     cx.notify();
@@ -515,11 +518,19 @@ export default class Berbr extends View {
         this.busy = false;
         run("berbr.refresh");
         if (close && props()?.overlay) closeOverlay(props().overlay);
+        after?.();
         notify({title:"Berbr",body:result.trim() || "Done",level:"info"});
         if (!this.form) this.refresh(cx, true);
       } catch (error) { this.error = String(error.message ?? error); this.busy = false; }
       this.busyAction = null; cx.notify();
     });
+  }
+
+  /** A worktree with no task: a new agent or shell in a space of its own (`berbr open`). */
+  openLoose(tree, shell, cx, {close = false, action} = {}) {
+    const path = tree.cwd || treeMarks(tree).path;
+    if (!path) return;
+    this.perform(cx, ["open", path, ...(shell ? ["--shell"] : [])], {close, action});
   }
 
   openUrl(url, cx, action = url, {close = false} = {}) {
@@ -568,11 +579,18 @@ export default class Berbr extends View {
     const popup = ["projects", "attach-task", "menu"].includes(form);
     openOverlay({ mod:"berbr", kind: popup ? "popup" : "dialog",
       width: ["done", "remove-merged"].includes(form) ? 520 : ["projects", "menu"].includes(form) ? 220 : form === "attach-task" ? 300 : ["jump", "new"].includes(form) ? 560 : form === "remove-tree" ? 440 : 480,
-      height: ["projects", "attach-task"].includes(form) ? 0.6 : popup ? undefined : form === "jump" ? 0.6 : ["done", "remove-merged"].includes(form) ? 0.75 : form === "new" ? 380 : form === "ticket" ? 420 : form === "remove-tree" ? 360 : 240,
+      height: ["projects", "attach-task"].includes(form) ? 0.6 : popup ? undefined : form === "jump" ? 0.6 : ["done", "remove-merged"].includes(form) ? 0.75 : form === "new" ? 520 : form === "ticket" ? 420 : form === "remove-tree" ? 360 : 240,
       modal: ["new", "rename", "stop-agent", "remove-tree", "done", "remove-merged"].includes(form),
       ...(popup ? {at:"pointer"} : {}),
       props:{ form, project:this.project, binary:this.binary, agent:this.agent,
-        ...this.actionContext(), ...extra } });
+        ...(form === "new" ? this.newTaskProps() : {}), ...this.actionContext(), ...extra } });
+  }
+
+  /** What the New task form picks from: the projects, and each one's open tickets with no task. */
+  newTaskProps() {
+    const projects = (this.data?.projects ?? []).map(project => project.name);
+    const tickets = Object.fromEntries([...this.snapshots].map(([name, snapshot]) => [name, freeTickets(snapshot)]));
+    return {projects, tickets};
   }
 
   menuTarget(item) {
@@ -608,11 +626,9 @@ export default class Berbr extends View {
         break;
       }
       case "start": case "resume": this.open(row, cx); break;
-      case "new-agent":
-        if (row.task) this.perform(cx, ["add", row.task, "--in", row.tree], {close:true});
-        else this.agentInWorktree(row, cx);
-        break;
+      case "new-agent": this.perform(cx, ["add", row.task, "--in", row.tree], {close:true}); break;
       case "review": this.perform(cx, ["review", row.tree], {close:true}); break;
+      case "open-agent": case "open-shell": this.openLoose(row, id === "open-shell", cx, {close:true}); break;
       case "rename": form("rename", {row, prefill:{title:row.title ?? row.label ?? row.task}}); break;
       case "note": close(); this.openNote(row); break;
       case "done": form("done", {task:row.task, label:row.title ?? row.label, row}); break;
@@ -627,36 +643,6 @@ export default class Berbr extends View {
       case "copy-terminal": this.copyText(terminal, cx); break;
       case "copy-link": this.copyText(row.url, cx); break;
     }
-  }
-
-  agentInWorktree(row, cx) {
-    if (this.busy || !row.cwd || !row.repo) return;
-    this.busy = true; this.error = null; cx.notify();
-    cx.spawn(async cx => {
-      try {
-        const all = panes();
-        const placed = spaces().filter(space => !space.machine).map(space => {
-          const tabs = new Set((space.tabs ?? []).map(tab => tab.id));
-          const path = all.find(pane => pane.terminal && tabs.has(pane.tab) && pane.cwd)?.cwd || space.folder;
-          return {space, path};
-        });
-        const inside = (path, folder) => path && (path === folder || path.startsWith(folder + "/"));
-        let main = false;
-        for (const {path} of placed) {
-          if (!inside(path, row.repo)) continue;
-          // A linked worktree can live under the main checkout's directory.
-          const result = await exec("git", ["-C", path, "rev-parse", "--show-toplevel"]);
-          if (result.code === 0 && result.stdout.trim() === row.repo) { main = true; break; }
-        }
-        if (!main) run("space.new", {folder:row.repo});
-        const target = placed.find(({path}) => inside(path, row.cwd));
-        const options = {folder:row.cwd, ...(this.agent === "none" ? {} : {argv:[this.agent]})};
-        if (target) run("tab.new", {space:target.space.id, ...options});
-        else run("space.new", options);
-        if (props()?.overlay) closeOverlay(props().overlay);
-      } catch (error) { this.error = String(error.message ?? error); }
-      this.busy = false; cx.notify();
-    });
   }
 
   copyText(value, cx) {
@@ -717,21 +703,27 @@ export default class Berbr extends View {
   }
 
   submitNew(cx) {
-    if (this.ticketMode === "existing" && !/^[A-Z][A-Z0-9]*-\d+$/.test(this.values.ticket?.trim() ?? "")) {
-      this.error = "Enter a valid Jira ticket key (for example DEMO-123)."; cx.notify(); return;
-    }
-    const title = this.values.title?.trim();
-    const args = ["start", ...(title ? [title] : ["--unnamed"]), "--bg"];
-    if (this.agent === "none") args.push("--no-agent"); else args.push("--agent", this.agent);
-    if (!this.worktree) args.push("--no-worktree");
-    if (this.ticketMode === "new") args.push("--new-ticket");
-    const ticket = this.values.ticket?.trim();
-    if (this.ticketMode === "existing" && ticket) args.push("--ticket", ticket);
-    const branch = this.values.branch?.trim();
-    if (this.worktree && branch) args.push("--branch", branch);
-    const name = this.values.name?.trim();
-    if (this.worktree && name) args.push("--name", name);
-    this.perform(cx, args, {close:true});
+    if (this.busy) return;
+    const {args, error} = newTaskArgs({source:this.source, text:this.values.title, ticket:this.ticket,
+      agent:this.agent, worktree:this.worktree, newTicket:this.newTicket, name:this.values.name, branch:this.values.branch});
+    if (error) { this.error = error; cx.notify(); return; }
+    // Create more: the form stays for the next task, its text cleared
+    const more = this.createMore;
+    this.perform(cx, args, {close:!more, action:"start", after:more ? () => {
+      this.inputs.title.set_value(""); this.values.title = ""; this.ticket = null; this.inputs.title.focus();
+    } : null});
+  }
+
+  /** New task: the project the task goes to (the CLI's --project). */
+  chooseNewProject(name, cx) {
+    if (this.busy || !name) return;
+    if (name !== this.project) { this.project = name; this.ticket = null; }
+    this.choosing = null; this.error = null; cx.notify();
+  }
+
+  /** New task: its open Jira tickets with no task, for the Jira tab. */
+  newTaskTickets() {
+    return props()?.tickets?.[this.project] ?? [];
   }
 
   submitTicket(cx, worktree) {
@@ -822,6 +814,9 @@ export default class Berbr extends View {
 
   keyEvent(event, cx) {
     if (this.form === "note" && noteKey(this, event, cx)) return;
+    if (this.form === "new" && event.key === "enter" && event.modifiers?.platform) {
+      this.submitNew(cx); cx.stop_propagation(); return;
+    }
     if (["projects", "attach-task"].includes(this.form) && ["up", "down", "enter"].includes(event.key)) {
       if (event.key === "enter") this.choosePicker(cx);
       else if (!this.busy) this.pickerIndex = Math.max(0, Math.min(this.pickerMatches().length - 1,
@@ -1076,6 +1071,9 @@ export default class Berbr extends View {
     if (loose && !tree.task) {
       const buttons = [iconButton(t, `${id}/remove`, "archive", "Remove worktree", () => this.removeTree(tree, mr),
         {size:20, disabled:this.busy})];
+      for (const [kind, icon, label, shell] of [["shell", "terminal", "New terminal", true], ["agent", "plus", "New agent", false]])
+        buttons.push(iconButton(t, `${id}/${kind}`, icon, label, cx => this.openLoose(tree, shell, cx, {action:`${id}/${kind}`}),
+          {size:20, disabled:this.busy, spinning:this.busy && this.busyAction === `${id}/${kind}`}));
       if (ticket && !isClosedTicket(ticket) && ticket.target) buttons.push(iconButton(t, `${id}/resume`, "terminal", "Resume agent",
         cx => this.perform(cx, ["select", ticket.target], {close:true, action:`${id}/resume`}),
         {size:20, disabled:this.busy, spinning:this.busy && this.busyAction === `${id}/resume`}));

@@ -2,7 +2,7 @@ import { div } from "gpui-kit";
 import { h_flex, v_flex, TextView, EditorState, Editor } from "gpui-base";
 import { props, closeOverlay, readTextFile, writeTextFile, watchFolder, settings } from "herdr";
 import { exists } from "fs/promises";
-import { parseFrontmatter, transformWikilinks, wikiTargets, wikiPath, obsidianUri, treeMarks } from "./model.js";
+import { parseFrontmatter, transformWikilinks, wikiTargets, wikiPath, obsidianUri, treeMarks, newTaskArgs, targetHint } from "./model.js";
 import { icon, iconButton, button, chip, segmented, kbd, worktreeSwitch, keyboardControl } from "./ui.js";
 
 function reloadNote(view, cx, {discard = false, links = false} = {}) {
@@ -226,38 +226,95 @@ function field(t, label, control) {
     .child(div().w(84).flex_none().text_size(12).text_color(t.muted).child(label)).child(control);
 }
 
+const sources = [["smart", "Smart", "search"], ["jira", "Jira", "file-text"], ["branch", "Branch", "git-branch"], ["name", "Name", "square-pen"]];
+
+/** A field whose value opens a list of choices under it. */
+function choice(view, t, id, label, options, value, choose) {
+  const open = view.choosing === id;
+  const current = options.find(([key]) => key === value)?.[1] ?? value ?? "—";
+  return v_flex().flex_1().min_w(0).gap(4)
+    .child(div().text_size(12).text_color(t.muted).child(label))
+    .child(keyboardControl(h_flex().id(`${id}-choice`), cx => { view.choosing = open ? null : id; cx.notify(); }, view.busy)
+      .h(32).px(10).gap(8).items_center().rounded(6).border_1().border_color(open ? t.accent : t.border)
+      .cursor_pointer().hover(el => el.bg(t.hover))
+      .on_click((_event, cx) => { if (!view.busy) { view.choosing = open ? null : id; cx.notify(); } })
+      .child(div().flex_1().min_w(0).text_size(13).truncate().child(current))
+      .child(icon("chevron-down", 12)))
+    .when(open, el => el.child(v_flex().id(`${id}-options`).max_h(160).overflow_y_scrollbar().p(4).gap(2).rounded(6)
+      .border_1().border_color(t.border).bg(t.popover)
+      .children(options.map(([key, text]) => keyboardControl(h_flex().id(`${id}-${key}`), cx => choose(key, cx), view.busy)
+        .h(28).px(8).gap(8).items_center().rounded(4).cursor_pointer().hover(el => el.bg(t.hover))
+        .on_click((_event, cx) => choose(key, cx))
+        .child(div().flex_1().min_w(0).text_size(13).truncate().child(text))
+        .when(key === value, el => el.child(icon("check", 12).text_color(t.dim)))))));
+}
+
 function newForm(view, t) {
-  const body = v_flex().flex_1().min_h(0).gap(12).overflow_y_scrollbar()
-    .child(v_flex().gap(4).child(view.input("title"))
-      .child(div().text_size(11).text_color(t.dim).child("Leave empty and the agent will name it.")))
-    .child(field(t, "Agent", segmented(t, "agent", [["codex", "Codex"], ["claude", "Claude"], ["none", "None"]],
-      view.agent, (value, cx) => { view.agent = value; cx.notify(); }, view.busy)))
-    .child(field(t, "Jira", h_flex().gap(8).items_center().flex_1().min_w(0)
-      .child(segmented(t, "jira", [["none", "None"], ["new", "New ticket"], ["existing", "Existing"]],
-        view.ticketMode, (value, cx) => { view.ticketMode = value; cx.notify(); }, view.busy))
-      .when(view.ticketMode === "existing", el => el.child(div().flex_1().min_w(0).child(view.input("ticket"))))))
-    .child(field(t, "Worktree", h_flex().gap(8).items_center()
-      .child(worktreeSwitch(t, view.worktree, (value, cx) => {view.worktree = value; cx.notify();}, view.busy))
-      .child(div().text_size(12).text_color(t.foreground).child("Create a worktree"))))
-    .when(view.worktree, el => el.child(v_flex().gap(8)
+  const p = props() ?? {};
+  const projects = (p.projects?.length ? p.projects : [view.project].filter(Boolean)).map(name => [name, name]);
+  const tickets = view.newTaskTickets();
+  const text = view.values.title?.trim() ?? "";
+  const plan = newTaskArgs({source:view.source, text, ticket:view.ticket, agent:view.agent, worktree:view.worktree,
+    newTicket:view.newTicket, name:view.values.name, branch:view.values.branch});
+  const hint = plan.error ? null : targetHint(plan.target, tickets);
+  const setSource = (source, cx) => {
+    if (view.busy) return;
+    view.source = source; view.error = null;
+    if (source !== "jira") view.ticket = null;
+    view.inputs.title.focus(); cx.notify();
+  };
+  const tabs = h_flex().gap(16).items_center().border_b_1().border_color(t.border)
+    .children(sources.map(([id, label, glyph]) => keyboardControl(h_flex().id(`source-${id}`), cx => setSource(id, cx), view.busy)
+      .h(32).gap(6).items_center().cursor_pointer().border_b_2()
+      .border_color(view.source === id ? t.foreground : t.popover)
+      .text_color(view.source === id ? t.foreground : t.muted).hover(el => el.text_color(t.foreground))
+      .on_click((_event, cx) => setSource(id, cx))
+      .child(icon(glyph, 13)).child(div().text_size(13).child(label))));
+  const needle = text.toLowerCase();
+  const shown = view.source === "jira"
+    ? tickets.filter(ticket => !needle || ticket.key.toLowerCase().includes(needle) || ticket.title.toLowerCase().includes(needle))
+    : [];
+  const ticketList = view.source !== "jira" ? null : v_flex().id("new-tickets").max_h(150).overflow_y_scrollbar().gap(2)
+    .children(shown.map(ticket => keyboardControl(h_flex().id(`new-ticket-${ticket.key}`), cx => {
+      view.ticket = view.ticket === ticket.key ? null : ticket.key; view.error = null; cx.notify();
+    }, view.busy).h(28).px(8).gap(8).items_center().rounded(4).cursor_pointer().hover(el => el.bg(t.hover))
+      .when(view.ticket === ticket.key, el => el.bg(t.selected))
+      .on_click((_event, cx) => { if (!view.busy) { view.ticket = view.ticket === ticket.key ? null : ticket.key; view.error = null; cx.notify(); } })
+      .child(div().flex_none().text_size(12).text_color(t.muted).child(ticket.key))
+      .child(div().flex_1().min_w(0).text_size(13).truncate().child(ticket.title))))
+    .when(!shown.length, el => el.child(div().px(8).text_size(12).text_color(t.dim)
+      .child(tickets.length ? "No matching tickets; a typed key works too" : "No open tickets without a task; type a key")));
+  const toggle = (id, value, label, flip) => h_flex().gap(8).items_center()
+    .child(worktreeSwitch(t, value, (next, cx) => { flip(next); view.error = null; cx.notify(); }, view.busy, id))
+    .child(div().text_size(12).text_color(t.foreground).child(label));
+  const body = v_flex().flex_1().min_h(0).gap(14).overflow_y_scrollbar()
+    .child(choice(view, t, "project", "Project", projects, view.project, (name, cx) => view.chooseNewProject(name, cx)))
+    .child(v_flex().gap(8).child(tabs).child(view.input("title"))
+      .when(Boolean(hint), el => el.child(div().text_size(11).text_color(t.dim).whitespace_normal().child(hint)))
+      .when(Boolean(ticketList), el => el.child(ticketList)))
+    .child(choice(view, t, "agent", "Agent", [["codex", "Codex"], ["claude", "Claude"], ["none", "None, a shell"]], view.agent,
+      (agent, cx) => { view.agent = agent; view.choosing = null; cx.notify(); }))
+    .child(v_flex().gap(8)
       .child(keyboardControl(h_flex().id("advanced"), cx => {view.advanced = !view.advanced; cx.notify();}, view.busy).h(28).gap(6).items_center().cursor_pointer().text_color(t.muted)
         .hover(el => el.text_color(t.foreground))
         .on_click((_event, cx) => {if (!view.busy) {view.advanced = !view.advanced; cx.notify();}})
-        .child(icon(view.advanced ? "chevron-down" : "chevron-right", 12))
-        .child(div().text_size(12).child("Advanced")))
+        .child(div().text_size(13).child("Advanced"))
+        .child(icon(view.advanced ? "chevron-down" : "chevron-right", 12)))
       .when(view.advanced, el => el.child(v_flex().gap(8)
-        .child(field(t, "Worktree name", div().flex_1().min_w(0).child(view.input("name"))))
-        .child(field(t, "Branch", div().flex_1().min_w(0).child(view.input("branch"))))))));
+        .child(toggle("new-worktree", view.worktree, "Create a worktree (off: the agent works in the main checkout)", next => { view.worktree = next; }))
+        .when(view.worktree, el => el
+          .child(field(t, "Worktree name", div().flex_1().min_w(0).child(view.input("name"))))
+          .when(view.source !== "branch", el => el.child(field(t, "Branch", div().flex_1().min_w(0).child(view.input("branch"))))))
+        .when(view.source !== "jira", el => el.child(toggle("new-jira-ticket", view.newTicket, "Create a Jira ticket for it", next => { view.newTicket = next; }))))));
   return v_flex().size_full().min_h(0).p(24).gap(16).bg(t.popover).text_color(t.foreground)
-    .child(h_flex().items_center().justify_between()
-      .child(div().text_size(20).font_semibold().child("New task"))
-      .child(div().text_size(12).text_color(t.dim).child(`in ${view.project ?? "project"}`)))
+    .child(div().text_size(20).font_semibold().child("New task"))
     .child(body)
-    .when(Boolean(view.error), el => el.child(errorLine(view, t)))
+    .when(Boolean(view.error), el => el.child(errorLine(view, t).whitespace_normal()))
     .child(h_flex().pt(12).gap(8).items_center().border_t_1().border_color(t.border)
-      .child(kbd(t, "enter create · esc cancel")).child(div().flex_1())
+      .child(toggle("create-more", view.createMore, "Create more", next => { view.createMore = next; }))
+      .child(div().flex_1())
       .child(cancel(view, t))
-      .child(button(t, "create", "Create task", cx => view.submitNew(cx), "primary", view.busy, view.busyAction === "start")));
+      .child(button(t, "create", "Create task  ⌘↵", cx => view.submitNew(cx), "primary", view.busy, view.busyAction === "start")));
 }
 
 function ticketForm(view, t, p) {
@@ -304,6 +361,10 @@ function doneForm(view, t, p) {
     view.externalLink(t, "close-proof", plan.proof.latest).text_size(13).text_color(t.dim)
       .child(div().min_w(0).truncate().child(plan.proof.latest.label))] : [], t.dim);
   const blocked = plan.blockers.length > 0;
+  // the person may still close it, once told what is lost
+  if (blocked && !view.planLoading) body.child(div().flex_none().text_size(12).text_color(t.blocked).whitespace_normal()
+    .child("Close anyway skips these checks: the worktrees are deleted with their uncommitted files, "
+      + "and their branches with commits found nowhere else. That is lost for good."));
   return v_flex().size_full().min_h(0).p(24).gap(16).bg(t.popover).text_color(t.foreground)
     .child(div().text_size(15).font_semibold().whitespace_normal().child(`Close “${p.label ?? p.task ?? "task"}”?`))
     .child(body.when(Boolean(view.error), el => el.child(errorLine(view, t).whitespace_normal())))
@@ -311,6 +372,9 @@ function doneForm(view, t, p) {
       .child(div().flex_1().min_w(0).text_size(11).text_color(t.dim).whitespace_normal()
         .child("Berbr re-checks Jira and GitLab before closing."))
       .child(cancel(view, t))
+      .when(blocked, el => el.child(button(t, "done-force", "Close anyway",
+        cx => view.perform(cx, ["done", p.task, "--yes", "--force"], {close:true, action:"done-force"}), "ghost",
+        view.busy || view.planLoading || Boolean(view.planError), view.busyAction === "done-force")))
       .child(button(t, "done", "Close task",
         cx => view.perform(cx, ["done", p.task, "--yes"], {close:true}), "primary", view.busy || view.planLoading || view.planError || blocked, view.busyAction === "done")
         .when(blocked, el => el.tooltip("Resolve the blockers first"))));

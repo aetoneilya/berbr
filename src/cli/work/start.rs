@@ -43,11 +43,12 @@ fn start_with(
         Some(target) => target,
         None if args.unnamed => String::new(),
         None if args.description.is_some() => {
-            if args.no_agent {
-                return Err("a task name is required without an agent".into());
-            }
+            // a headless call of its own: works without an agent for the task too
             ui.say("generating a task name from the description…".into());
-            let names = super::naming::from_description(args.description.as_deref().unwrap())?;
+            let names = super::naming::from_description(
+                args.description.as_deref().unwrap(),
+                &config.workflow.naming_model,
+            )?;
             if args.name.is_none() {
                 worktree::validate_name(&names.worktree).map_err(err)?;
                 args.name = Some(names.worktree);

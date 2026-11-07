@@ -810,7 +810,8 @@ test("Not in a task gives a second-line reason; Make task prefills both loose an
     state.props = props;
     const dialog = new Berbr();
     dialog.init({}, cx);
-    assert.equal(dialog.ticketMode, "existing");
+    assert.equal(dialog.source, "jira");
+    assert.equal(dialog.ticket, target);
     state.props = {};
     if (target === "DEMO-61") {
       const loose = byId(rendered, `loose-${row.id}`);
@@ -1807,8 +1808,8 @@ test("Todo renders idea rings and assigned ticket icons together; hover Make tas
   assert.equal(props.form, "new");
   assert.deepEqual(props.prefill, {title:"Demo assigned", ticket:"DEMO-102"});
   const dialog = setup({props}).view;
-  assert.equal(dialog.ticketMode, "existing");
-  assert.equal(dialog.inputs.ticket.value(), "DEMO-102");
+  assert.equal(dialog.source, "jira");
+  assert.equal(dialog.ticket, "DEMO-102");
   assert.equal(dialog.inputs.title.value(), "Demo assigned");
 });
 
@@ -2536,129 +2537,6 @@ test("new agent menu dispatch adds an agent in the existing worktree and closes 
   assert.ok(state.calls.some(call => call[0] === "closeOverlay" && call[1] === "menu"));
 });
 
-test("a loose worktree creates unnamed main and worktree spaces with the configured plain agent", async () => {
-  const row = {kind:"tree", tree:"loose", cwd:"/home/dev/loose", repo:"/home/dev/repo", task:null};
-  for (const agent of ["codex", "claude", "none"]) {
-    const {view, cx, jobs} = setup({props:{form:"menu", row, agent, overlay:"menu"}});
-    view.chooseMenu(cx, "new-agent");
-    assert.equal(view.busy, true);
-    view.chooseMenu(cx, "new-agent");
-    assert.equal(jobs.length, 1, "a second click cannot launch another agent while busy");
-    await jobs.shift()(cx);
-    assert.deepEqual(state.calls, [
-      ["space.new", {folder:row.repo}],
-      ["space.new", {folder:row.cwd, ...(agent === "none" ? {} : {argv:[agent]})}],
-      ["closeOverlay", "menu"]]);
-    assert.deepEqual(state.execs, []);
-    assert.equal(view.busy, false);
-    assert.equal(view.error, null);
-  }
-});
-
-test("a loose worktree reuses spaces by live terminal cwd rather than their original folder", async () => {
-  const row = {kind:"tree", tree:"loose", cwd:"/home/dev/loose", repo:"/home/dev/repo"};
-  const liveSpaces = [
-    {id:"main", folder:"/old/main", tabs:[{id:"main-tab"}]},
-    {id:"worktree", folder:"/old/worktree", tabs:[{id:"tree-tab"}]}];
-  for (const agent of ["claude", "none"]) {
-    const {view, cx, jobs} = setup({props:{form:"menu", row, agent, overlay:"menu"}, liveSpaces});
-    state.panes = [
-      {terminal:"main-shell", tab:"main-tab", cwd:row.repo},
-      {terminal:"tree-shell", tab:"tree-tab", cwd:row.cwd + "/src"}];
-    state.execResult = {code:0, stdout:row.repo + "\n", stderr:""};
-    view.chooseMenu(cx, "new-agent");
-    await jobs.shift()(cx);
-    assert.deepEqual(state.execs, [["git", ["-C", row.repo, "rev-parse", "--show-toplevel"]]]);
-    assert.deepEqual(state.calls, [
-      ["tab.new", {space:"worktree", folder:row.cwd, ...(agent === "none" ? {} : {argv:[agent]})}],
-      ["closeOverlay", "menu"]]);
-  }
-});
-
-test("a worktree inside the repo directory is not mistaken for the main checkout space", async () => {
-  for (const directory of [".herdr", ".claude"]) {
-    const row = {kind:"tree", tree:"loose", repo:"/home/dev/repo", cwd:`/home/dev/repo/${directory}/worktrees/loose`};
-    const {view, cx, jobs} = setup({props:{form:"menu", row, agent:"codex", overlay:"menu"},
-      liveSpaces:[{id:"tree", folder:row.repo, tabs:[{id:"tree-tab"}]}]});
-    const path = row.cwd + "/src";
-    state.panes = [{terminal:"tree-shell", tab:"tree-tab", cwd:path}];
-    state.execResult = {code:0, stdout:row.cwd + "\n", stderr:""};
-    view.chooseMenu(cx, "new-agent");
-    await jobs.shift()(cx);
-    assert.deepEqual(state.execs, [["git", ["-C", path, "rev-parse", "--show-toplevel"]]]);
-    assert.deepEqual(state.calls, [
-      ["space.new", {folder:row.repo}],
-      ["tab.new", {space:"tree", folder:row.cwd, argv:["codex"]}],
-      ["closeOverlay", "menu"]]);
-  }
-});
-
-test("loose worktree space placement falls back to folder and skips remote and sibling paths", async () => {
-  const row = {kind:"tree", tree:"loose", repo:"/home/dev/repo", cwd:"/home/dev/loose"};
-  const {view, cx, jobs} = setup({props:{form:"menu", row, overlay:"menu"}, liveSpaces:[
-    {id:"remote", machine:"server", folder:row.repo},
-    {id:"sibling", folder:row.repo + "-other"},
-    {id:"tree-sibling", folder:row.cwd + "-other"},
-    {id:"main", folder:row.repo + "/src", tabs:[{id:"main-tab"}]},
-    {id:"tree", folder:row.cwd}]});
-  state.panes = [{terminal:null, mod:"files", tab:"main-tab", cwd:"/elsewhere"}];
-  state.execResult = {code:0, stdout:row.repo + "\n", stderr:""};
-  view.chooseMenu(cx, "new-agent");
-  await jobs.shift()(cx);
-  assert.deepEqual(state.execs, [["git", ["-C", row.repo + "/src", "rev-parse", "--show-toplevel"]]]);
-  assert.deepEqual(state.calls, [
-    ["tab.new", {space:"tree", folder:row.cwd, argv:["codex"]}], ["closeOverlay", "menu"]]);
-});
-
-test("only a space's first terminal places it in a checkout", async () => {
-  const row = {kind:"tree", tree:"loose", repo:"/home/dev/repo", cwd:"/home/dev/loose"};
-  const {view, cx, jobs} = setup({props:{form:"menu", row, overlay:"menu"},
-    liveSpaces:[{id:"elsewhere", folder:row.cwd, tabs:[{id:"first"}, {id:"second"}]}]});
-  state.panes = [
-    {terminal:"first", tab:"first", cwd:"/elsewhere"},
-    {terminal:"second", tab:"second", cwd:row.cwd}];
-  view.chooseMenu(cx, "new-agent");
-  await jobs.shift()(cx);
-  assert.deepEqual(state.execs, []);
-  assert.deepEqual(state.calls, [
-    ["space.new", {folder:row.repo}], ["space.new", {folder:row.cwd, argv:["codex"]}],
-    ["closeOverlay", "menu"]]);
-});
-
-test("an unsuccessful git probe does not identify a main checkout space", async () => {
-  const row = {kind:"tree", tree:"loose", repo:"/home/dev/repo", cwd:"/home/dev/loose"};
-  const {view, cx, jobs} = setup({props:{form:"menu", row, overlay:"menu"},
-    liveSpaces:[{id:"gone", folder:row.repo + "/gone"}]});
-  state.execResult = {code:128, stdout:"", stderr:"cannot change directory"};
-  view.chooseMenu(cx, "new-agent");
-  await jobs.shift()(cx);
-  assert.deepEqual(state.calls, [
-    ["space.new", {folder:row.repo}], ["space.new", {folder:row.cwd, argv:["codex"]}],
-    ["closeOverlay", "menu"]]);
-});
-
-test("loose worktree launch failures stay visible and clear busy without closing the menu", async () => {
-  const row = {kind:"tree", tree:"loose", repo:"/home/dev/repo", cwd:"/home/dev/loose"};
-  for (const failure of ["exec", "space.new", "tab.new"]) {
-    const {view, cx, jobs} = setup({props:{form:"menu", row, overlay:"menu"}, liveSpaces:[
-      {id:"main", folder:row.repo}, {id:"tree", folder:row.cwd}]});
-    let notifications = 0;
-    cx.notify = () => notifications++;
-    state.execHandler = async () => {
-      if (failure === "exec") throw new Error("Could not run git");
-      return {code:0, stdout:failure === "space.new" ? row.cwd : row.repo, stderr:""};
-    };
-    state.runHandler = action => { if (action === failure) throw new Error("Could not open checkout"); };
-    view.chooseMenu(cx, "new-agent");
-    await jobs.shift()(cx);
-    assert.equal(view.error, failure === "exec" ? "Could not run git" : "Could not open checkout");
-    assert.equal(view.busy, false);
-    assert.equal(notifications, 2);
-    assert.ok(!state.calls.some(call => call[0] === "closeOverlay"));
-    if (failure === "exec") assert.deepEqual(state.calls, []);
-  }
-});
-
 test("active worktree menu dispatch opens the existing remove dialog without running done", () => {
   const mr = {kind:"mr", label:"!1 Demo", state:"opened"};
   const row = {id:"tree", kind:"tree", tree:"demo-tree", task:"demo", children:[mr]};
@@ -2830,10 +2708,10 @@ test("V07: unblocking during reply verification clears focus immediately and in 
   assert.equal(state.overlays.at(-1).props.form, "new");
 });
 
-test("logic 22: Existing Jira requires a valid nonempty key before creating anything", () => {
+test("logic 22: the Jira tab requires a picked ticket or a valid key before creating anything", () => {
   for (const ticket of ["", "  ", "DEMO", "demo-1", "DEMO-1 extra"]) {
     const {view, cx, jobs} = setup({props:{form:"new", project:"demo"}});
-    view.values.title = "Named task"; view.ticketMode = "existing"; view.values.ticket = ticket;
+    view.source = "jira"; view.values.title = ticket;
     view.submitNew(cx);
     assert.match(view.error, /valid Jira ticket key/);
     assert.equal(jobs.length, 0);
@@ -2904,11 +2782,12 @@ test("V04: confirm and segmented controls are tab stops with Enter/Space activat
   }
   const {view, cx, key} = setup({props:{form:"new", overlay:"new"}});
   let root = view.render(cx);
-  for (const [id, expected] of [["agent-claude", "claude"], ["jira-existing", "existing"]]) {
+  for (const [id, read, expected] of [["source-jira", () => view.source, "jira"],
+    ["agent-choice", () => view.choosing, "agent"], ["agent-claude", () => view.agent, "claude"]]) {
     const control = byId(root, id);
     assert.equal(control.attributes.tab_index[0], 0);
     control.attributes.on_key_down[0]({key:"space"}, cx);
-    assert.equal(id.startsWith("agent") ? view.agent : view.ticketMode, expected);
+    assert.equal(read(), expected);
     root = view.render(cx);
   }
   byId(root, "advanced").attributes.on_key_down[0]({key:"enter"}, cx);
@@ -3106,4 +2985,32 @@ test("picker popups give their result lists a height, since popups size to conte
   assert.equal(view.inputs.search.placeholder, "Filter projects");
   const attach = setup({props:{form:"attach-task", ticket:"DEMO-1", tasks:[{id:"a", task:"a", title:"A"}], overlay:"attach"}});
   assert.equal(byId(attach.view.render(attach.cx), "attach-results").attributes.h[0], pickerHeight(1));
+});
+
+test("New task: the project picker sets --project, Create more keeps the form and clears it, cmd-enter creates", async () => {
+  const tickets = {demo:[{key:"DEMO-1", title:"Login"}], other:[]};
+  const {view, cx, jobs} = setup({props:{form:"new", project:"demo", overlay:"new", projects:["demo", "other"], tickets}});
+  let root = view.render(cx);
+  click(byId(root, "source-jira"), cx);
+  root = view.render(cx);
+  click(byId(root, "new-ticket-DEMO-1"), cx);
+  assert.equal(view.ticket, "DEMO-1");
+  click(byId(view.render(cx), "project-choice"), cx);
+  click(byId(view.render(cx), "project-other"), cx);
+  assert.equal(view.project, "other");
+  assert.equal(view.ticket, null, "a ticket of the old project is dropped");
+  assert.ok(!byId(view.render(cx), "new-ticket-DEMO-1"));
+
+  const calls = []; view.cli = async args => { calls.push([view.project, ...args]); return "Started"; };
+  view.source = "smart"; view.values.title = "First"; view.inputs.title.set_value("First");
+  view.createMore = true;
+  view.keyEvent({key:"enter", modifiers:{platform:true}}, cx);
+  await jobs.shift()(cx);
+  assert.deepEqual(calls, [["other", "start", "First", "--bg", "--agent", view.agent]]);
+  assert.equal(view.values.title, "");
+  assert.ok(!state.calls.some(call => call[0] === "closeOverlay"), "Create more keeps the form open");
+
+  view.createMore = false; view.values.title = "Second";
+  view.submitNew(cx); await jobs.shift()(cx);
+  assert.deepEqual(state.calls.at(-1), ["closeOverlay", "new"]);
 });

@@ -248,6 +248,22 @@ pub fn log_oneline(path: &Path, range: &str, max: usize) -> Result<String> {
     git_output(path, &["log", "--oneline", &format!("-{max}"), range])
 }
 
+/// Whether the branch exists locally or on origin.
+pub fn branch_exists(path: &Path, branch: &str) -> bool {
+    [
+        format!("refs/heads/{branch}"),
+        format!("refs/remotes/origin/{branch}"),
+    ]
+    .iter()
+    .any(|r| git_output(path, &["rev-parse", "--verify", "--quiet", r]).is_ok())
+}
+
+/// Renames the branch checked out in the worktree `path`; refuses a name that
+/// is taken.
+pub fn rename_branch(path: &Path, from: &str, to: &str) -> Result<()> {
+    git_output(path, &["branch", "-m", from, to]).map(|_| ())
+}
+
 /// Removes a linked worktree without waiting for its files to be deleted: a
 /// large checkout takes git a minute. The folder is renamed into
 /// `<common dir>/berbr-trash` and deleted there by a detached `rm -rf`; git
@@ -964,6 +980,19 @@ mod removal_tests {
         std::fs::create_dir_all(tree.join("build/out")).unwrap();
         std::fs::write(tree.join("build/out/artifact"), "x").unwrap();
         (root, tree)
+    }
+
+    #[test]
+    fn a_worktrees_checked_out_branch_is_renamed_in_place() {
+        let (root, tree) = repo_with_tree("demo-0");
+        assert!(branch_exists(&tree, "demo-0"));
+        assert!(!branch_exists(&tree, "fix-the-thing"));
+        rename_branch(&tree, "demo-0", "fix-the-thing").unwrap();
+        assert_eq!(current_branch(&tree).unwrap(), "fix-the-thing");
+        assert!(!branch_exists(&root.join("main"), "demo-0"));
+        // a taken name is refused, not overwritten
+        assert!(rename_branch(&tree, "fix-the-thing", "main").is_err());
+        assert_eq!(current_branch(&tree).unwrap(), "fix-the-thing");
     }
 
     #[test]

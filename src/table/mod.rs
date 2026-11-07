@@ -441,8 +441,13 @@ impl Table {
             tree.agents = matching::agents_in(&tree.wt.path, agents, &self.sessions);
         }
         for row in &mut self.tasks {
-            row.agents =
-                matching::agents_outside(row.space.as_deref(), agents, &self.trees, &self.sessions);
+            row.agents = matching::agents_outside(
+                &row.task.name,
+                row.space.as_deref(),
+                agents,
+                &self.trees,
+                &self.sessions,
+            );
         }
     }
 

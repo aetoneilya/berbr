@@ -107,6 +107,7 @@ fn act(command: &str, args: Value) -> Result<Value> {
             | "tab.rename"
             | "space.close"
             | "tab.close"
+            | "pane.close"
     ) {
         invalidate();
     }
@@ -163,10 +164,35 @@ fn agents() -> Result<Vec<Value>> {
                 "name": detail["labels"]["berbr.name"].as_str().or(detail["name"].as_str()),
                 "agent_status": term["status"], "cwd": detail["foreground"]["cwd"].as_str().or(detail["cwd"].as_str()),
                 "pane_id": address, "tab_id": tab["id"], "workspace_id": space["id"],
-                "agent": term["app"], "agent_session": null
+                "agent": term["app"], "agent_session": null,
+                "berbr_task": detail["labels"]["berbr.task"]
             }))
         }).into_iter().map(|result| result.unwrap_or_else(|| Err(HerdrError::NonZeroExit("hc detail read panicked".into())))).collect()
     })
+}
+
+/// Where each space is now, as the app's sidebar sees it: the live folder of
+/// its first terminal, else the folder it was made in; with that terminal.
+pub(super) fn space_places() -> Result<Vec<(String, String, Option<String>)>> {
+    Ok(spaces()?
+        .iter()
+        .map(|space| {
+            let live = tabs(space).flat_map(terminals).find_map(|term| {
+                let address = text(term, "terminal");
+                let detail = read("hc", &["get", address, "--json"]).ok()?;
+                detail["foreground"]["cwd"]
+                    .as_str()
+                    .or(detail["cwd"].as_str())
+                    .filter(|cwd| !cwd.is_empty())
+                    .map(|cwd| (cwd.to_string(), address.to_string()))
+            });
+            let (place, terminal) = match live {
+                Some((cwd, address)) => (cwd, Some(address)),
+                None => (text(space, "folder").to_string(), None),
+            };
+            (text(space, "id").to_string(), place, terminal)
+        })
+        .collect())
 }
 
 pub(super) fn focus_known(space: &str, tab: &str, terminal: &str) -> Result<()> {
@@ -301,6 +327,16 @@ pub(super) fn output(args: &[&str]) -> Result<Vec<u8>> {
             invalidate();
             sent?;
             json!({})
+        }
+        ["pane", "label", address, label] => {
+            let labelled = output_of("hc", &["label", address, label]);
+            invalidate();
+            labelled?;
+            json!({})
+        }
+        ["pane", "close", address] => {
+            let pane = pane_of(address)?;
+            act("pane.close", json!({"pane": pane}))?
         }
         ["agent", "rename", address, name] => {
             let renamed = output_of("hc", &["label", address, &format!("berbr.name={name}")]);

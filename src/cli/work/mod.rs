@@ -12,7 +12,7 @@ mod task;
 
 pub(crate) use common::{Ui, is_ticket_key};
 pub(super) use done::{cli_attach, cli_done};
-pub(super) use launch::cli_prepare;
+pub(super) use launch::{cli_open, cli_prepare};
 pub(super) use review::cli_review;
 pub(crate) use review::review;
 pub(super) use select::cli_select;

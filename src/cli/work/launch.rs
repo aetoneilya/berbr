@@ -151,7 +151,7 @@ pub(super) fn open_work(
     }
 
     let cwd = if dir.exists() { &dir } else { main };
-    let (tab, pane) = open_tab(space, cwd, name)?;
+    let (tab, pane) = open_tab(space, cwd, name, ui)?;
     let agent = agent.then(|| free_agent_name(name));
     let spec = PrepareSpec {
         directory,
@@ -214,7 +214,7 @@ pub(super) fn open_added_work(
 ) -> Result<(), String> {
     let brief = write_brief(dir, &brief)?;
     let prompt = agent_prompt(Some(&task.note.path), &brief, open.description.as_deref());
-    let (tab, pane) = open_tab(Space::Task(task), dir, name)?;
+    let (tab, pane) = open_tab(Space::Task(task), dir, name, ui)?;
     let agent = free_agent_name(name);
     let args: Vec<&str> = prompt.as_deref().into_iter().collect();
     herdr::start_agent_with_label(open.kind, &agent, &pane, name, &args).map_err(err)?;
@@ -311,7 +311,12 @@ pub(super) fn open_agent(
         ));
         return Ok(());
     }
-    let (tab, pane) = open_tab(space, cwd, label)?;
+    if let Space::Task(task) = space
+        && open_in_project_space(kind, task, cwd, label, agent_args, focus, ui)?.is_some()
+    {
+        return Ok(());
+    }
+    let (tab, pane) = open_tab(space, cwd, label, ui)?;
     let agent = free_agent_name(label);
     herdr::start_agent_with_label(kind, &agent, &pane, label, agent_args).map_err(err)?;
     if focus {
@@ -323,9 +328,201 @@ pub(super) fn open_agent(
     Ok(())
 }
 
+/// Herdr App lists a worktree's space under the space of its repo's main
+/// checkout, so the project gets one before work opens in a space of its
+/// own: a shell in the main checkout, named `project`. Never switches the
+/// checkout's branch (it may hold someone's changes), only says when it is
+/// not the default one.
+/// Returns that space and its first terminal; none outside Herdr App.
+pub(super) fn ensure_project_space(
+    main: &Path,
+    project: &str,
+    ui: &mut dyn Ui,
+) -> Result<Option<herdr::SpacePlace>, String> {
+    if !herdr::nests_worktree_spaces() {
+        return Ok(None);
+    }
+    let places = herdr::space_places().map_err(err)?;
+    if let Some(found) = project_space(main, &places, |dir| worktree::worktree_root(dir).ok()) {
+        return Ok(Some(found.clone()));
+    }
+    let (_, terminal) = herdr::create_workspace(project, main).map_err(err)?;
+    ui.say(format!("space \"{project}\" → {}", main.display()));
+    let default = worktree::Refs::read(main)
+        .ok()
+        .and_then(|refs| refs.default_branch(None))
+        .map(|b| b.trim_start_matches("origin/").to_string());
+    if let (Some(default), Ok(current)) = (default, worktree::current_branch(main))
+        && default != current
+    {
+        ui.say(format!(
+            "  ! the main checkout is on {current}, not {default}"
+        ));
+    }
+    let space = herdr::space_places()
+        .map_err(err)?
+        .into_iter()
+        .find(|p| p.terminal.as_deref() == Some(terminal.as_str()));
+    Ok(space)
+}
+
+/// The first space (by where it is now) in the main checkout `main` itself,
+/// not in one of its linked worktrees. `root_of` gives the git checkout a
+/// folder is in.
+fn project_space<'a>(
+    main: &Path,
+    places: &'a [herdr::SpacePlace],
+    root_of: impl Fn(&Path) -> Option<PathBuf>,
+) -> Option<&'a herdr::SpacePlace> {
+    let main = canonical(main);
+    places.iter().find(|p| {
+        let place = canonical(&p.place);
+        place.starts_with(&main) && root_of(&place).is_some_and(|root| canonical(&root) == main)
+    })
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Herdr App: a task's agent in the main checkout (no worktree) gets no space
+/// of its own: it is a pane beside the project space's terminal, labelled with
+/// the task so the board still finds it. None when that does not apply.
+fn open_in_project_space(
+    kind: AgentKind,
+    task: &Task,
+    cwd: &Path,
+    label: &str,
+    agent_args: &[&str],
+    focus: bool,
+    ui: &mut dyn Ui,
+) -> Result<Option<()>, String> {
+    if !herdr::nests_worktree_spaces() {
+        return Ok(None);
+    }
+    let Ok(main) = worktree::main_checkout(cwd) else {
+        return Ok(None);
+    };
+    if worktree::worktree_root(cwd).map(|r| canonical(&r)).ok() != Some(canonical(&main)) {
+        return Ok(None);
+    }
+    let project = project_label(task, &main);
+    let Some(space) = ensure_project_space(&main, &project, ui)? else {
+        return Ok(None);
+    };
+    let Some(terminal) = &space.terminal else {
+        return Ok(None);
+    };
+    let pane = herdr::split_pane(terminal, "right", cwd).map_err(err)?;
+    herdr::label_task(&pane, &task.name).map_err(err)?;
+    let agent = free_agent_name(label);
+    herdr::start_agent_with_label(kind, &agent, &pane, label, agent_args).map_err(err)?;
+    if focus {
+        let _ = herdr::focus_pane(&space.space, &pane);
+    }
+    ui.say(format!(
+        "agent {agent} → a pane in space \"{project}\" ({})",
+        cwd.display()
+    ));
+    Ok(Some(()))
+}
+
+/// The project a task's space is filed under: the note's `project`, else the
+/// main checkout's folder name.
+fn project_label(task: &Task, main: &Path) -> String {
+    task.note
+        .string("project")
+        .filter(|p| !p.trim().is_empty())
+        .or_else(|| main.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "project".into())
+}
+
+/// `berbr open <worktree> [--shell]`: work in a worktree that belongs to no
+/// task (the mod's Cleanup rows). It gets a space named after its branch,
+/// filed under the project's space; each call adds a tab with a new agent,
+/// or a shell, there.
+pub(in crate::cli) fn cli_open(
+    config: &crate::config::Config,
+    path: &Path,
+    shell: bool,
+) -> Result<(), String> {
+    let ui: &mut dyn Ui = &mut super::common::Terminal;
+    let path = path
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let root = worktree::worktree_root(&path).map_err(err)?;
+    if root.canonicalize().ok().as_deref() != Some(path.as_path()) {
+        return Err(format!(
+            "{} is not the top of a git worktree",
+            path.display()
+        ));
+    }
+    let main = worktree::main_checkout(&path).map_err(err)?;
+    let label = worktree::current_branch(&path).unwrap_or_else(|_| {
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "worktree".into())
+    });
+    let kind = config
+        .workflow
+        .agent_override
+        .unwrap_or(config.workflow.agent);
+    if !herdr::available() {
+        if !shell {
+            ui.say(format!(
+                "not in herdr — run it yourself: cd {} && {}",
+                shell_quote(&path.to_string_lossy()),
+                kind.named_shell_command(&label, &[])
+            ));
+        }
+        return Ok(());
+    }
+    let _operation = herdr::operation();
+    if let Err(e) = ensure_project_space(&main, &config.name, ui) {
+        ui.say(format!("  ! no project space: {e}"));
+    }
+    let spaces = herdr::list_workspaces().map_err(err)?;
+    let places = herdr::space_places().unwrap_or_default();
+    let existing = spaces.iter().find(|s| {
+        same_name(&s.label, &label)
+            || places
+                .iter()
+                .any(|p| p.space == s.workspace_id && canonical(&p.place) == path)
+    });
+    let tab_label = if shell {
+        "shell".to_string()
+    } else {
+        kind.to_string()
+    };
+    let (tab, pane) = match existing {
+        Some(space) => herdr::create_tab(&space.workspace_id, &path, &tab_label).map_err(err)?,
+        None => {
+            let (tab, pane) = herdr::create_workspace(&label, &path).map_err(err)?;
+            herdr::rename_tab(&tab, &tab_label).map_err(err)?;
+            (tab, pane)
+        }
+    };
+    if !shell {
+        let agent = free_agent_name(&label);
+        herdr::start_agent_with_label(kind, &agent, &pane, &label, &[]).map_err(err)?;
+    }
+    let _ = herdr::focus_tab(&tab);
+    ui.say(format!(
+        "{tab_label} → space \"{label}\" ({})",
+        path.display()
+    ));
+    Ok(())
+}
+
 /// A new tab `label` in the herdr workspace `space`, created when missing;
-/// returns the tab and its pane.
-fn open_tab(space: Space<'_>, cwd: &Path, label: &str) -> Result<(String, String), String> {
+/// returns the tab and its pane. A new task space first gets its project's
+/// space (see `ensure_project_space`).
+fn open_tab(
+    space: Space<'_>,
+    cwd: &Path,
+    label: &str,
+    ui: &mut dyn Ui,
+) -> Result<(String, String), String> {
     let spaces = herdr::list_workspaces().map_err(err)?;
     let existing = match space {
         Space::Task(task) => task_space(task, &spaces)?,
@@ -344,6 +541,12 @@ fn open_tab(space: Space<'_>, cwd: &Path, label: &str) -> Result<(String, String
     match existing {
         Some(ws) => herdr::create_tab(&ws.workspace_id, cwd, label).map_err(err),
         None => {
+            if let Space::Task(task) = space
+                && let Ok(main) = worktree::main_checkout(cwd)
+                && let Err(e) = ensure_project_space(&main, &project_label(task, &main), ui)
+            {
+                ui.say(format!("  ! no project space: {e}"));
+            }
             let (tab, pane) = herdr::create_workspace(&space.to_string(), cwd).map_err(err)?;
             herdr::rename_tab(&tab, label).map_err(err)?;
             Ok((tab, pane))
@@ -416,5 +619,49 @@ pub(super) fn close_herdr_views_outside(
         if let Err(err) = herdr::close_tab(&tab) {
             say(format!("can't close tab {tab}: {err}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::project_space;
+    use crate::client::herdr::SpacePlace;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn project_space_is_a_space_in_the_main_checkout_not_in_its_worktrees() {
+        let main = Path::new("/nonexistent/repo");
+        let tree = main.join(".herdr/worktrees/demo-1");
+        // A worktree lives inside the main checkout's folder: git, not the path, tells them apart.
+        let root_of = |dir: &Path| {
+            Some(if dir.starts_with(&tree) {
+                tree.clone()
+            } else {
+                main.to_path_buf()
+            })
+        };
+        let place = |space: &str, p: &Path| SpacePlace {
+            space: space.into(),
+            place: p.to_path_buf(),
+            terminal: Some(format!("t-{space}")),
+        };
+        let found =
+            |places: &[SpacePlace]| project_space(main, places, root_of).map(|p| p.space.clone());
+        assert_eq!(found(&[]), None);
+        assert_eq!(
+            found(&[place("a", &tree), place("b", &tree.join("src"))]),
+            None
+        );
+        assert_eq!(found(&[place("a", Path::new("/nonexistent/other"))]), None);
+        assert_eq!(
+            found(&[
+                place("a", &tree),
+                place("b", &main.join("src")),
+                place("c", main)
+            ]),
+            Some("b".into())
+        );
+        let not_a_repo = |_: &Path| None::<PathBuf>;
+        assert!(project_space(main, &[place("a", main)], not_a_repo).is_none());
     }
 }

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { taskSpace, taskSpaceMatches, walk, groupSections, taskSignals, PanelModel, visibleRows, parseMrFlags,
   normalizeTicketState, isClosedTicket, cleanObsidian, parseFrontmatter, obsidianUri, ticketTitle, taskDetail, looseReason, worktreeNameCollision, cleanCliText, parseTreeMarks, looseWhy,
-  agentActivity, formatElapsed, classifyBlocked, closePlan, rowMenu } from "../model.js";
+  agentActivity, formatElapsed, classifyBlocked, closePlan, rowMenu, smartTarget, newTaskArgs, freeTickets } from "../model.js";
 
 const snapshot = JSON.parse(await readFile(new URL("../fixtures/sample-snapshot.json", import.meta.url)));
 const section = (sections, id) => sections.find(item => item.id === id);
@@ -24,11 +24,12 @@ test("active, merged and loose worktrees all offer removal with a danger separat
   assert.deepEqual(rowMenu(tree).map(item => item.id), ["resume", "new-agent", "review", "mr", "copy-path", "copy-branch", "remove-tree"]);
   assert.deepEqual(rowMenu(tree).at(-1), {id:"remove-tree", label:"Remove worktree…", danger:true, separatorBefore:true});
   assert.ok(rowMenu({...tree, merged:true}).some(item => item.id === "remove-tree"));
-  assert.deepEqual(rowMenu({...tree, task:null}).map(item => item.id), ["new-agent", "mr", "copy-path", "copy-branch", "remove-tree"]);
-  for (const missing of [{cwd:null}, {repo:null}, {cwd:null, repo:null}])
-    assert.ok(!rowMenu({...tree, task:null, ...missing}).some(item => item.id === "new-agent"));
-  assert.deepEqual(rowMenu({kind:"tree", tree:"loose", body:"/home/dev/loose\n +2"}).map(item => item.id), ["copy-path", "remove-tree"]);
-  assert.ok(!rowMenu({kind:"tree", tree:"loose"}).some(item => item.id === "copy-path"));
+  assert.deepEqual(rowMenu({...tree, task:null}).map(item => item.id),
+    ["open-agent", "open-shell", "mr", "copy-path", "copy-branch", "remove-tree"]);
+  assert.deepEqual(rowMenu({kind:"tree", tree:"loose", body:"/home/dev/loose\n +2"}).map(item => item.id),
+    ["open-agent", "open-shell", "copy-path", "remove-tree"]);
+  // nowhere to open: no path known
+  assert.ok(!rowMenu({kind:"tree", tree:"loose"}).some(item => ["copy-path", "open-agent", "open-shell"].includes(item.id)));
   assert.ok(rowMenu({kind:"tree", tree:"demo"}, {mr}).some(item => item.id === "mr"));
 });
 
@@ -724,4 +725,51 @@ test("task spaces accept title, stable id and legacy names without case sensitiv
   const explicit = {id:"known", name:"Custom label"};
   assert.equal(taskSpace({...row, space:"known"}, [titleSpace, explicit]), explicit);
   assert.equal(taskSignals({...row, children:[]}, [], [titleSpace]).liveSpace, titleSpace);
+});
+
+test("Smart input tells a Jira key or link, a branch and a task name apart", () => {
+  assert.deepEqual(smartTarget(" "), {kind:"empty"});
+  assert.deepEqual(smartTarget("DEMO-12"), {kind:"ticket", key:"DEMO-12"});
+  assert.deepEqual(smartTarget("https://jira.example.com/browse/DEMO-12?focusedId=1"), {kind:"ticket", key:"DEMO-12"});
+  assert.deepEqual(smartTarget("https://git.example.com/demo/-/merge_requests/3"), {kind:"unsupported"});
+  assert.deepEqual(smartTarget("dev/fix-login"), {kind:"branch", branch:"dev/fix-login"});
+  // a task ID or a lowercase key is a name, not a ticket
+  assert.deepEqual(smartTarget("demo-1"), {kind:"name", name:"demo-1"});
+  assert.deepEqual(smartTarget("Fix the login / logout race"), {kind:"name", name:"Fix the login / logout race"});
+});
+
+test("New task arguments follow the source tab and the advanced options", () => {
+  const base = {source:"smart", agent:"codex", worktree:true};
+  assert.deepEqual(newTaskArgs({...base, text:""}).args, ["start", "--unnamed", "--bg", "--agent", "codex"]);
+  assert.deepEqual(newTaskArgs({...base, text:"DEMO-7"}).args, ["start", "DEMO-7", "--bg", "--agent", "codex"]);
+  assert.deepEqual(newTaskArgs({...base, text:"dev/fix-login"}).args,
+    ["start", "fix-login", "--branch", "dev/fix-login", "--bg", "--agent", "codex"]);
+  assert.deepEqual(newTaskArgs({...base, source:"name", text:"DEMO-7", agent:"none", worktree:false, newTicket:true}).args,
+    ["start", "DEMO-7", "--bg", "--no-agent", "--no-worktree", "--new-ticket"]);
+  assert.deepEqual(newTaskArgs({...base, source:"jira", text:"login", ticket:"DEMO-9", name:"x", branch:"dev/x"}).args,
+    ["start", "DEMO-9", "--bg", "--agent", "codex", "--name", "x", "--branch", "dev/x"]);
+  // the branch tab's branch wins over the advanced one; a worktree's name/branch need a worktree
+  assert.deepEqual(newTaskArgs({...base, source:"branch", text:"dev/a", branch:"dev/b"}).args,
+    ["start", "a", "--branch", "dev/a", "--bg", "--agent", "codex"]);
+  assert.deepEqual(newTaskArgs({...base, text:"Task", worktree:false, name:"x", branch:"dev/x"}).args,
+    ["start", "Task", "--bg", "--agent", "codex", "--no-worktree"]);
+  for (const [form, error] of [
+    [{source:"jira", text:"login"}, /valid Jira ticket key/],
+    [{source:"branch", text:""}, /Enter a branch/],
+    [{source:"branch", text:"two words"}, /no spaces/],
+    [{source:"branch", text:"dev/a", worktree:false}, /needs a worktree/],
+    [{source:"smart", text:"https://git.example.com/mr/1"}, /Jira key or link/],
+    [{source:"name", text:"", newTicket:true}, /Name the task/],
+  ]) assert.match(newTaskArgs({...base, ...form}).error, error);
+});
+
+test("the Jira tab lists open tickets with no task once each", () => {
+  const ticket = (target, extra = {}) => ({kind:"ticket", target, label:`${target}  Summary ${target}`, state:"Open", ...extra});
+  const snapshot = {rows:[
+    {kind:"header", label:"assigned to me in jira", children:[ticket("DEMO-1"), ticket("DEMO-2", {state:"Closed"})]},
+    {kind:"task", task:"Busy", children:[ticket("DEMO-3", {task:"Busy"})]},
+    ticket("DEMO-1"),
+  ]};
+  assert.deepEqual(freeTickets(snapshot), [{key:"DEMO-1", title:"Summary DEMO-1"}]);
+  assert.deepEqual(freeTickets(null), []);
 });

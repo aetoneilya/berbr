@@ -42,6 +42,9 @@ pub struct WorkflowConfig {
     pub review_model: Option<String>,
     /// Model for Codex reviews; Codex's configured default when empty.
     pub codex_review_model: Option<String>,
+    /// Claude model that names a task (title and worktree) from its
+    /// description: a small one, the answer is a few words.
+    pub naming_model: String,
     /// macOS app the TUI's `i` opens a worktree in.
     pub ide: String,
 }
@@ -56,6 +59,7 @@ impl Default for WorkflowConfig {
             agent_override: None,
             review_model: None,
             codex_review_model: None,
+            naming_model: "haiku".to_string(),
             ide: "IntelliJ IDEA".to_string(),
         }
     }

@@ -521,6 +521,19 @@ fn finish_task_with(
     {
         problems.push(format!("can't close herdr workspace {space}: {e}"));
     }
+    // agents labelled with the task in another space: a task without a worktree
+    // runs as a pane in the project's space, which stays
+    if herdr::available() {
+        for agent in row
+            .agents
+            .iter()
+            .filter(|a| Some(a.workspace.as_str()) != space)
+        {
+            if let Err(e) = herdr::close_pane(&agent.pane) {
+                problems.push(format!("can't close pane {}: {e}", agent.name));
+            }
+        }
+    }
     if problems.is_empty() {
         Ok(())
     } else {

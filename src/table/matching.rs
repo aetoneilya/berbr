@@ -141,7 +141,13 @@ pub fn assemble(inputs: Inputs) -> Table {
     }
 
     for row in &mut rows {
-        row.agents = agents_outside(row.space.as_deref(), &agents, &trees, &sessions);
+        row.agents = agents_outside(
+            &row.task.name,
+            row.space.as_deref(),
+            &agents,
+            &trees,
+            &sessions,
+        );
     }
     for row in rows.iter_mut().filter(|r| !r.task.done) {
         row.new_sessions = discover_sessions(row, &trees, &roots, &sessions);
@@ -510,19 +516,19 @@ fn link_parents(rows: &mut [TaskRow]) {
     }
 }
 
-/// Agents of herdr workspace `space` that work in none of `trees`.
+/// Agents of the task `task` that work in none of `trees`: those in its herdr
+/// workspace `space`, and those labelled with it elsewhere (Herdr App: a task
+/// without a worktree runs as a pane in the project's space).
 pub(super) fn agents_outside(
+    task: &str,
     space: Option<&str>,
     agents: &[herdr::Agent],
     trees: &[Tree],
     sessions: &HashMap<String, Session>,
 ) -> Vec<Agent> {
-    let Some(space) = space else {
-        return Vec::new();
-    };
     agents
         .iter()
-        .filter(|a| a.workspace_id == space)
+        .filter(|a| Some(a.workspace_id.as_str()) == space || a.task_label() == Some(task))
         .filter(|a| {
             !trees
                 .iter()
@@ -539,6 +545,32 @@ mod tests {
     use super::*;
     use crate::table::{Category, write_back};
     use crate::vault::note::Note;
+
+    #[test]
+    fn a_task_owns_the_agents_of_its_space_and_those_labelled_with_it_elsewhere() {
+        let agent = |pane: &str, space: &str, task: Option<&str>| -> herdr::Agent {
+            serde_json::from_value(serde_json::json!({
+                "name": pane, "agent_status": "idle", "cwd": "/main", "pane_id": pane,
+                "tab_id": "tab", "workspace_id": space, "agent_session": null,
+                "berbr_task": task
+            }))
+            .unwrap()
+        };
+        let agents = [
+            agent("own", "task-space", None),
+            agent("labelled", "project-space", Some("demo-0")),
+            agent("other-task", "project-space", Some("demo-1")),
+            agent("project-shell", "project-space", None),
+        ];
+        let panes = |space| {
+            agents_outside("demo-0", space, &agents, &[], &HashMap::new())
+                .into_iter()
+                .map(|a| a.pane)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(panes(Some("task-space")), ["own", "labelled"]);
+        assert_eq!(panes(None), ["labelled"]);
+    }
 
     #[test]
     fn numbered_task_keeps_its_tree_without_live_agents_after_a_title_change() {
