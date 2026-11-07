@@ -638,6 +638,7 @@ mod close_plan_tests {
                 path: dir,
                 task_dirs: vec![],
                 new_task_dir: "tasks".into(),
+                own: false,
             },
         };
         let mut app = App::new(vec![config], Some(0)).unwrap();

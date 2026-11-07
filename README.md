@@ -1,8 +1,7 @@
 # berbr
 
 berbr joins Jira tickets, GitLab merge requests, git worktrees,
-[herdr](https://herdr.dev) agents and task notes in an Obsidian vault into one
-table. A task is a markdown note; its tickets, MRs, worktrees, agents and claude
+[herdr](https://herdr.dev) agents and task notes into one table. A task is a markdown note; its tickets, MRs, worktrees, agents and claude
 sessions are found from branch names, herdr workspaces and transcripts. `berbr`
 shows the table as a TUI or as plain text and runs the daily workflow: start a
 task, add a ticket to it, go back to it, review, close. `DESIGN.md` has the
@@ -15,15 +14,34 @@ model and the decisions.
 cargo install --path . --locked
 ```
 
+## Where things live
+
+Like `~/.claude`, berbr keeps its own folder, `~/.berbr` (`BERBR_HOME` overrides):
+
+```
+~/.berbr/
+  config.toml
+  logs/berbr.log
+  projects/<project>/tasks/*.md        open tasks
+  projects/<project>/tasks/done/*.md   closed ones, moved there by `berbr done`
+```
+
+Task notes are plain Markdown with YAML frontmatter; `o` in the TUI and the
+mod's note window open them in the default editor.
+
+An Obsidian vault can still hold them: a `[vault]` table puts every project's
+`task_dirs` inside it, as before. `berbr migrate` moves from there to `~/.berbr`:
+it copies each task (closed ones into `done/`, with its creation date), the
+task-number counters and the config without `[vault]` to
+`~/.berbr/config.toml`. The vault's notes are left alone — delete them once the
+copy looks right; removing `~/.berbr/config.toml` goes back.
+
 ## Config
 
-`~/.config/berbr/config.toml` (`$XDG_CONFIG_HOME/berbr/config.toml`, or
-the path in `BERBR_CONFIG`):
+The first of `BERBR_CONFIG`, `~/.berbr/config.toml`,
+`$XDG_CONFIG_HOME/berbr/config.toml`:
 
 ```toml
-[vault]
-path = "~/demo-vault"
-
 [workflow]                  # defaults for every project
 branch_prefix = "demo/"
 worktree_dir = ".herdr/worktrees" # relative to each main checkout
@@ -32,9 +50,7 @@ worktree_dir = ".herdr/worktrees" # relative to each main checkout
 # ide = "IntelliJ IDEA"
 
 [[project]]                 # in the TUI's project dropdown, `berbr -p demo`
-name = "demo"
-task_dirs = ["30-work/tasks"]
-# new_task_dir = "30-work/tasks"   # default: the first of task_dirs
+name = "demo"               # tasks in ~/.berbr/projects/demo/tasks
 jira = { host = "https://jira.example.com", project = "DEMO", issue_type = "Задача" }
 gitlab = { host = "gitlab.example.com", project = "demo/service" }
 
@@ -44,12 +60,15 @@ gitlab_project = "demo/service"
 
 [[project]]                 # no Jira, no GitLab: notes, worktrees, agents
 name = "vpn"
-task_dirs = ["10-ah-fuck-life/projects/vpn"]
 branch_prefix = ""
 
 [[project.repo]]
 path = "~/code/pet-projects/vpn-bot"
 ```
+
+With a vault instead, add `[vault] path = "~/demo-vault"` and a `task_dirs =
+["30-work/tasks"]` (relative to the vault) to each project; `new_task_dir`
+defaults to the first of them.
 
 Existing `~/.config/worktable/config.toml` is used when the new config is absent.
 `WORKTABLE_CONFIG`, `WT_TRACE` and `WT_POPUP` remain accepted; the `BERBR_*`
@@ -64,6 +83,14 @@ appends a `[[project]]` here. `[` `]` and Tab switch at once.
 
 Tokens come from `JIRA_TOKEN` and `GITLAB_TOKEN`. `BERBR_TRACE=1` prints how long
 each fetch, the matching and the rendering took to stderr.
+
+Commands that change something (start, select, done, rename, …) are logged with
+their arguments, folder, time and error to `~/.berbr/logs/berbr.log`
+(`BERBR_LOG_DIR` overrides); the Herdr.app mod
+logs what it ran to `~/.config/herdr-app/logs/berbr-mod.log`. `debug = true` at
+the top of the config, or `BERBR_DEBUG=1`, also logs reads, every git and herdr
+call, each HTTP request (method, URL without query, status) and the trace spans.
+`berbr logs` shows the end of both.
 
 ## Commands
 
@@ -114,7 +141,7 @@ Unknown inspection counts are JSON `null`.
 - `↑↓`/`jk` move, `←→`/`hl`/space fold, `z` fold / unfold all, `/` filter, `.` all / active only, `v` hide MRs, worktrees, …
 - `⏎` focus the agent, or resume work (`berbr select`)
 - `+ new task` row above the tasks: ⏎ or a click opens a form (name, one Jira dropdown: none, new ticket and the open tickets without a task, filtered by typing; checkboxes worktree, agent); `s` start a ticket / add one to a task, `a` attach a ticket
-- `b` browser, `o` note in Obsidian, `e` note in `$EDITOR`, `i` worktree in the IDE
+- `b` browser, `o` note in its editor (Obsidian for a vault), `e` note in `$EDITOR`, `i` worktree in the IDE
 - `R` review, `d` remove a worktree / close a task
 - `w` next agent waiting for you, `p` details pane, `r` refresh, `q` quit
 

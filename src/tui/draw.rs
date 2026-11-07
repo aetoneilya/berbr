@@ -186,7 +186,12 @@ impl App {
             }
             if under_task {
                 keys.push(("N", "note line".into()));
-                keys.push(("o", "obsidian".into()));
+                let open = if self.config.vault.own {
+                    "open note"
+                } else {
+                    "obsidian"
+                };
+                keys.push(("o", open.into()));
                 keys.push(("e", "edit note".into()));
             }
             if row.has_children {

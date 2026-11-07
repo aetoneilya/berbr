@@ -1,5 +1,6 @@
 use crate::client::agent::AgentKind;
 mod app;
+mod migrate;
 mod progress;
 mod table;
 pub(crate) mod work;
@@ -105,6 +106,24 @@ enum CliCommands {
     /// worktrees, closes my tickets in Jira and marks the note done. Use --tree
     /// to remove one checkout, or omit the target inside that checkout
     Done(DoneArgs),
+    /// The tail of berbr's log and the Herdr.app mod's log. Changes are always
+    /// logged; set `debug = true` in the config or BERBR_DEBUG=1 for everything
+    Logs {
+        /// Lines from each log
+        #[arg(long, short = 'n', default_value_t = 40)]
+        lines: usize,
+        /// Only print where the logs are
+        #[arg(long)]
+        path: bool,
+    },
+    /// Copy task notes out of the Obsidian vault into ~/.berbr/projects/<project>/tasks
+    /// (closed ones into done/) and write ~/.berbr/config.toml without [vault].
+    /// The vault's notes stay until you delete them
+    Migrate {
+        /// Only say what would be copied
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Shell completion script
     Completions {
         #[arg(value_enum)]
@@ -261,6 +280,10 @@ struct DoneArgs {
 
 pub fn run() -> Result<(), String> {
     let cli = Cli::parse();
+    if let Some(CliCommands::Logs { lines, path }) = cli.command {
+        return logs(lines, path);
+    }
+    crate::log::begin(cli.command.as_ref().is_some_and(changes));
     if matches!(cli.command, Some(CliCommands::PluginOpen)) {
         if let Err(err) = crate::metadata::start() {
             eprintln!("sidebar metadata: {err}");
@@ -283,6 +306,9 @@ pub fn run() -> Result<(), String> {
             project.workflow.agent = agent;
             project.workflow.agent_override = Some(agent);
         }
+    }
+    if let Some(CliCommands::Migrate { dry_run }) = cli.command {
+        return migrate::run(&projects, dry_run);
     }
     let cwd = crate::tui::caller_dir();
     let command = match cli.command {
@@ -320,10 +346,61 @@ pub fn run() -> Result<(), String> {
             generate(shell, &mut Cli::command(), "berbr", &mut io::stdout());
             Ok(())
         }
-        CliCommands::Tui {} => unreachable!(),
+        CliCommands::Tui {} | CliCommands::Logs { .. } | CliCommands::Migrate { .. } => {
+            unreachable!()
+        }
         CliCommands::PluginOpen => unreachable!(),
         CliCommands::PluginMetadataStart | CliCommands::PluginMetadata { .. } => unreachable!(),
     }
+}
+
+/// Whether the command may change tasks, worktrees, tickets or Herdr: those
+/// are always logged.
+fn changes(command: &CliCommands) -> bool {
+    match command {
+        CliCommands::Start(_)
+        | CliCommands::Add(_)
+        | CliCommands::Attach { .. }
+        | CliCommands::Select(_)
+        | CliCommands::Prepare { .. }
+        | CliCommands::Note { .. }
+        | CliCommands::Rename { .. }
+        | CliCommands::Task { .. }
+        | CliCommands::Review { .. } => true,
+        CliCommands::Done(args) => !args.dry_run,
+        CliCommands::Migrate { dry_run } => !dry_run,
+        CliCommands::AppSnapshot { .. }
+        | CliCommands::PluginOpen
+        | CliCommands::PluginMetadataStart
+        | CliCommands::PluginMetadata { .. }
+        | CliCommands::Tui {}
+        | CliCommands::Status(_)
+        | CliCommands::Logs { .. }
+        | CliCommands::Completions { .. } => false,
+    }
+}
+
+/// Where the Herdr.app mod writes its log: mods may write only there.
+fn mod_log() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".config/herdr-app/logs/berbr-mod.log")
+}
+
+fn logs(lines: usize, path_only: bool) -> Result<(), String> {
+    let logs = [("berbr", crate::log::path()), ("Herdr.app mod", mod_log())];
+    for (i, (name, path)) in logs.iter().enumerate() {
+        if path_only {
+            println!("{}", path.display());
+            continue;
+        }
+        if i > 0 {
+            println!();
+        }
+        println!("== {name}: {}", path.display());
+        println!("{}", crate::log::tail(path, lines));
+    }
+    Ok(())
 }
 
 /// The vault's tasks; notes that can't be read are reported and left out.

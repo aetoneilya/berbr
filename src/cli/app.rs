@@ -28,7 +28,8 @@ pub(super) fn snapshot(projects: &[Config], chosen: usize, cached: bool) -> Resu
         json!({
             "version": 3, "project": config.name,
             "projects": projects.iter().map(|c| json!({"name":c.name,"cwd":c.repos.first().map(|r|&r.path),"agent":c.workflow.agent})).collect::<Vec<_>>(),
-            "rows": rows, "warnings": table.warnings,
+            "rows": rows, "warnings": table.warnings, "debug": crate::log::debug_enabled(),
+            "store": if config.vault.own { "berbr" } else { "vault" },
             "sources": {"jira":format!("{:?}",table.jira.fresh),"gitlab":format!("{:?}",table.gitlab.fresh)}
         })
     );
@@ -237,6 +238,7 @@ mod tests {
                 path: dir.clone(),
                 task_dirs: vec!["tasks".into()],
                 new_task_dir: "tasks".into(),
+                own: false,
             },
         };
         let (tasks, errors) = crate::vault::task::load_previews(&config);

@@ -63,6 +63,7 @@ pub fn create(
     let mut keys = keys.to_vec();
     keys.push(("id", Value::String(id.clone())));
     keys.push(("project", Value::String(config.name.clone())));
+    keys.push(("created", Value::String(chrono::Local::now().to_rfc3339())));
     if !title.trim().is_empty() {
         keys.push(("title", Value::String(title.trim().into())));
     }
@@ -116,6 +117,7 @@ mod tests {
                 path: root,
                 task_dirs: vec!["tasks".into()],
                 new_task_dir: "tasks".into(),
+                own: false,
             },
         };
         let ids = std::thread::scope(|scope| {

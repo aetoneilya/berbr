@@ -343,10 +343,16 @@ fn load_with(
             match read(&path) {
                 Ok(note) => {
                     let mut task = Task::from_note(note);
-                    task.created = path
-                        .strip_prefix(&vault.path)
-                        .ok()
-                        .and_then(|rel| added.get(rel).cloned())
+                    // written at creation since berbr has its own folder;
+                    // older vault notes have only their first commit
+                    task.created = task
+                        .note
+                        .string("created")
+                        .or_else(|| {
+                            path.strip_prefix(&vault.path)
+                                .ok()
+                                .and_then(|rel| added.get(rel).cloned())
+                        })
                         .or_else(|| birth_time(&path));
                     tasks.push(task);
                 }
@@ -362,6 +368,9 @@ fn load_with(
 /// auto-committed). The file's own birth time is useless: saving a note goes
 /// through a temp file and a rename.
 fn git_added(vault: &VaultConfig) -> HashMap<PathBuf, String> {
+    if vault.own {
+        return HashMap::new();
+    }
     let mut args = vec![
         "-c".to_string(),
         "core.quotePath=false".to_string(),
@@ -377,12 +386,10 @@ fn git_added(vault: &VaultConfig) -> HashMap<PathBuf, String> {
             .iter()
             .map(|d| d.to_string_lossy().to_string()),
     );
-    let Ok(output) = Command::new("git")
-        .arg("-C")
-        .arg(&vault.path)
-        .args(&args)
-        .output()
-    else {
+    let Ok(output) = crate::log::command(
+        "git",
+        Command::new("git").arg("-C").arg(&vault.path).args(&args),
+    ) else {
         return HashMap::new();
     };
     let mut added = HashMap::new();

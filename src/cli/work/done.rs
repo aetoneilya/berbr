@@ -408,14 +408,17 @@ pub(crate) fn finish_task(
     } else {
         Some(config.jira_client()?)
     };
-    finish_task_with(plan, force, say, &mut |key| {
+    let store = config.vault.own.then_some(&config.vault);
+    finish_task_with(plan, force, store, say, &mut |key| {
         close_in_jira(jira.as_ref().ok_or("Jira unavailable")?, key)
     })
 }
 
+/// `store`: berbr's own task folder, where a closed task moves to `done/`.
 fn finish_task_with(
     plan: TaskPlan,
     force: bool,
+    store: Option<&crate::config::VaultConfig>,
     say: &mut dyn FnMut(String),
     close_ticket: &mut dyn FnMut(&str) -> Result<String, String>,
 ) -> Result<(), String> {
@@ -501,6 +504,9 @@ fn finish_task_with(
             note.set("branches", list(&branches));
         }
         note.save().map_err(err)?;
+        if let Some(store) = store {
+            archive(&note.path, store, say);
+        }
     }
     say(format!("\"{}\" is done", row.task.name));
 
@@ -680,7 +686,8 @@ pub(crate) fn finish_tree(
     say: &mut dyn FnMut(String),
 ) -> Result<(), String> {
     let tree = plan.table.tree(plan.tree);
-    if let Some(kept) = remove_tree(tree, mr_of(&plan.table, tree), force, false, say)? {
+    // forced, the files go but a branch with commits found nowhere else stays
+    if let Some(kept) = remove_tree(tree, mr_of(&plan.table, tree), false, force, say)? {
         say(kept);
     }
     // last: this may close the pane wt itself runs in
@@ -736,6 +743,33 @@ fn not_finished(name: &str, blockers: &[String]) -> String {
 
 fn mr_of<'a>(table: &'a Table, tree: &Tree) -> Option<&'a MergeRequest> {
     tree.mr.map(|i| &table.mr(i).mr)
+}
+
+/// Moves a closed task's note into `done/` of the task folder, so the folder
+/// holds only open work; berbr reads both.
+fn archive(
+    path: &std::path::Path,
+    store: &crate::config::VaultConfig,
+    say: &mut dyn FnMut(String),
+) {
+    let done = store.path.join(&store.new_task_dir).join("done");
+    let (Some(name), false) = (path.file_name(), path.starts_with(&done)) else {
+        return;
+    };
+    let target = done.join(name);
+    let moved = std::fs::create_dir_all(&done).and_then(|()| {
+        if target.exists() {
+            Err(std::io::Error::other(format!(
+                "{} exists",
+                target.display()
+            )))
+        } else {
+            std::fs::rename(path, &target)
+        }
+    });
+    if let Err(e) = moved {
+        say(format!("note kept in place: {e}"));
+    }
 }
 
 /// Removes the worktree and deletes its branch; returns why the branch was kept,
@@ -853,6 +887,37 @@ mod tests {
     };
     use crate::client::jira::Transition;
     use crate::table::fixtures::{mr, table, task, tree};
+
+    #[test]
+    fn a_closed_task_moves_into_done_unless_something_is_in_the_way() {
+        let root = crate::table::fixtures::temp_dir();
+        let store = crate::config::VaultConfig {
+            path: root.clone(),
+            task_dirs: vec!["tasks".into()],
+            new_task_dir: "tasks".into(),
+            own: true,
+        };
+        std::fs::create_dir_all(root.join("tasks/done")).unwrap();
+        for name in ["demo-1.md", "demo-2.md"] {
+            std::fs::write(root.join("tasks").join(name), "---\ndone: true\n---\n").unwrap();
+        }
+        std::fs::write(root.join("tasks/done/demo-2.md"), "older").unwrap();
+        let mut said = Vec::new();
+        super::archive(&root.join("tasks/demo-1.md"), &store, &mut |s| said.push(s));
+        super::archive(&root.join("tasks/demo-2.md"), &store, &mut |s| said.push(s));
+        super::archive(&root.join("tasks/done/demo-2.md"), &store, &mut |s| {
+            said.push(s)
+        });
+        assert!(root.join("tasks/done/demo-1.md").is_file());
+        assert!(!root.join("tasks/demo-1.md").exists());
+        assert!(root.join("tasks/demo-2.md").is_file(), "never overwritten");
+        assert_eq!(
+            std::fs::read_to_string(root.join("tasks/done/demo-2.md")).unwrap(),
+            "older"
+        );
+        assert_eq!(said.len(), 1, "{said:?}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn closing_a_task_closes_its_workspace_last() {
@@ -1069,6 +1134,7 @@ mod regressions {
                 path: temp_dir(),
                 task_dirs: vec![],
                 new_task_dir: "tasks".into(),
+                own: false,
             },
             repos: vec![],
         }
@@ -1139,14 +1205,20 @@ mod failure_tests {
         let plan = plan_task_table(table, 0, false).unwrap();
         let mut calls = Vec::new();
         let mut report = Vec::new();
-        let result = finish_task_with(plan, false, &mut |line| report.push(line), &mut |key| {
-            calls.push(key.to_string());
-            if key == "DEMO-1" {
-                Ok("Done".into())
-            } else {
-                Err("transition refused".into())
-            }
-        });
+        let result = finish_task_with(
+            plan,
+            false,
+            None,
+            &mut |line| report.push(line),
+            &mut |key| {
+                calls.push(key.to_string());
+                if key == "DEMO-1" {
+                    Ok("Done".into())
+                } else {
+                    Err("transition refused".into())
+                }
+            },
+        );
         assert!(result.unwrap_err().contains("task remains open"));
         assert_eq!(calls, ["DEMO-1", "DEMO-2"]);
         assert!(report.iter().any(|l| l.contains("DEMO-1 → Done")));
@@ -1178,6 +1250,7 @@ mod data_guard_tests {
             finish_task_with(
                 plan,
                 true,
+                None,
                 &mut |_| panic!("no steps allowed"),
                 &mut |_| panic!("no Jira mutation allowed")
             )

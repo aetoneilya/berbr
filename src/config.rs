@@ -61,7 +61,8 @@ impl Default for WorkflowConfig {
     }
 }
 
-/// Where a project's task notes live in the Obsidian vault.
+/// Where a project's task notes live: berbr's own folder,
+/// `~/.berbr/projects/<project>`, or an Obsidian vault named by `[vault]`.
 #[derive(Debug, Clone)]
 pub struct VaultConfig {
     pub path: PathBuf,
@@ -69,6 +70,23 @@ pub struct VaultConfig {
     pub task_dirs: Vec<PathBuf>,
     /// Folder for notes created by `berbr start <name>`, relative to `path`.
     pub new_task_dir: PathBuf,
+    /// berbr's own folder, not a vault: closed tasks move to `done/`, and
+    /// notes open in an editor rather than Obsidian.
+    pub own: bool,
+}
+
+/// berbr's home, like `~/.claude`: the config, logs and each project's tasks.
+/// `BERBR_HOME` overrides.
+pub fn berbr_home() -> PathBuf {
+    if let Some(home) = std::env::var_os("BERBR_HOME").filter(|h| !h.is_empty()) {
+        return PathBuf::from(home);
+    }
+    dirs::home_dir().unwrap_or_default().join(".berbr")
+}
+
+/// A project's own task folder under berbr's home.
+pub fn project_home(name: &str) -> PathBuf {
+    berbr_home().join("projects").join(name)
 }
 
 /// A repository whose worktrees and merge requests belong to tasks.
@@ -97,7 +115,11 @@ pub struct Config {
 /// The config file: the vault, defaults for every project, the projects.
 #[derive(Debug, Deserialize)]
 struct FileConfig {
-    vault: VaultFile,
+    /// Log every command, git call and request to berbr's log, not only changes.
+    #[serde(default)]
+    debug: bool,
+    /// An Obsidian vault for task notes; without it they live in berbr's home.
+    vault: Option<VaultFile>,
     #[serde(default)]
     workflow: WorkflowConfig,
     #[serde(rename = "project")]
@@ -114,6 +136,9 @@ struct ProjectFile {
     name: String,
     jira: Option<JiraConfig>,
     gitlab: Option<GitLabConfig>,
+    /// Relative to the vault, or to the project's own folder; default `tasks`
+    /// there, required with a vault.
+    #[serde(default)]
     task_dirs: Vec<PathBuf>,
     /// Default: the first of `task_dirs`.
     new_task_dir: Option<PathBuf>,
@@ -129,14 +154,28 @@ struct ProjectFile {
 impl FileConfig {
     /// Each project with the shared parts filled in and `~` expanded.
     fn projects(self) -> Result<Vec<Config>, String> {
-        let vault = expand_home(&self.vault.path);
+        let vault = self.vault.as_ref().map(|v| expand_home(&v.path));
         self.projects
             .into_iter()
-            .map(|p| {
+            .map(|mut p| {
+                if vault.is_none() {
+                    if p.name.is_empty() || p.name.starts_with('.') || p.name.contains(['/', '\\'])
+                    {
+                        return Err(format!(
+                            "project {:?}: its name is a folder in {}; no slashes or leading dots",
+                            p.name,
+                            berbr_home().display()
+                        ));
+                    }
+                    if p.task_dirs.is_empty() {
+                        p.task_dirs.push(PathBuf::from("tasks"));
+                    }
+                }
                 let new_task_dir = p
                     .new_task_dir
                     .or_else(|| p.task_dirs.first().cloned())
                     .ok_or_else(|| format!("project {}: no task_dirs", p.name))?;
+                let home = project_home(&p.name);
                 let mut workflow = self.workflow.clone();
                 if let Some(prefix) = p.branch_prefix {
                     workflow.branch_prefix = prefix;
@@ -155,9 +194,10 @@ impl FileConfig {
                     gitlab: p.gitlab,
                     workflow,
                     vault: VaultConfig {
-                        path: vault.clone(),
+                        path: vault.clone().unwrap_or(home),
                         task_dirs: p.task_dirs,
                         new_task_dir,
+                        own: vault.is_none(),
                     },
                     repos: p
                         .repos
@@ -191,7 +231,8 @@ pub fn expand_home(path: &Path) -> PathBuf {
     }
 }
 
-/// Explicit config, then an existing plugin config, then the standalone config.
+/// Explicit config, then an existing plugin config, then `~/.berbr/config.toml`,
+/// then the standalone config.
 pub(crate) fn config_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -205,6 +246,10 @@ pub(crate) fn config_path() -> PathBuf {
         .or_else(|| {
             let path =
                 PathBuf::from(std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")?).join("config.toml");
+            path.is_file().then_some(path)
+        })
+        .or_else(|| {
+            let path = berbr_home().join("config.toml");
             path.is_file().then_some(path)
         })
         .unwrap_or_else(|| default_config_path(&base))
@@ -227,6 +272,7 @@ pub fn load_projects() -> Result<Vec<Config>, ConfigError> {
         fs::read_to_string(&config_path).map_err(|e| ConfigError::Read(config_path.clone(), e))?;
     let file: FileConfig =
         toml::from_str(&contents).map_err(|e| ConfigError::Parse(config_path.clone(), e))?;
+    crate::log::set_debug(file.debug);
     let projects = file
         .projects()
         .map_err(|e| ConfigError::Invalid(config_path.clone(), e))?;
@@ -234,6 +280,33 @@ pub fn load_projects() -> Result<Vec<Config>, ConfigError> {
         return Err(ConfigError::Invalid(config_path, "no [[project]]".into()));
     }
     Ok(projects)
+}
+
+/// The config for berbr's own task folders: `[vault]` and the projects'
+/// `task_dirs` / `new_task_dir` dropped, every other line kept as it is. Fails
+/// when the result does not parse, or still names a vault — a multi-line value
+/// needs a hand edit then.
+pub fn without_vault(text: &str) -> Result<String, String> {
+    let mut out = String::new();
+    let mut in_vault = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            in_vault = trimmed.trim_end() == "[vault]";
+        }
+        let key = trimmed.split('=').next().unwrap_or("").trim();
+        if in_vault || (trimmed.contains('=') && matches!(key, "task_dirs" | "new_task_dir")) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    let file: FileConfig = toml::from_str(&out).map_err(|e| e.to_string())?;
+    if file.vault.is_some() {
+        return Err("[vault] is still there".into());
+    }
+    file.projects()?;
+    Ok(out)
 }
 
 /// A `[[project]]` with its notes in `task_dir` and, if given, one repo: the
@@ -334,6 +407,20 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_vault_config_becomes_one_for_berbr_s_own_folders() {
+        let text = "debug = true\n\n[vault]\npath = \"~/notes\"\n\n[workflow]\nbranch_prefix = \"dev/\"\n\n[[project]]\nname = \"demo\"\ntask_dirs = [\"30/tasks\"]\nnew_task_dir = \"30/tasks\"\njira = { host = \"https://jira.example.invalid\", project = \"DEMO\" }\n\n[[project.repo]]\npath = \"~/code/demo\"\n";
+        let own = without_vault(text).unwrap();
+        assert!(!own.contains("[vault]") && !own.contains("task_dirs") && !own.contains("~/notes"));
+        assert!(own.contains("branch_prefix = \"dev/\"") && own.contains("[[project.repo]]"));
+        let file: FileConfig = toml::from_str(&own).unwrap();
+        let demo = file.projects().unwrap().remove(0);
+        assert!(demo.vault.own);
+        assert_eq!(demo.vault.path, project_home("demo"));
+        assert_eq!(demo.vault.task_dirs, vec![PathBuf::from("tasks")]);
+        assert!(without_vault("[vault]\npath = \"/v\"\n[[project]]\nname = \"a/b\"\n").is_err());
+    }
 
     #[test]
     fn renamed_config_prefers_berbr_and_falls_back_to_worktable() {

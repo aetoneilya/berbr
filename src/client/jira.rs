@@ -90,8 +90,10 @@ impl JiraClient {
         query: &[(&str, &str)],
     ) -> Result<T> {
         let _permit = super::http::acquire();
-        let response = self.client.get(url).query(query).send()?;
-        Ok(checked(response)?.json()?)
+        let start = std::time::Instant::now();
+        let response = self.client.get(url).query(query).send();
+        super::http::log("GET", url, start, &response);
+        Ok(checked(response?)?.json()?)
     }
 
     /// The workflow transitions available on the issue now.
@@ -104,13 +106,15 @@ impl JiraClient {
     pub fn transition(&self, key: &str, transition_id: &str) -> Result<()> {
         let url = format!("{}/rest/api/2/issue/{}/transitions", self.base_url, key);
         let _permit = super::http::acquire();
+        let start = std::time::Instant::now();
         let response = self
             .client
             .post(&url)
             .timeout(Duration::from_secs(10))
             .json(&serde_json::json!({ "transition": { "id": transition_id } }))
-            .send()?;
-        checked(response).map(|_| ())
+            .send();
+        super::http::log("POST", &url, start, &response);
+        checked(response?).map(|_| ())
     }
 
     /// Creates a ticket assigned to me; returns its key.
@@ -124,13 +128,15 @@ impl JiraClient {
             "assignee": { "name": me.name },
         });
         let _permit = super::http::acquire();
+        let start = std::time::Instant::now();
         let response = self
             .client
             .post(&url)
             .timeout(Duration::from_secs(10))
             .json(&serde_json::json!({ "fields": fields }))
-            .send()?;
-        let created: Created = checked(response)?.json()?;
+            .send();
+        super::http::log("POST", &url, start, &response);
+        let created: Created = checked(response?)?.json()?;
         Ok(created.key)
     }
 

@@ -471,6 +471,8 @@ impl App {
 
     fn open_note_in_obsidian(&mut self) {
         match self.note() {
+            // berbr's own folder is no vault: the default app for Markdown
+            Some(path) if self.config.vault.own => open(&path.to_string_lossy()),
             Some(path) => open(&format!(
                 "obsidian://open?path={}",
                 percent_encode(&path.to_string_lossy())

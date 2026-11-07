@@ -1525,3 +1525,134 @@ print(json.dumps({'address':sys.argv[2],'cwd':str(root/'repo'),'foreground':{'na
     assert_eq!(pool["active"], 0);
     assert!(pool["peak"].as_u64().unwrap() <= 8);
 }
+
+#[test]
+fn changes_are_logged_with_their_failure_and_reads_only_in_debug() {
+    let fixture = Fixture::new();
+    let logs = fixture.root.join("logs");
+    let run = |args: &[&str], debug: bool| {
+        let mut cmd = fixture.command();
+        cmd.env("BERBR_LOG_DIR", &logs).args(args);
+        if debug {
+            cmd.env("BERBR_DEBUG", "1");
+        } else {
+            cmd.env_remove("BERBR_DEBUG");
+        }
+        cmd.output().unwrap()
+    };
+    let log = || fs::read_to_string(logs.join("berbr.log")).unwrap_or_default();
+    run(&["app-snapshot", "--cached"], false);
+    assert_eq!(log(), "", "a read is not logged without debug");
+    assert!(
+        !run(&["rename", "missing-task", "New title"], false)
+            .status
+            .success()
+    );
+    let text = log();
+    assert!(
+        text.contains(r#"start ["rename", "missing-task", "New title"]"#),
+        "{text}"
+    );
+    assert!(
+        text.contains(r#"failed "#) && text.contains("missing-task"),
+        "{text}"
+    );
+    run(&["app-snapshot", "--cached"], true);
+    let text = log();
+    assert!(
+        text.contains(r#"ok "#) && text.contains(r#"["app-snapshot", "--cached"]"#),
+        "{text}"
+    );
+    assert!(
+        text.contains("git [") || text.contains("herdr-app ["),
+        "{text}"
+    );
+    let out = run(&["logs", "--path"], false);
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .starts_with(&logs.join("berbr.log").display().to_string())
+    );
+}
+
+#[test]
+fn migrate_copies_tasks_out_of_the_vault_and_berbr_then_reads_its_own_folder() {
+    let fixture = Fixture::new();
+    let vault = fixture.root.join("vault");
+    fs::write(
+        vault.join("tasks/test-1.md"),
+        "---\nid: test-1\ntitle: Closed one\ndone: true\n---\nOld work\n",
+    )
+    .unwrap();
+    fs::create_dir_all(vault.join(".worktable")).unwrap();
+    fs::write(vault.join(".worktable/test.next"), "5").unwrap();
+    let own = fixture.root.join("home/.berbr");
+    let tasks = own.join("projects/test/tasks");
+
+    let out = fixture
+        .command()
+        .args(["migrate", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Would copy 2 task(s), 1 closed"));
+    assert!(!own.exists());
+
+    let out = fixture.command().arg("migrate").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let open = fs::read_to_string(tasks.join("test-0.md")).unwrap();
+    assert!(open.contains("id: test-0") && open.contains("created:") && open.contains("задача"));
+    assert!(
+        fs::read_to_string(tasks.join("done/test-1.md"))
+            .unwrap()
+            .contains("Old work")
+    );
+    assert_eq!(
+        fs::read_to_string(own.join("projects/test/.worktable/test.next")).unwrap(),
+        "5"
+    );
+    let config = fs::read_to_string(own.join("config.toml")).unwrap();
+    assert!(
+        !config.contains("[vault]")
+            && !config.contains("task_dirs")
+            && config.contains("[[project.repo]]")
+    );
+    // the vault keeps everything
+    assert!(vault.join("tasks/test-0.md").is_file() && vault.join("tasks/test-1.md").is_file());
+    assert!(
+        fs::read_to_string(fixture.root.join("config.toml"))
+            .unwrap()
+            .contains("[vault]")
+    );
+
+    // without an explicit config, berbr takes ~/.berbr/config.toml and its folders
+    let out = fixture
+        .command()
+        .env_remove("BERBR_CONFIG")
+        .args(["app-snapshot", "--cached"])
+        .output()
+        .unwrap();
+    let snapshot = success(out);
+    let notes: Vec<String> = snapshot["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["note"].as_str().map(String::from))
+        .collect();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.ends_with(".berbr/projects/test/tasks/test-0.md")),
+        "{notes:?}"
+    );
+    // a second run copies nothing over what is there
+    let out = fixture.command().arg("migrate").output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Copied 0 task(s)"));
+}

@@ -52,10 +52,10 @@ impl GitLab {
         query: &[(&str, &str)],
     ) -> Result<(Response, super::http::Permit<'static>), String> {
         let permit = super::http::acquire();
-        self.client
-            .get(url)
-            .query(query)
-            .send()
+        let start = std::time::Instant::now();
+        let response = self.client.get(url.clone()).query(query).send();
+        super::http::log("GET", url.as_str(), start, &response);
+        response
             .and_then(|r| r.error_for_status())
             .map(|response| (response, permit))
             .map_err(|e| e.to_string())

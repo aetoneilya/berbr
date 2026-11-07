@@ -82,7 +82,7 @@ fn enabled_from_env(backend: Option<&str>, socket: Option<&str>, herdr_env: Opti
 }
 
 fn output_of(bin: &str, args: &[&str]) -> Result<Vec<u8>> {
-    let out = Command::new(bin).args(args).output()?;
+    let out = crate::log::command(bin, Command::new(bin).args(args))?;
     if !out.status.success() {
         return Err(HerdrError::NonZeroExit(format!(
             "{bin}: {}",

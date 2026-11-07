@@ -79,6 +79,15 @@ Existing conventions are kept: file `DEMO-42 Title.md` or any free name, keys
 Decided 2026-10-09: the TUI is the daily view; Obsidian is archive and search,
 task notes are not edited on the phone. So notes carry almost no live data.
 
+Decided 2026-11-06: task notes leave the vault by default. Dozens of closed
+tasks nobody opens cluttered it, and the board, not Obsidian, is where they are
+read. berbr keeps them in its own folder like `~/.claude`:
+`~/.berbr/projects/<project>/tasks`, closed ones moved to `done/`, `created:`
+written into the note since its file dates and the vault's git history no
+longer tell. Not `.herdr/` in the repo: `git clean -fdx` and a fresh clone would
+lose them, and a project can span several repos or none. `[vault]` still works;
+`berbr migrate` copies out of it and never deletes.
+
 ```yaml
 ---
 # user-owned (berbr writes these on a command; sync only appends to tickets)

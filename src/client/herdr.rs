@@ -49,7 +49,7 @@ fn herdr_output(args: &[&str]) -> Result<Vec<u8>> {
     if app::enabled() {
         return app::output(args);
     }
-    let output = Command::new(herdr_bin()).args(args).output()?;
+    let output = crate::log::command("herdr", Command::new(herdr_bin()).args(args))?;
     if !output.status.success() {
         return Err(HerdrError::NonZeroExit(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),

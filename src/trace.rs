@@ -11,14 +11,15 @@ static ENABLED: LazyLock<bool> = LazyLock::new(|| {
 });
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-/// Prints `name` and its duration when dropped, with BERBR_TRACE set.
+/// Prints `name` and its duration when dropped, with BERBR_TRACE set; writes it
+/// to the log in debug mode.
 pub struct Span {
     name: String,
     start: Instant,
 }
 
 pub fn span(name: impl Into<String>) -> Option<Span> {
-    if !*ENABLED {
+    if !*ENABLED && !crate::log::debug_enabled() {
         return None;
     }
     LazyLock::force(&START);
@@ -37,11 +38,15 @@ pub fn time<T>(name: &str, f: impl FnOnce() -> T) -> T {
 impl Drop for Span {
     fn drop(&mut self) {
         let end = Instant::now();
-        eprintln!(
-            "[berbr] {:>6}ms  {:>6}ms  {}",
+        let line = format!(
+            "{:>6}ms  {:>6}ms  {}",
             end.duration_since(self.start).as_millis(),
             end.duration_since(*START).as_millis(),
             self.name
         );
+        if *ENABLED {
+            eprintln!("[berbr] {line}");
+        }
+        crate::log::debug(|| format!("span {}", line.trim_start()));
     }
 }

@@ -35,6 +35,24 @@ impl Drop for Permit<'_> {
     }
 }
 
+/// A request's method, URL without its query, status and time, in debug mode.
+/// Never headers or bodies: they carry tokens and private data.
+pub(crate) fn log(
+    method: &str,
+    url: &str,
+    start: std::time::Instant,
+    response: &Result<reqwest::blocking::Response, reqwest::Error>,
+) {
+    crate::log::debug(|| {
+        let url = url.split('?').next().unwrap_or(url);
+        let ms = start.elapsed().as_millis();
+        match response {
+            Ok(r) => format!("{method} {url} {} {ms}ms", r.status()),
+            Err(e) => format!("{method} {url} failed {ms}ms: {e}"),
+        }
+    });
+}
+
 pub(crate) fn acquire() -> Permit<'static> {
     static BUDGET: LazyLock<Budget> = LazyLock::new(|| Budget::new(16));
     BUDGET.acquire()

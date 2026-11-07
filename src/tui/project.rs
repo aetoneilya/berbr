@@ -393,6 +393,7 @@ mod tests {
                 path: PathBuf::from("/v"),
                 task_dirs: vec![PathBuf::from(notes)],
                 new_task_dir: PathBuf::from(notes),
+                own: false,
             },
             repos: Vec::new(),
         })
