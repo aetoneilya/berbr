@@ -361,6 +361,49 @@ fn add_existing_key_creates_named_worktree_without_prompts_or_focus() {
             "{}",
             String::from_utf8_lossy(&reuse.stderr)
         );
+        for args in [
+            vec!["add", "test-0", "--in", "followup"],
+            vec!["add", "--in", "followup"],
+        ] {
+            let calls_before = f.calls().len();
+            let reuse = f
+                .command()
+                .current_dir(&tree)
+                .env_remove("HERDR_WORKSPACE_ID")
+                .args(args)
+                .args(["--agent", kind])
+                .output()
+                .unwrap();
+            assert!(
+                reuse.status.success(),
+                "{}",
+                String::from_utf8_lossy(&reuse.stderr)
+            );
+            assert_eq!(fs::read(&note).unwrap(), before);
+            let git_dir = f.git(&tree, &["rev-parse", "--absolute-git-dir"]);
+            let brief = fs::read_to_string(PathBuf::from(git_dir).join("task.md")).unwrap();
+            assert!(brief.contains(note.to_str().unwrap()));
+            assert!(brief.contains("Other tickets of the task: TEST-1."));
+            assert!(brief.contains("See the task note."));
+            let calls = f.calls();
+            let added = &calls[calls_before..];
+            assert!(added.iter().any(|c| c[1][1] == "tab.new"));
+            assert!(!added.iter().any(
+                |c| c[1][1] == "tab.select" && c[1][2].as_str().unwrap().contains("tb-created")
+            ));
+            let send = added
+                .iter()
+                .find(|c| c[0] == "hc" && c[1][0] == "send")
+                .unwrap();
+            let command = send[1][2].as_str().unwrap();
+            assert!(command.contains(kind));
+            assert!(!command.contains("--resume") && !command.contains("--continue"));
+        }
+        for args in [vec!["add"], vec!["add", "test-0"]] {
+            let error = f.command().args(args).output().unwrap();
+            assert!(!error.status.success());
+            assert!(String::from_utf8_lossy(&error.stderr).contains("berbr add [<task>] <KEY>"));
+        }
         // Missing current context must return an error instead of opening a picker.
         let error = f
             .command()

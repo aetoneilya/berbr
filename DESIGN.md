@@ -197,7 +197,7 @@ The daily workflow is five commands (decided 2026-10-09):
 ```
 berbr                          TUI
 berbr start <task name | KEY>  start new work
-berbr add [<task>] <KEY>       add a ticket to an existing task, with its own worktree tab
+berbr add [<task>] [<KEY>]     new agent tab; KEY is optional only with --in <tree>
 berbr select [<task | KEY>]    go back to existing work
 berbr status                   the table in plain text
 ```
@@ -233,7 +233,7 @@ Two fetches at once in one repo (two tasks started together) race for
 fetch that still fails only warns — the worktree starts from origin as last
 fetched.
 
-### `berbr add [<task>] <KEY> [--in <worktree>] [-n name] [-m text] [--bg]`
+### `berbr add [<task>] [<KEY>] [--in <worktree>] [-n name] [-m text] [--bg]`
 
 Attaches the ticket to the task (writes `tickets:`) and opens a tab for it in
 the task's herdr workspace (creating the workspace if it is gone): a new worktree
@@ -241,6 +241,9 @@ by default, or `--in` an existing worktree of the task (stacked
 MRs that share one worktree) — then only a new agent in that worktree. The agent
 is briefed with the task note plus the ticket. `<task>` defaults to the task of
 the current worktree, otherwise a fuzzy picker.
+The key is optional only with `--in`: a fresh agent gets the task brief and the
+note's tickets stay unchanged. The panel's worktree menu uses this for **New agent**;
+**Resume agent** keeps its existing session behavior.
 
 ### `berbr select [<task | KEY>] [--tree <worktree>] [--session] [--bg]`
 

@@ -608,6 +608,10 @@ export default class Berbr extends View {
         break;
       }
       case "start": case "resume": this.open(row, cx); break;
+      case "new-agent":
+        if (row.task) this.perform(cx, ["add", row.task, "--in", row.tree], {close:true});
+        else this.agentInWorktree(row, cx);
+        break;
       case "review": this.perform(cx, ["review", row.tree], {close:true}); break;
       case "rename": form("rename", {row, prefill:{title:row.title ?? row.label ?? row.task}}); break;
       case "note": close(); this.openNote(row); break;
@@ -623,6 +627,36 @@ export default class Berbr extends View {
       case "copy-terminal": this.copyText(terminal, cx); break;
       case "copy-link": this.copyText(row.url, cx); break;
     }
+  }
+
+  agentInWorktree(row, cx) {
+    if (this.busy || !row.cwd || !row.repo) return;
+    this.busy = true; this.error = null; cx.notify();
+    cx.spawn(async cx => {
+      try {
+        const all = panes();
+        const placed = spaces().filter(space => !space.machine).map(space => {
+          const tabs = new Set((space.tabs ?? []).map(tab => tab.id));
+          const path = all.find(pane => pane.terminal && tabs.has(pane.tab) && pane.cwd)?.cwd || space.folder;
+          return {space, path};
+        });
+        const inside = (path, folder) => path && (path === folder || path.startsWith(folder + "/"));
+        let main = false;
+        for (const {path} of placed) {
+          if (!inside(path, row.repo)) continue;
+          // A linked worktree can live under the main checkout's directory.
+          const result = await exec("git", ["-C", path, "rev-parse", "--show-toplevel"]);
+          if (result.code === 0 && result.stdout.trim() === row.repo) { main = true; break; }
+        }
+        if (!main) run("space.new", {folder:row.repo});
+        const target = placed.find(({path}) => inside(path, row.cwd));
+        const options = {folder:row.cwd, ...(this.agent === "none" ? {} : {argv:[this.agent]})};
+        if (target) run("tab.new", {space:target.space.id, ...options});
+        else run("space.new", options);
+        if (props()?.overlay) closeOverlay(props().overlay);
+      } catch (error) { this.error = String(error.message ?? error); }
+      this.busy = false; cx.notify();
+    });
   }
 
   copyText(value, cx) {

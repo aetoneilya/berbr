@@ -101,7 +101,7 @@ resumes and launches after worktree preparation, so each pane owns its runtime.
 ```
 berbr                         the TUI (also `berbr tui`)
 berbr start [<task|KEY>]      new task: note, herdr workspace, worktree tab with claude
-berbr add [<task>] <KEY>      add a ticket to a task, with its own worktree tab
+berbr add [<task>] [<KEY>]    new agent tab; KEY is optional only with --in <tree>
 berbr attach <KEY> [<task>]   put a ticket into a task without a worktree
 berbr select [<task|KEY>]     go back to a task: its agent, or claude resuming its session; a task with nothing yet gets its first worktree
 berbr note "<text>"           (for agents) append a finding to the note's "Agent notes"
@@ -193,11 +193,18 @@ Agents can run `berbr add [<task>] DEMO-1 --name followup --agent codex
 task's Herdr space. The task defaults to the current worktree/space. An existing
 ticket requires `--name` for a new worktree or `--in <tree>` to reuse one; an
 existing path requires `--in`. Without Jira, supply `--name` or `--in`.
+With `--in`, the key is optional: `berbr add [<task>] --in <tree>` starts a fresh
+agent briefed from the task without changing its tickets. The panel's worktree
+menu uses this for **New agent**; **Resume agent** continues the last session.
 Without a TTY, `add` never prompts and automatically behaves like `--bg`, keeping
 the caller's focus. It waits for worktree creation and the agent launch request,
 then prints one line with the path, tab and terminal IDs. Errors exit nonzero
 with one error line. Herdr is required; a failed launch leaves the worktree for
 inspection/retry with `--in`.
+
+On a worktree without a task, **New agent** opens the configured agent without a
+brief (or a shell when the agent is `none`). It reuses the worktree's live space
+and creates an unnamed main-checkout space if needed so the sidebar nests them.
 
 New task checkouts reserve a unique name before launch. A slug collision adds
 its task ID (then a counter if needed); a new task never reuses another task's

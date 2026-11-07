@@ -20,11 +20,13 @@ test("task menu offers a live space instead of starting work and hides unavailab
 
 test("active, merged and loose worktrees all offer removal with a danger separator", () => {
   const mr = {kind:"mr", url:"https://gitlab.example/demo/-/merge_requests/1", state:"opened"};
-  const tree = {kind:"tree", tree:"demo", task:"task", branch:"demo-branch", cwd:"/home/dev/demo", children:[mr]};
-  assert.deepEqual(rowMenu(tree).map(item => item.id), ["resume", "review", "mr", "copy-path", "copy-branch", "remove-tree"]);
+  const tree = {kind:"tree", tree:"demo", task:"task", branch:"demo-branch", cwd:"/home/dev/demo", repo:"/home/dev/repo", children:[mr]};
+  assert.deepEqual(rowMenu(tree).map(item => item.id), ["resume", "new-agent", "review", "mr", "copy-path", "copy-branch", "remove-tree"]);
   assert.deepEqual(rowMenu(tree).at(-1), {id:"remove-tree", label:"Remove worktree…", danger:true, separatorBefore:true});
   assert.ok(rowMenu({...tree, merged:true}).some(item => item.id === "remove-tree"));
-  assert.deepEqual(rowMenu({...tree, task:null}).map(item => item.id), ["mr", "copy-path", "copy-branch", "remove-tree"]);
+  assert.deepEqual(rowMenu({...tree, task:null}).map(item => item.id), ["new-agent", "mr", "copy-path", "copy-branch", "remove-tree"]);
+  for (const missing of [{cwd:null}, {repo:null}, {cwd:null, repo:null}])
+    assert.ok(!rowMenu({...tree, task:null, ...missing}).some(item => item.id === "new-agent"));
   assert.deepEqual(rowMenu({kind:"tree", tree:"loose", body:"/home/dev/loose\n +2"}).map(item => item.id), ["copy-path", "remove-tree"]);
   assert.ok(!rowMenu({kind:"tree", tree:"loose"}).some(item => item.id === "copy-path"));
   assert.ok(rowMenu({kind:"tree", tree:"demo"}, {mr}).some(item => item.id === "mr"));

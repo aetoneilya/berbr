@@ -45,7 +45,10 @@ export const panes = () => state.panes ?? [];
 export const theme = () => new Proxy({}, {get:(_target, name) => name});
 export const shared = key => state.shared.get(key);
 export const setShared = (key, value) => state.shared.set(key, value);
-export const run = (...args) => state.calls.push(args);
+export const run = (...args) => {
+  state.calls.push(args);
+  return state.runHandler?.(...args);
+};
 export const openOverlay = spec => state.overlays.push(spec);
 export const closeOverlay = id => state.calls.push(["closeOverlay", id]);
 export const notify = message => state.notices.push(message);

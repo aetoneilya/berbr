@@ -25,6 +25,8 @@ export function rowMenu(row, ctx = {}) {
     if (row.task && !row.done) add("done", "Close task…", {danger:true, separatorBefore:items.length > 0});
   } else if (row.kind === "tree") {
     if (row.task) add("resume", "Resume agent");
+    if (row.task && row.tree) add("new-agent", "New agent");
+    if (!row.task && row.cwd && row.repo) add("new-agent", "New agent");
     if (row.task && row.tree) add("review", "Review");
     const mr = ctx.mr ?? row.children?.find(child => child.kind === "mr");
     if (mr?.url) add("mr", "Open MR");

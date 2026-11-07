@@ -245,8 +245,8 @@ fn create_ticket(config: &Config, title: &str) -> Result<String, String> {
         .map_err(err)
 }
 
-/// `berbr add [<task>] <KEY>`: the ticket joins the task and gets a tab in the
-/// task's herdr workspace, in a new worktree or `--in` one the task has.
+/// `berbr add [<task>] [<KEY>]`: a new agent tab in the task's herdr workspace,
+/// in a new worktree or `--in` one the task has. KEY is optional only with `--in`.
 pub(in crate::cli) fn cli_add(config: &Config, args: AddArgs) -> Result<(), String> {
     add(config, args, &mut Terminal).map_err(|e| e.lines().collect::<Vec<_>>().join(" "))
 }
@@ -271,11 +271,15 @@ fn add_with(
         bg,
     } = args;
     let (task_arg, key) = match args.as_slice() {
-        [key] => (None, key.clone()),
-        [task, key] => (Some(task.clone()), key.clone()),
+        [] if in_tree.is_some() => (None, None),
+        [task] if in_tree.is_some() && !is_ticket_key(task) => (Some(task.clone()), None),
+        [key] => (None, Some(key.clone())),
+        [task, key] => (Some(task.clone()), Some(key.clone())),
         _ => return Err("berbr add [<task>] <KEY>".to_string()),
     };
-    if !is_ticket_key(&key) {
+    if let Some(key) = &key
+        && !is_ticket_key(key)
+    {
         return Err(format!(
             "\"{key}\" is not a ticket key: berbr add [<task>] <KEY>"
         ));
@@ -287,16 +291,20 @@ fn add_with(
         .map(|&i| (table.tree(i).repo.clone(), table.tree(i).wt.clone()))
         .collect();
     let mut task = table.tasks.swap_remove(row).task;
-    if task.tickets.contains(&key) && name.is_none() && in_tree.is_none() {
+    if let Some(key) = &key
+        && task.tickets.contains(key)
+        && name.is_none()
+        && in_tree.is_none()
+    {
         return Err(format!(
             "{key} is already in task \"{}\"; pass --name <name> for a new worktree or --in <tree> for an existing one",
             task.name
         ));
     }
-    let issue = config
-        .jira
-        .as_ref()
-        .map(|_| fetch_issue(config, &key))
+    let issue = key
+        .as_deref()
+        .filter(|_| config.jira.is_some())
+        .map(|key| fetch_issue(config, key))
         .transpose()?;
     let main = match &in_tree {
         Some(existing) => {
@@ -349,7 +357,7 @@ fn add_with(
                 .or_else(|| issue.as_ref().map(name_from_issue))
                 .ok_or("pass --name <name> when Jira is not configured")?;
             worktree::validate_name(&wt_name).map_err(err)?;
-            let branch = branch_name(config, Some(&key), &wt_name);
+            let branch = branch_name(config, key.as_ref(), &wt_name);
             let tree = worktree::worktree_dir(&main, &config.workflow.worktree_dir, &wt_name);
             if tree.exists() {
                 return Err(format!(
@@ -367,11 +375,13 @@ fn add_with(
         worktree::create_new_worktree(&main, &config.workflow.worktree_dir, &wt_name, &branch)
             .map_err(err)?;
     }
-    if !task.tickets.contains(&key) {
+    if let Some(key) = &key
+        && !task.tickets.contains(key)
+    {
         let _lock = crate::vault::lock().map_err(err)?;
         task.note.reload().map_err(err)?;
         task = Task::from_note(task.note);
-        if !task.tickets.contains(&key) {
+        if !task.tickets.contains(key) {
             task.tickets.push(key.clone());
             task.note.set("tickets", list(&task.tickets));
             task.note.save().map_err(err)?;

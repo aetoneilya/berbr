@@ -20,7 +20,7 @@ function setup({data = snapshot, props = {}, saved = null, collapsed = null, liv
   if (saved) storage.set("berbr.expanded", JSON.stringify(saved));
   if (collapsed) storage.set("berbr.collapsed", JSON.stringify(collapsed));
   Object.assign(state, {focused:focus, props, spaces:liveSpaces, agents:[], panes:[], shared:new Map(), calls:[], overlays:[], notices:[], execs:[], execResult:null,
-    existsCalls:[], existsError:null, reads:[], readResult:null, readError:null, watches:[], watchers:[], hcCalls:[], hcResult:null, hcError:null, hcHandler:null, execHandler:null, files:null, writes:[], writeError:null, writeResult:null});
+    existsCalls:[], existsError:null, reads:[], readResult:null, readError:null, watches:[], watchers:[], hcCalls:[], hcResult:null, hcError:null, hcHandler:null, execHandler:null, runHandler:null, files:null, writes:[], writeError:null, writeResult:null});
   const jobs = [], timers = [];
   const handle = {focused:true, focus() {this.focused = true;}, is_focused() {return this.focused;}};
   const cx = {notify() {}, stop_propagation() {}, focus_handle:() => handle,
@@ -2522,6 +2522,141 @@ test("menu arrows wrap, Enter dispatches the highlighted item, and Escape only c
   assert.equal(jobs.length, 0);
   key("escape");
   assert.deepEqual(state.calls.at(-1), ["closeOverlay", "menu"]);
+});
+
+test("new agent menu dispatch adds an agent in the existing worktree and closes the overlay", async () => {
+  const row = {kind:"tree", tree:"demo-tree", task:"demo"};
+  const {view, cx, jobs} = setup({props:{form:"menu", row, overlay:"menu"}});
+  const calls = [];
+  view.cli = async args => {calls.push(args); return "Started";};
+  view.chooseMenu(cx, "new-agent");
+  assert.equal(jobs.length, 1);
+  await jobs.shift()(cx);
+  assert.deepEqual(calls, [["add", "demo", "--in", "demo-tree"]]);
+  assert.ok(state.calls.some(call => call[0] === "closeOverlay" && call[1] === "menu"));
+});
+
+test("a loose worktree creates unnamed main and worktree spaces with the configured plain agent", async () => {
+  const row = {kind:"tree", tree:"loose", cwd:"/home/dev/loose", repo:"/home/dev/repo", task:null};
+  for (const agent of ["codex", "claude", "none"]) {
+    const {view, cx, jobs} = setup({props:{form:"menu", row, agent, overlay:"menu"}});
+    view.chooseMenu(cx, "new-agent");
+    assert.equal(view.busy, true);
+    view.chooseMenu(cx, "new-agent");
+    assert.equal(jobs.length, 1, "a second click cannot launch another agent while busy");
+    await jobs.shift()(cx);
+    assert.deepEqual(state.calls, [
+      ["space.new", {folder:row.repo}],
+      ["space.new", {folder:row.cwd, ...(agent === "none" ? {} : {argv:[agent]})}],
+      ["closeOverlay", "menu"]]);
+    assert.deepEqual(state.execs, []);
+    assert.equal(view.busy, false);
+    assert.equal(view.error, null);
+  }
+});
+
+test("a loose worktree reuses spaces by live terminal cwd rather than their original folder", async () => {
+  const row = {kind:"tree", tree:"loose", cwd:"/home/dev/loose", repo:"/home/dev/repo"};
+  const liveSpaces = [
+    {id:"main", folder:"/old/main", tabs:[{id:"main-tab"}]},
+    {id:"worktree", folder:"/old/worktree", tabs:[{id:"tree-tab"}]}];
+  for (const agent of ["claude", "none"]) {
+    const {view, cx, jobs} = setup({props:{form:"menu", row, agent, overlay:"menu"}, liveSpaces});
+    state.panes = [
+      {terminal:"main-shell", tab:"main-tab", cwd:row.repo},
+      {terminal:"tree-shell", tab:"tree-tab", cwd:row.cwd + "/src"}];
+    state.execResult = {code:0, stdout:row.repo + "\n", stderr:""};
+    view.chooseMenu(cx, "new-agent");
+    await jobs.shift()(cx);
+    assert.deepEqual(state.execs, [["git", ["-C", row.repo, "rev-parse", "--show-toplevel"]]]);
+    assert.deepEqual(state.calls, [
+      ["tab.new", {space:"worktree", folder:row.cwd, ...(agent === "none" ? {} : {argv:[agent]})}],
+      ["closeOverlay", "menu"]]);
+  }
+});
+
+test("a worktree inside the repo directory is not mistaken for the main checkout space", async () => {
+  for (const directory of [".herdr", ".claude"]) {
+    const row = {kind:"tree", tree:"loose", repo:"/home/dev/repo", cwd:`/home/dev/repo/${directory}/worktrees/loose`};
+    const {view, cx, jobs} = setup({props:{form:"menu", row, agent:"codex", overlay:"menu"},
+      liveSpaces:[{id:"tree", folder:row.repo, tabs:[{id:"tree-tab"}]}]});
+    const path = row.cwd + "/src";
+    state.panes = [{terminal:"tree-shell", tab:"tree-tab", cwd:path}];
+    state.execResult = {code:0, stdout:row.cwd + "\n", stderr:""};
+    view.chooseMenu(cx, "new-agent");
+    await jobs.shift()(cx);
+    assert.deepEqual(state.execs, [["git", ["-C", path, "rev-parse", "--show-toplevel"]]]);
+    assert.deepEqual(state.calls, [
+      ["space.new", {folder:row.repo}],
+      ["tab.new", {space:"tree", folder:row.cwd, argv:["codex"]}],
+      ["closeOverlay", "menu"]]);
+  }
+});
+
+test("loose worktree space placement falls back to folder and skips remote and sibling paths", async () => {
+  const row = {kind:"tree", tree:"loose", repo:"/home/dev/repo", cwd:"/home/dev/loose"};
+  const {view, cx, jobs} = setup({props:{form:"menu", row, overlay:"menu"}, liveSpaces:[
+    {id:"remote", machine:"server", folder:row.repo},
+    {id:"sibling", folder:row.repo + "-other"},
+    {id:"tree-sibling", folder:row.cwd + "-other"},
+    {id:"main", folder:row.repo + "/src", tabs:[{id:"main-tab"}]},
+    {id:"tree", folder:row.cwd}]});
+  state.panes = [{terminal:null, mod:"files", tab:"main-tab", cwd:"/elsewhere"}];
+  state.execResult = {code:0, stdout:row.repo + "\n", stderr:""};
+  view.chooseMenu(cx, "new-agent");
+  await jobs.shift()(cx);
+  assert.deepEqual(state.execs, [["git", ["-C", row.repo + "/src", "rev-parse", "--show-toplevel"]]]);
+  assert.deepEqual(state.calls, [
+    ["tab.new", {space:"tree", folder:row.cwd, argv:["codex"]}], ["closeOverlay", "menu"]]);
+});
+
+test("only a space's first terminal places it in a checkout", async () => {
+  const row = {kind:"tree", tree:"loose", repo:"/home/dev/repo", cwd:"/home/dev/loose"};
+  const {view, cx, jobs} = setup({props:{form:"menu", row, overlay:"menu"},
+    liveSpaces:[{id:"elsewhere", folder:row.cwd, tabs:[{id:"first"}, {id:"second"}]}]});
+  state.panes = [
+    {terminal:"first", tab:"first", cwd:"/elsewhere"},
+    {terminal:"second", tab:"second", cwd:row.cwd}];
+  view.chooseMenu(cx, "new-agent");
+  await jobs.shift()(cx);
+  assert.deepEqual(state.execs, []);
+  assert.deepEqual(state.calls, [
+    ["space.new", {folder:row.repo}], ["space.new", {folder:row.cwd, argv:["codex"]}],
+    ["closeOverlay", "menu"]]);
+});
+
+test("an unsuccessful git probe does not identify a main checkout space", async () => {
+  const row = {kind:"tree", tree:"loose", repo:"/home/dev/repo", cwd:"/home/dev/loose"};
+  const {view, cx, jobs} = setup({props:{form:"menu", row, overlay:"menu"},
+    liveSpaces:[{id:"gone", folder:row.repo + "/gone"}]});
+  state.execResult = {code:128, stdout:"", stderr:"cannot change directory"};
+  view.chooseMenu(cx, "new-agent");
+  await jobs.shift()(cx);
+  assert.deepEqual(state.calls, [
+    ["space.new", {folder:row.repo}], ["space.new", {folder:row.cwd, argv:["codex"]}],
+    ["closeOverlay", "menu"]]);
+});
+
+test("loose worktree launch failures stay visible and clear busy without closing the menu", async () => {
+  const row = {kind:"tree", tree:"loose", repo:"/home/dev/repo", cwd:"/home/dev/loose"};
+  for (const failure of ["exec", "space.new", "tab.new"]) {
+    const {view, cx, jobs} = setup({props:{form:"menu", row, overlay:"menu"}, liveSpaces:[
+      {id:"main", folder:row.repo}, {id:"tree", folder:row.cwd}]});
+    let notifications = 0;
+    cx.notify = () => notifications++;
+    state.execHandler = async () => {
+      if (failure === "exec") throw new Error("Could not run git");
+      return {code:0, stdout:failure === "space.new" ? row.cwd : row.repo, stderr:""};
+    };
+    state.runHandler = action => { if (action === failure) throw new Error("Could not open checkout"); };
+    view.chooseMenu(cx, "new-agent");
+    await jobs.shift()(cx);
+    assert.equal(view.error, failure === "exec" ? "Could not run git" : "Could not open checkout");
+    assert.equal(view.busy, false);
+    assert.equal(notifications, 2);
+    assert.ok(!state.calls.some(call => call[0] === "closeOverlay"));
+    if (failure === "exec") assert.deepEqual(state.calls, []);
+  }
 });
 
 test("active worktree menu dispatch opens the existing remove dialog without running done", () => {

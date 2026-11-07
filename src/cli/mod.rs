@@ -57,7 +57,8 @@ enum CliCommands {
     /// `berbr start DEMO-123`: the same, the task named after the ticket's summary
     Start(StartArgs),
     /// Open a worktree tab and a new agent in the task's Herdr space. Use --name
-    /// for another branch of a ticket already in the task. Without a TTY, never
+    /// for another branch of a ticket already in the task, or --in for a fresh
+    /// agent in an existing worktree (KEY is optional with --in). Without a TTY, never
     /// prompts or focuses the new tab; success prints its path, tab and terminal.
     Add(AddArgs),
     /// Put a ticket into a task without starting work on it (no worktree)
@@ -198,8 +199,8 @@ pub(crate) enum TaskCommand {
 
 #[derive(Args, Debug, Default)]
 pub(crate) struct AddArgs {
-    /// [<task ID or title>] <KEY>; defaults to the current worktree/space's task
-    #[arg(num_args = 1..=2, required = true)]
+    /// [<task>] [<KEY>]; task defaults to the current worktree/space; KEY is optional only with --in
+    #[arg(num_args = 0..=2)]
     pub(crate) args: Vec<String>,
     /// Run the agent in this existing worktree of the task (stacked MRs)
     #[arg(long = "in", conflicts_with = "name")]
