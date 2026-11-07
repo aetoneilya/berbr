@@ -152,7 +152,7 @@ test("close plan finds deep blockers, deduplicates references and marks lost cha
 
 test("fixture tasks and header-delimited work are all grouped", () => {
   const sections = groupSections(snapshot.rows);
-  assert.equal(section(sections, "progress").rows.length, 9);
+  assert.equal(section(sections, "progress").rows.filter(row => row.kind === "task").length, 9);
   assert.equal(section(sections, "todo").rows.length, 4);
   assert.equal(section(sections, "todo").rows[0].state, "idea");
   assert.equal(section(sections, "needs").rows.length, 0);
@@ -162,7 +162,7 @@ test("fixture tasks and header-delimited work are all grouped", () => {
   const start = snapshot.rows.findIndex(row => row.label === "no task");
   const end = snapshot.rows.findIndex(row => row.label === "assigned to me in Jira");
   const loose = snapshot.rows.slice(start + 1, end);
-  assert.deepEqual(section(sections, "notInTask").rows, loose.filter(row => row.kind === "ticket" && !isClosedTicket(row)));
+  assert.deepEqual(section(sections, "progress").rows.filter(row => row.kind !== "task"), loose.filter(row => row.kind === "ticket" && !isClosedTicket(row)));
   assert.deepEqual(section(sections, "cleanup").rows, loose.filter(row => row.kind !== "ticket" || isClosedTicket(row)));
 });
 
@@ -251,10 +251,10 @@ test("live agents move tasks into attention or running groups; stale agents do n
   for (const status of ["blocked", "done"]) {
     const sections = groupSections(rows, [{address:"terminal-1", status}]);
     assert.equal(section(sections, "needs").rows[0].id, task.id);
-    assert.equal(section(sections, "progress").rows.length, 8);
+    assert.equal(section(sections, "progress").rows.filter(row => row.kind === "task").length, 8);
   }
   assert.equal(section(groupSections(rows, [{address:"terminal-1", status:"working"}]), "running").rows[0].id, task.id);
-  assert.equal(section(groupSections(rows, [{address:"other", status:"blocked"}]), "progress").rows.length, 9);
+  assert.equal(section(groupSections(rows, [{address:"other", status:"blocked"}]), "progress").rows.filter(row => row.kind === "task").length, 9);
   const done = { ...task, done:true };
   assert.equal(section(groupSections([done], [{address:"terminal-1", status:"blocked"}]), "done").rows[0], done);
 });
@@ -423,7 +423,7 @@ test("task details handle empty content, direct MRs and bounded plain excerpts",
 
 test("loose fixture work splits into active tickets and explained cleanup", () => {
   const sections = groupSections(snapshot.rows);
-  const active = section(sections, "notInTask").rows;
+  const active = section(sections, "progress").rows.filter(row => row.kind !== "task");
   assert.deepEqual(active.map(row => [row.target, looseReason(row)]), [
     ["DEMO-61", "merged · worktree left"],
     ["DEMO-42", "worktree demo-checkout-11"],
@@ -450,7 +450,7 @@ test("unknown tickets stay active; cleanup reasons handle both leftovers, zero M
     {kind:"tree", state:"active"}, {id:"mr", kind:"mr", state:"opened"},
   ]};
   const sections = groupSections([{kind:"header", label:"no task", children:[unknown, closed]}]);
-  assert.deepEqual(section(sections, "notInTask").rows, [unknown]);
+  assert.deepEqual(section(sections, "progress").rows, [unknown]);
   assert.deepEqual(section(sections, "cleanup").rows, [closed]);
   assert.equal(looseReason(unknown), "ticket open");
   assert.equal(looseReason(closed), "ticket closed · worktree left · 1 MR open");
@@ -663,7 +663,7 @@ test("panel memoization survives focus redraws and invalidates live, snapshot an
 test("all section kinds are collapsible and filtering temporarily expands them without losing counts", () => {
   const data = {rows:[{id:"task", kind:"task", title:"Demo", children:[]}]};
   const sections = new PanelModel().update(data).sections;
-  assert.deepEqual(sections.map(section => section.id), ["needs", "running", "progress", "todo", "notInTask", "cleanup", "done"]);
+  assert.deepEqual(sections.map(section => section.id), ["needs", "running", "progress", "todo", "cleanup", "done"]);
   assert.ok(sections.every(section => section.collapsible));
   const collapsed = new Set(sections.map(section => section.id));
   const hidden = new PanelModel().update(data, [], [], {collapsed}).visible;
@@ -674,7 +674,7 @@ test("all section kinds are collapsible and filtering temporarily expands them w
   const filtered = new PanelModel().update(data, [], [], {collapsed, query:"demo"}).visible;
   assert.equal(filtered[0].expanded, true);
   assert.equal(visibleRows(filtered)[0].id, "task");
-  assert.equal(collapsed.size, 7);
+  assert.equal(collapsed.size, 6);
 });
 
 test("task excerpts stop before machine sections, including when they are the whole body", () => {

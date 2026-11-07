@@ -20,7 +20,7 @@ function setup({data = snapshot, props = {}, saved = null, collapsed = null, liv
   if (saved) storage.set("berbr.expanded", JSON.stringify(saved));
   if (collapsed) storage.set("berbr.collapsed", JSON.stringify(collapsed));
   Object.assign(state, {focused:focus, props, spaces:liveSpaces, agents:[], panes:[], shared:new Map(), calls:[], overlays:[], notices:[], execs:[], execResult:null,
-    existsCalls:[], existsError:null, reads:[], readResult:null, readError:null, watches:[], watchers:[], hcCalls:[], hcResult:null, hcError:null, hcHandler:null, files:null, writes:[], writeError:null, writeResult:null});
+    existsCalls:[], existsError:null, reads:[], readResult:null, readError:null, watches:[], watchers:[], hcCalls:[], hcResult:null, hcError:null, hcHandler:null, execHandler:null, files:null, writes:[], writeError:null, writeResult:null});
   const jobs = [], timers = [];
   const handle = {focused:true, focus() {this.focused = true;}, is_focused() {return this.focused;}};
   const cx = {notify() {}, stop_propagation() {}, focus_handle:() => handle,
@@ -781,7 +781,8 @@ test("small ticket dialogs retain CLI verbs and show the busy action's spinner",
 
 test("loose sections default to active work visible and Cleanup collapsed; old Unsorted state migrates", () => {
   let {view, cx} = setup();
-  assert.equal(view.sections().find(section => section.id === "notInTask").expanded, true);
+  assert.ok(!view.sections().some(section => section.id === "notInTask"));
+  assert.ok(view.sections().find(section => section.id === "progress").rows.some(row => row.kind === "ticket"));
   assert.equal(view.sections().find(section => section.id === "cleanup").expanded, false);
   assert.equal(view.rows().filter(row => row.id?.startsWith("loose:")).length, 6);
   ({view, cx} = setup({collapsed:["inbox", "unsorted"]}));
@@ -952,6 +953,26 @@ test("task IDs, titles and ticket aliases cannot change a removal target", async
   }
 });
 
+test("Delete anyway appears only with blockers and is the one path that passes --force", async () => {
+  const tree = {kind:"tree", tree:"branch", cwd:"/home/dev/demo/worktrees/branch", body:"/home/dev/demo/worktrees/branch\n +3"};
+  let {view, cx, jobs} = setup({props:{form:"remove-tree", tree:{kind:"tree", tree:"clean"}, rows:[]}});
+  assert.equal(byId(view.render(cx), "remove-tree-force"), undefined);
+  ({view, cx, jobs} = setup({props:{form:"remove-tree", tree, rows:[], overlay:"confirm"}}));
+  const args = [];
+  view.cli = async values => {args.push(values); return "removed branch";};
+  click(byId(view.render(cx), "remove-tree"), cx);
+  await jobs.shift()(cx);
+  click(byId(view.render(cx), "remove-tree-force"), cx);
+  assert.equal(view.busyAction, "remove-tree-force");
+  await jobs.shift()(cx);
+  assert.deepEqual(args, [["done", "--tree", tree.cwd, "--yes"], ["done", "--tree", tree.cwd, "--yes", "--force"]]);
+  ({view, cx, jobs} = setup({props:{form:"remove-tree", tree:{kind:"tree", tree:"clean"}, rows:[]}}));
+  view.cli = async () => { throw new Error("\"clean\" is not finished: clean: unpushed commits and no MR"); };
+  view.submitRemoveTree(cx);
+  await jobs.shift()(cx);
+  assert.ok(byId(view.render(cx), "remove-tree-force"));
+});
+
 test("remove confirmation displays CLI blockers and retains the form", async () => {
   const {view, cx, jobs} = setup({props:{form:"remove-tree", tree:{tree:"branch"}, rows:[]}});
   view.cli = async () => { throw new Error("Worktree has uncommitted changes"); };
@@ -1031,7 +1052,8 @@ test("loose worktrees never select their tree name, including children of loose 
   const args = [];
   view.cli = async values => {args.push(values); return "";};
   view.collapsed.clear();
-  const looseRows = view.sections().filter(section => ["cleanup", "notInTask"].includes(section.id)).flatMap(section => section.rows);
+  const looseRows = view.sections().filter(section => ["cleanup", "progress"].includes(section.id)).flatMap(section => section.rows)
+    .filter(row => row.kind !== "task");
   const trees = looseRows.flatMap(row => row.kind === "tree" ? [row] : (row.children ?? []).filter(child => child.kind === "tree"));
   assert.ok(trees.length > 1);
   for (const tree of trees) {
@@ -1285,7 +1307,7 @@ test("task Note opens a keyed Herdr window without executing open", () => {
   view.showDetails(task, cx);
   click(byId(view.render(cx), "task/action/note"), cx);
   assert.deepEqual(state.overlays, [{mod:"berbr", kind:"window", key:"berbr-note", width:720, height:0.75,
-    props:{form:"note", path:task.note, title:task.title, tickets:[]}}]);
+    props:{form:"note", path:task.note, title:task.title, vault:false, tickets:[]}}]);
   view.openNote({note:"/notes/other.md", title:"Other"});
   assert.equal(state.overlays.at(-1).key, "berbr-note");
   assert.equal(state.overlays.at(-1).props.path, "/notes/other.md");
@@ -1328,7 +1350,7 @@ test("snapshot previews lead to full note viewing and editing, including machine
 
 test("note window loads selectable markdown and wires title bar controls and Escape", async () => {
   const path = "/notes/My task #1.md";
-  const {view, cx, jobs, key} = setup({props:{form:"note", path, title:"My task", overlay:"note-window"}});
+  const {view, cx, jobs, key} = setup({props:{form:"note", path, title:"My task", overlay:"note-window", vault:true}});
   assert.ok(text(view.render(cx)).includes("Loading note…"));
   state.readResult = "---\ntitle: Hidden\n---\n# Visible\n\n[[Page|Link]]\n![[image.png]]";
   await jobs.shift()(cx);
@@ -1714,14 +1736,14 @@ function sectionPanel() {
 test("every section header toggles and persists, with the specified initial expansion", () => {
   const {view, cx} = sectionPanel();
   const defaults = new Map([["needs", true], ["running", true], ["progress", true], ["todo", true],
-    ["notInTask", true], ["cleanup", false], ["done", true]]);
+    ["cleanup", false], ["done", true]]);
   assert.equal(view.sections().length, defaults.size);
   for (const [id, expanded] of defaults) {
     let section = view.sections().find(section => section.id === id);
     assert.equal(section.expanded, expanded, id);
     let header = byId(view.render(cx), `section-${id}`);
     assert.ok(text(header).includes(`chevron-${expanded ? "down" : "right"}.svg`), id);
-    assert.equal(text(header.nodes.at(-1)), id === "todo" ? "2" : "1");
+    assert.equal(text(header.nodes.at(-1)), ["todo", "progress"].includes(id) ? "2" : "1");
     view.handle.focused = false;
     click(header, cx);
     assert.equal(view.handle.focused, true);
@@ -1742,7 +1764,7 @@ test("every section header toggles and persists, with the specified initial expa
 
 test("stored section ids migrate together, preserving every new id and removing unknowns", () => {
   const saved = ["needs", "running", "progress", "ideas", "done", "notInTask", "unsorted", "inbox", "unknown", "needs"];
-  const expected = ["needs", "running", "progress", "todo", "done", "notInTask", "cleanup"];
+  const expected = ["needs", "running", "progress", "todo", "done", "cleanup"];
   let {view} = setup({collapsed:saved});
   assert.deepEqual([...view.collapsed], expected);
   assert.deepEqual(JSON.parse(storage.get("berbr.collapsed")), expected);
@@ -1771,7 +1793,7 @@ test("Todo renders idea rings and assigned ticket icons together; hover Make tas
   assert.equal(text(header.nodes.at(-1)), "2");
   assert.equal(list.nodes[index + 1].attributes.id[0], "task-idea-task");
   assert.equal(list.nodes[index + 2].attributes.id[0], "loose-assigned-ticket");
-  assert.equal(list.nodes[index + 3].attributes.id[0], "section-notInTask");
+  assert.equal(list.nodes[index + 3].attributes.id[0], "section-cleanup");
   const idea = byId(list, "task-idea-task");
   assert.equal(idea.nodes[0].nodes[0].nodes[0].attributes.border[0], 1.5);
   const ticket = byId(list, "loose-assigned-ticket");
@@ -2161,6 +2183,49 @@ test("cmd-k opens a centered dialog; task/tree/MR jumps reveal the section, expa
     assert.ok(!state.calls.some(call => call[0] === "scroll"));
     assert.deepEqual(state.execs, []);
   }
+});
+
+test("a project chosen in the picker switches the panel outside render", async () => {
+  const {view, cx} = setup();
+  state.shared.set("berbr.project", "other");
+  // As in Herdr.app: spawn runs its body at once, and notifying while rendering throws.
+  let rendering = false;
+  const started = [];
+  const real = {...cx, notify() { if (rendering) throw new Error("notify during render"); },
+    spawn: fn => { started.push(fn(real)); }};
+  real.sleep = async () => { await new Promise(resolve => setTimeout(resolve, 0)); };
+  rendering = true;
+  view.render(real);
+  rendering = false;
+  assert.equal(started.length, 1);
+  await started.shift();
+  assert.equal(view.project, "other");
+  assert.ok(state.execs.some(([, args]) => args.includes("app-snapshot") && args[args.indexOf("--project") + 1] === "other"),
+    "the switch loads the new project itself, not on the next 30-second refresh");
+});
+
+test("choosing a project mid-load starts it at once and drops the old project's snapshot", async () => {
+  const {view, cx, jobs} = setup();
+  const pending = [];
+  state.execHandler = (_program, args) => new Promise(resolve => pending.push({project:args[args.indexOf("--project") + 1], resolve}));
+  view.project = "demo";
+  view.refresh(cx);
+  const old = jobs.shift()(cx);
+  assert.equal(view.loading, true);
+  state.shared.set("berbr.project", "other");
+  view.render(cx);
+  await jobs.shift()(cx);
+  const next = jobs.shift()(cx);
+  assert.deepEqual(pending.map(run => run.project), ["demo", "other"]);
+  const reply = project => ({code:0, stderr:"", stdout:JSON.stringify({project, rows:[], projects:[{name:"demo"}, {name:"other"}]})});
+  pending[1].resolve(reply("other"));
+  await next;
+  assert.equal(view.data.project, "other");
+  pending[0].resolve(reply("demo"));
+  await old;
+  assert.equal(view.project, "other");
+  assert.equal(view.data.project, "other");
+  assert.equal(state.shared.get("berbr.project"), "other");
 });
 
 test("jump opens loose links, focuses agents, switches projects and closes on Escape", async () => {
@@ -2553,7 +2618,8 @@ test("tree confirmation states known blockers and that pushed unmerged commits m
   const rendered = text(view.render(cx));
   assert.ok(rendered.includes("Removal will be refused: 2 uncommitted change(s)"));
   assert.ok(rendered.includes("Removal will be refused: the MR is open"));
-  assert.ok(rendered.includes("Uncommitted files are never discarded here"));
+  assert.ok(rendered.includes("Remove never discards uncommitted files"));
+  assert.ok(rendered.includes("2 uncommitted change(s) are lost for good"));
   assert.ok(rendered.includes("Unmerged commits already pushed to origin can be removed locally"));
 });
 
@@ -2691,7 +2757,9 @@ test("V08/V09: Jump, Projects and Attach have bounded scroll bodies and keyboard
   for (const [form, listId] of [["jump", "jump-results"], ["projects", "project-results"], ["attach-task", "attach-results"]]) {
     const {view, cx, jobs, key} = setup({props:{form, projects:rows, tasks:rows, snapshot:{rows}, ticket:"DEMO-1", overlay:"picker"}});
     let root = view.render(cx), list = byId(root, listId);
-    assert.ok(list.attributes.flex_1); assert.equal(list.attributes.min_h[0], 0);
+    // Jump is a dialog with a height; the pickers are content-sized popups
+    if (form === "jump") { assert.ok(list.attributes.flex_1); assert.equal(list.attributes.min_h[0], 0); }
+    else assert.ok(list.attributes.h[0] > 0 && !list.attributes.flex_1);
     assert.ok(list.attributes.overflow_y_scrollbar);
     for (let index = 0; index < 40; index++) key("down");
     root = view.render(cx); list = byId(root, listId);
@@ -2786,4 +2854,92 @@ test("an MR link without a ticket starts with its number: the spinner slot trail
   const slot = link.nodes.at(-1);
   assert.deepEqual(slot.attributes.size, [11]);
   assert.ok(slot.attributes.invisible);
+});
+
+test("a command from a removed worktree's terminal runs from the project instead", async () => {
+  const {view} = setup({props:{opening:{cwd:"/home/dev/demo/.herdr/worktrees/gone"}}});
+  view.project = "demo";
+  view.data = {projects:[{name:"demo", cwd:"/home/dev/demo"}], rows:[]};
+  state.execHandler = async (_program, _args, options) => {
+    if (options.cwd?.endsWith("/gone")) throw new Error("herdr.exec: cannot run zsh: No such file or directory (os error 2)");
+    return {code:0, stdout:"ok", stderr:""};
+  };
+  assert.equal(await view.cli(["app-snapshot"]), "ok");
+  assert.deepEqual(state.execs.map(call => call[2].cwd), ["/home/dev/demo/.herdr/worktrees/gone", "/home/dev/demo"]);
+  state.execHandler = async () => { throw new Error("herdr.exec: permission denied (os error 13)"); };
+  await assert.rejects(view.cli(["app-snapshot"]), /os error 13/);
+});
+
+test("the mod log keeps changes and failures, and snapshots only in debug", async () => {
+  const {logRun, setDebug, logPath, log} = await import("../log.js");
+  state.fsFiles = new Map();
+  setDebug(false);
+  await logRun(["app-snapshot", "--cached"], {cwd:"/home/dev/demo", ms:5, code:0});
+  assert.equal(state.fsFiles.get(logPath()), undefined);
+  await logRun(["done", "--tree", "demo", "--yes"], {cwd:"/home/dev/demo/gone", ms:7, code:1});
+  await logRun(["app-snapshot"], {cwd:"/home/dev/demo/gone", ms:3, code:0, retried:{to:"/home/dev/demo"}});
+  await logRun(["select", "Demo"], {ms:2, error:"cannot run zsh: No such file or directory (os error 2)"});
+  let text = state.fsFiles.get(logPath());
+  assert.match(text, /berbr \["done","--tree","demo","--yes"\] in \/home\/dev\/demo\/gone exited 1 7ms/);
+  assert.match(text, /its folder is gone; ran from \/home\/dev\/demo\) ok 3ms/);
+  assert.match(text, /could not run: cannot run zsh/);
+  setDebug(true);
+  await logRun(["app-snapshot", "--cached"], {ms:5, code:0});
+  assert.match(state.fsFiles.get(logPath()), /app-snapshot","--cached"\] ok 5ms/);
+  setDebug(false);
+  await log("x".repeat(600 * 1024));
+  await log("newest");
+  text = state.fsFiles.get(logPath());
+  assert.ok(text.length <= 512 * 1024 && text.endsWith("newest\n"));
+});
+
+test("a failed berbr run from the panel lands in the mod log with its stderr", async () => {
+  const {logPath} = await import("../log.js");
+  state.fsFiles = new Map();
+  const {view} = setup({props:{opening:{cwd:"/home/dev/demo"}}});
+  state.execHandler = async () => ({code:1, stdout:"", stderr:"Error: \"demo\" is not finished"});
+  await assert.rejects(view.cli(["done", "--tree", "demo", "--yes"]), /not finished/);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const text = state.fsFiles.get(logPath());
+  assert.match(text, /exited 1/);
+  assert.match(text, /berbr done: Error: "demo" is not finished/);
+});
+
+test("a note from berbr's own folder opens in the default editor, not Obsidian", async () => {
+  state.readResult = "Body";
+  const {view, cx, jobs} = setup({props:{form:"note", path:"/home/dev/.berbr/projects/demo/tasks/demo-1.md", title:"Demo", vault:false}});
+  await jobs.shift()(cx);
+  const rendered = view.render(cx);
+  assert.equal(byId(rendered, "note-obsidian"), undefined);
+  click(byId(rendered, "note-open"), cx);
+  await jobs.pop()(cx);
+  assert.deepEqual(state.execs, [["open", ["/home/dev/.berbr/projects/demo/tasks/demo-1.md"]]]);
+});
+
+test("the panel tells the note window which kind of store it reads", () => {
+  const {view} = setup();
+  view.data = {store:"berbr", rows:[]};
+  view.openNote({note:"/home/dev/.berbr/projects/demo/tasks/demo-1.md", title:"Demo"});
+  assert.equal(state.overlays.at(-1).props.vault, false);
+  view.data = {store:"vault", rows:[]};
+  view.openNote({note:"/notes/demo-1.md", title:"Demo"});
+  assert.equal(state.overlays.at(-1).props.vault, true);
+  view.data = {rows:[]};
+  view.openNote({note:"/notes/demo-1.md", title:"Demo"});
+  assert.equal(state.overlays.at(-1).props.vault, false, "an older snapshot without store is no vault");
+});
+
+test("picker popups give their result lists a height, since popups size to content", async () => {
+  const {pickerHeight} = await import("../forms.js");
+  const projects = [{name:"ucp"}, {name:"vpn"}, {name:"kalorie"}];
+  const {view, cx} = setup({props:{form:"projects", project:"ucp", projects, overlay:"projects"}});
+  const list = byId(view.render(cx), "project-results");
+  assert.equal(list.attributes.h[0], pickerHeight(3));
+  assert.ok(!list.attributes.flex_1, "a growing list collapses inside a content-sized popup");
+  assert.equal(pickerHeight(0), 38);
+  assert.equal(pickerHeight(50), 344);
+  for (const name of ["ucp", "vpn", "kalorie"]) assert.ok(byId(list, `project-${name}`));
+  assert.equal(view.inputs.search.placeholder, "Filter projects");
+  const attach = setup({props:{form:"attach-task", ticket:"DEMO-1", tasks:[{id:"a", task:"a", title:"A"}], overlay:"attach"}});
+  assert.equal(byId(attach.view.render(attach.cx), "attach-results").attributes.h[0], pickerHeight(1));
 });

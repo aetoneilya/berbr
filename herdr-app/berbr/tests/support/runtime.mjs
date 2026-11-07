@@ -29,9 +29,9 @@ export const image = path => Object.assign(div().child(path), {asset:{kind:"imag
 export class View {}
 export const Input = {new:input => Object.assign(div(), {input})};
 export const Switch = {new:() => div()};
-export const InputState = {new:({value}) => {
+export const InputState = {new:({value, placeholder}) => {
   const listeners = new Map();
-  return {on:(event, fn) => listeners.set(event, fn), focus() {}, value:() => value,
+  return {placeholder, on:(event, fn) => listeners.set(event, fn), focus() {}, value:() => value,
     set_value(next) {value = next;}, emit:(event, cx) => listeners.get(event)?.({}, cx)};
 }};
 export const TextView = {html:(_id, text) => div().child(text), markdown:(_id, text) => div().child(text)};
@@ -61,6 +61,7 @@ export const watchFolder = path => {
 };
 export const exec = async (...args) => {
   state.execs.push(args);
+  if (state.execHandler) return state.execHandler(...args);
   return state.execResult ?? {code:0, stdout:"", stderr:""};
 };
 export const hc = async args => {
@@ -95,5 +96,13 @@ export const exists = async path => {
   if (state.existsError) throw state.existsError;
   return state.files ? state.files.has(path) : !state.readError && state.readResult !== null;
 };
+// The mod log's files, in memory.
+export const readFile = async path => {
+  const text = (state.fsFiles ??= new Map()).get(path);
+  if (text === undefined) throw new Error(`ENOENT: ${path}`);
+  return text;
+};
+export const writeFile = async (path, text) => { (state.fsFiles ??= new Map()).set(path, String(text)); };
+export const mkdir = async () => {};
 export const layout = () => state.layout ?? {children:[]};
 export const window = () => state.window ?? null;

@@ -8,6 +8,7 @@ import { walk, sectionLabels, taskSpace, rowMenu,
   agentActivity, formatElapsed, blockedPrompt, mrPills, focusedTask, focusedTree, treeFocusTarget, jumpItems, matchJump, closePlan, PanelModel, treeMarks, isMergedTree, mergedPlan, backendClosePlan } from "./model.js";
 import { icon, iconButton, button, chip, sectionHeader, statusMark, kbd, pill } from "./ui.js";
 import { formView, initNote, noteKey } from "./forms.js";
+import { log, logRun, setDebug } from "./log.js";
 
 export default class Berbr extends View {
   init(_props, cx) {
@@ -49,7 +50,7 @@ export default class Berbr extends View {
     this.handle.focus();
     if (this.form === "note") { initNote(this, cx); return; }
     this.inputs = {}; this.values = {}; this.searchFocused = false;
-    const placeholders = { search: this.form === "jump" ? "Jump to…" : "Filter tasks", title: "What are you working on?",
+    const placeholders = { search: {jump:"Jump to…", projects:"Filter projects"}[this.form] ?? "Filter tasks", title: "What are you working on?",
       ticket: "DEMO-123", branch: "Automatic", name: "Automatic" };
     for (const key of Object.keys(placeholders)) {
       const value = p.prefill?.[key] ?? "";
@@ -140,8 +141,27 @@ export default class Berbr extends View {
     if (opening?.terminal) env.push(`HERDR_PANE_ID=${opening.terminal}`);
     // Load the same login/interactive environment as the existing terminal TUI.
     // All user values stay argv entries; the shell only forwards "$@".
-    const result = await exec("zsh", ["-lic", 'exec "$@"', "berbr-env", "env", ...env, this.binary,
-      ...(this.project ? ["--project", this.project] : []), ...args], cwd ? {cwd} : {});
+    const command = ["-lic", 'exec "$@"', "berbr-env", "env", ...env, this.binary,
+      ...(this.project ? ["--project", this.project] : []), ...args];
+    const started = Date.now();
+    let result, retried = null;
+    try {
+      try {
+        result = await exec("zsh", command, cwd ? {cwd} : {});
+      } catch (error) {
+        // The focused terminal can sit in a folder that is gone (a removed worktree):
+        // nothing starts there, so run from the project instead.
+        if (!cwd || !/os error 2\b/.test(String(error?.message ?? error))) throw error;
+        const fallback = this.data?.projects?.find(project => project.name === this.project)?.cwd;
+        retried = {to:fallback && fallback !== cwd ? fallback : null};
+        result = await exec("zsh", command, retried.to ? {cwd:retried.to} : {});
+      }
+    } catch (error) {
+      logRun(args, {cwd, ms:Date.now() - started, error:String(error?.message ?? error), retried});
+      throw error;
+    }
+    logRun(args, {cwd, ms:Date.now() - started, code:result.code, retried});
+    if (result.code !== 0) log(`berbr ${args[0]}: ${cleanCliText(result.stderr) || cleanCliText(result.stdout)}`);
     if (result.code !== 0) throw new Error(cleanCliText(result.stderr) || cleanCliText(result.stdout) || `berbr exited ${result.code}`);
     return result.stdout;
   }
@@ -154,9 +174,11 @@ export default class Berbr extends View {
     const live = this.liveState();
     this.syncBlocked(live.rows, cx, forcePrompts, live);
     const requestedProject = this.project;
+    const load = this.load = (this.load ?? 0) + 1;
     cx.spawn(async cx => {
       try {
         const data = JSON.parse(await this.cli(["app-snapshot", ...(cached ? ["--cached"] : [])]));
+        if (load !== this.load) return; // another project was chosen meanwhile
         const desired = shared("berbr.project");
         if (desired && desired !== requestedProject && desired !== data.project) {
           this.loading = false; this.switchProject(desired, cx); return;
@@ -166,6 +188,7 @@ export default class Berbr extends View {
         setShared("berbr.project", this.project);
         const firstData = !this.data;
         this.data = data; this.contextRow = null; this.error = null;
+        setDebug(data.debug);
         if (firstData) {
           const flat = walk(data.rows);
           const task = focusedTask(data.rows, this.actionContext().opening, spaces(), agents());
@@ -173,7 +196,10 @@ export default class Berbr extends View {
           if (task) this.setExpanded(task.id, cx);
           if ((task ?? flat.find(row => row.id === this.expanded))?.done) this.all = true;
         }
-      } catch (error) { this.error = String(error.message ?? error); }
+      } catch (error) {
+        if (load !== this.load) return;
+        this.error = String(error.message ?? error);
+      }
       this.loading = false;
       const live = this.liveState();
       this.syncBlocked(live.rows, cx, false, live); cx.notify();
@@ -181,8 +207,10 @@ export default class Berbr extends View {
     });
   }
 
+  // A load still running for the old project is dropped, not waited for.
   switchProject(name, cx) {
-    if (this.loading || this.busy || name === this.project) return;
+    if (this.busy || name === this.project) return;
+    this.loading = false;
     this.project = name; this.selected = null; this.didOnline = false;
     this.contextRow = null;
     this.setExpanded(null, cx);
@@ -495,7 +523,7 @@ export default class Berbr extends View {
         const result = await exec("open", [url]);
         if (result.code !== 0) throw new Error(result.stderr.trim() || "Could not open link");
         if (close && props()?.overlay) closeOverlay(props().overlay);
-      } catch (error) { this.error = String(error.message ?? error); }
+      } catch (error) { this.error = String(error.message ?? error); log(`open ${url}: ${this.error}`); }
       this.busy = false; this.busyAction = null; cx.notify();
     });
   }
@@ -503,7 +531,7 @@ export default class Berbr extends View {
   openNote(row) {
     if (!row.note || this.busy) return;
     openOverlay({mod:"berbr", kind:"window", key:"berbr-note", width:720, height:0.75,
-      props:{form:"note", path:row.note, title:row.title ?? row.label ?? row.task ?? "Note",
+      props:{form:"note", path:row.note, title:row.title ?? row.label ?? row.task ?? "Note", vault:this.data?.store === "vault",
         tickets:walk(row.children).filter(child => child.kind === "ticket").map(ticket => ({key:ticket.target, url:ticket.url}))}});
   }
 
@@ -684,14 +712,16 @@ export default class Berbr extends View {
     this.formOverlay("remove-tree", {tree, mr, rows});
   }
 
-  submitRemoveTree(cx) {
+  submitRemoveTree(cx, {force = false} = {}) {
     const p = props() ?? {};
     const name = p.tree?.tree;
     if (!name?.trim()) { this.error = "Worktree name is unavailable."; cx.notify(); return; }
     const target = p.tree?.cwd || name;
     const args = ["done", "--tree", target, "--yes"];
     if (p.tree?.repo) args.push("--repo", p.tree.repo);
-    this.perform(cx, args, {close:true, action:"remove-tree"});
+    // only from the dialog's Delete anyway, after it names what is lost
+    if (force) args.push("--force");
+    this.perform(cx, args, {close:true, action:force ? "remove-tree-force" : "remove-tree"});
   }
 
   enterTree(tree, mr, cx, action, remove = false) {
@@ -1266,9 +1296,11 @@ export default class Berbr extends View {
   render(cx) {
     if (this.form) return this.renderPanel(cx);
     const desired = shared("berbr.project");
-    if (desired && desired !== this.project && desired !== this.pendingProject && !this.loading && !this.busy) {
+    if (desired && desired !== this.project && desired !== this.pendingProject && !this.busy) {
+      // Not here: switching notifies, and notifying while rendering throws. spawn
+      // runs its body at once, still inside render; the sleep resumes after it.
       this.pendingProject = desired;
-      this.switchProject(desired, cx);
+      cx.spawn(async cx => { await cx.sleep(0); this.switchProject(desired, cx); });
     } else if (desired === this.project && !this.loading) this.pendingProject = null;
     return this.withLive(() => this.renderPanel(cx));
   }

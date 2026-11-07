@@ -446,7 +446,7 @@ export function taskSignals(row, liveAgents = [], liveSpaces = [], related = wal
 
 export const sectionLabels = {
   needs:"Needs you", running:"Running", progress:"In progress", todo:"Todo",
-  notInTask:"Not in a task", cleanup:"Cleanup", done:"Done",
+  cleanup:"Cleanup", done:"Done",
 };
 
 export function groupSections(rows = [], liveAgents = [], liveSpaces = [], signalFor = row => taskSignals(row, liveAgents, liveSpaces)) {
@@ -478,7 +478,7 @@ export function groupSections(rows = [], liveAgents = [], liveSpaces = [], signa
     } else if (!looseIds.has(row.id)) {
       looseIds.add(row.id);
       const section = looseSection === "todo" ? "todo"
-        : row.kind === "ticket" && !isClosedTicket(row) ? "notInTask" : "cleanup";
+        : row.kind === "ticket" && !isClosedTicket(row) ? "progress" : "cleanup";
       byId.get(section).rows.push(row);
     }
   };

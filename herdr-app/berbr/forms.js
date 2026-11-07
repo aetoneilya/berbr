@@ -191,7 +191,10 @@ function noteForm(view, t, p) {
         .on_mouse_down("left", (_event, cx) => cx.stop_propagation()))
       .when(note.editing, el => el.child(button(t, "note-done", "Done", cx => leaveNote(view, cx), "ghost", note.saving)
         .on_mouse_down("left", (_event, cx) => cx.stop_propagation())))
-      .child(control("note-obsidian", "file-text", "Open in Obsidian", cx => view.openUrl(obsidianUri(note.path), cx)))
+      // Obsidian only for a vault the snapshot named; berbr's own folder is the default
+      .child(p.vault === true
+        ? control("note-obsidian", "file-text", "Open in Obsidian", cx => view.openUrl(obsidianUri(note.path), cx))
+        : control("note-open", "file-text", "Open in editor", cx => view.openUrl(note.path, cx)))
       .when(!note.editing, el => el.child(control("note-reload", "refresh", "Reload", cx => reloadNote(view, cx, {links:true}))))
       .child(control("note-close", "x", "Close", cx => leaveNote(view, cx, true))))
     .when(Boolean(note.ask), el => el.child(h_flex().px(16).py(8).gap(8).items_center()
@@ -340,19 +343,26 @@ function removeTreeForm(view, t, p) {
   const state = p.mr?.state?.toLowerCase();
   const summary = p.mr ? `Its MR${key ? ` ${key}` : ""} is ${state}. ` : "";
   const marks = treeMarks(p.tree);
+  // known blockers, or the CLI refused: the person may still choose to lose them
+  const forceable = marks.changes > 0 || state === "opened" || p.tree?.mr_state === "opened" || Boolean(view.error);
   return v_flex().size_full().min_h(0).p(24).gap(12).bg(t.popover).text_color(t.foreground)
     .child(div().text_size(15).font_semibold().child(`Remove worktree “${p.tree?.tree ?? "unknown"}”?`))
     .child(v_flex().flex_1().min_h(0).gap(12).overflow_y_scrollbar()
       .child(div().text_size(13).text_color(t.muted).whitespace_normal()
-        .child(`${summary}Deletes the checkout folder, its Herdr tabs, and the local branch when safe. Uncommitted files are never discarded here.`))
+        .child(`${summary}Deletes the checkout folder, its Herdr tabs, and the local branch when safe. Remove never discards uncommitted files.`))
       .child(div().text_size(12).text_color(t.muted).whitespace_normal()
         .child("Berbr refuses uncommitted changes, an open MR, unknown unpushed commits, or local commits not covered by a merged/closed MR. Unmerged commits already pushed to origin can be removed locally; the remote branch remains. Git and GitLab are checked again before removal."))
       .when(marks.changes > 0, el => el.child(div().text_size(12).text_color(t.blocked).whitespace_normal()
         .child(`Removal will be refused: ${marks.changes} uncommitted change(s) in the snapshot.`)))
       .when(state === "opened" || p.tree?.mr_state === "opened", el => el.child(div().text_size(12).text_color(t.blocked)
         .child("Removal will be refused: the MR is open.")))
-      .when(Boolean(view.error), el => el.child(errorLine(view, t).whitespace_normal())))
+      .when(Boolean(view.error), el => el.child(errorLine(view, t).whitespace_normal()))
+      .when(forceable, el => el.child(div().text_size(12).text_color(t.blocked).whitespace_normal()
+        .child(`Delete anyway skips these checks: ${marks.changes > 0 ? `${marks.changes} uncommitted change(s) are lost for good. ` : ""}`
+          + "The local branch stays when it has commits found nowhere else."))))
     .child(h_flex().gap(8).justify_end().child(cancel(view, t))
+      .when(forceable, el => el.child(button(t, "remove-tree-force", "Delete anyway", cx => view.submitRemoveTree(cx, {force:true}),
+        "ghost", view.busy, view.busyAction === "remove-tree-force")))
       .child(button(t, "remove-tree", "Remove", cx => view.submitRemoveTree(cx),
         "primary", view.busy, view.busyAction === "remove-tree")));
 }
@@ -392,11 +402,18 @@ function stopAgentForm(view, t, p) {
       .child(button(t, "stop-agent", "Stop agent", cx => view.submitStopAgent(cx), "primary", view.busy)));
 }
 
+// A popup is as tall as its content: a list that only grows (flex_1) gets no
+// height at all, so the rows were there but invisible. Room for the rows, up to
+// ten, and one line for "No matches".
+export function pickerHeight(rows) {
+  return Math.min(Math.max(rows, 1), 10) * 34 + 4;
+}
+
 function projectsForm(view, t, p) {
   const matches = view.pickerMatches(), start = Math.max(0, view.pickerIndex);
   return v_flex().size_full().min_h(0).p(4).gap(4).bg(t.popover).text_color(t.foreground)
     .child(view.input("search"))
-    .child(v_flex().id("project-results").flex_1().min_h(0).overflow_y_scrollbar()
+    .child(v_flex().id("project-results").h(pickerHeight(matches.length - start)).flex_none().overflow_y_scrollbar()
       .children(matches.slice(start).map((project, index) => h_flex().id(`project-${project.name}`).h(32).flex_none().px(10).gap(8)
         .items_center().rounded(6).cursor_pointer().hover(el => el.bg(t.hover))
         .when(start + index === view.pickerIndex, el => el.bg(t.selected))
@@ -428,7 +445,7 @@ function attachTaskForm(view, t, p) {
   const matches = view.pickerMatches(), start = Math.max(0, view.pickerIndex);
   return v_flex().size_full().min_h(0).p(4).gap(4).bg(t.popover).text_color(t.foreground)
     .child(view.input("search"))
-    .child(v_flex().id("attach-results").flex_1().min_h(0).overflow_y_scrollbar()
+    .child(v_flex().id("attach-results").h(pickerHeight(matches.length - start)).flex_none().overflow_y_scrollbar()
       .children(matches.slice(start).map((task, index) => {
         const id = `attach-task-${task.id}`, pending = view.busy && view.busyAction === id;
         return h_flex().id(id).h(32).flex_none().px(10).gap(8).items_center().rounded(6)
