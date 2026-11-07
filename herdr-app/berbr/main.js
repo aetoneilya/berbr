@@ -6,7 +6,7 @@ import { walk, sectionLabels, taskSpace, rowMenu,
   normalizeTicketState, ticketTitle,
   cleanCliText, isClosedTicket, newTaskArgs, freeTickets,
   agentActivity, formatElapsed, blockedPrompt, mrPills, focusedTask, focusedTree, treeFocusTarget, jumpItems, matchJump, closePlan, PanelModel, treeMarks, isMergedTree, mergedPlan, backendClosePlan } from "./model.js";
-import { icon, iconButton, button, chip, sectionHeader, statusMark, kbd, pill } from "./ui.js";
+import { icon, iconButton, button, chip, sectionHeader, statusMark, kbd, pill, keyboardControl } from "./ui.js";
 import { formView, initNote, noteKey } from "./forms.js";
 import { log, logRun, setDebug } from "./log.js";
 
@@ -94,6 +94,9 @@ export default class Berbr extends View {
       this.created = false; this.choiceIndex = 0; this.choiceWidths = {};
       this.choiceFocus = {project:cx.focus_handle(), agent:cx.focus_handle(), list:cx.focus_handle()};
     }
+    this.generationAgent = "claude";
+    this.namingExpanded = false; this.namingDirty = false; this.settingsLoading = false;
+    if (this.form === "settings") this.loadSettings(cx);
     if (!this.form) {
       this.refresh(cx, true);
       cx.timer.every(1000, cx => {
@@ -201,6 +204,7 @@ export default class Berbr extends View {
         }
         this.project = data.project;
         this.agent = data.projects?.find(project => project.name === data.project)?.agent ?? "codex";
+        if (data.settings) setShared("berbr.settings", data.settings);
         setShared("berbr.project", this.project);
         const firstData = !this.data;
         this.data = data; this.contextRow = null; this.error = null;
@@ -591,10 +595,10 @@ export default class Berbr extends View {
     const popup = ["projects", "attach-task", "menu"].includes(form);
     openOverlay({ mod:"berbr", kind: popup ? "popup" : "dialog",
       width: ["done", "remove-merged"].includes(form) ? 520 : ["projects", "menu"].includes(form) ? 220 : form === "attach-task" ? 300 : form === "jump" ? 560 : form === "remove-tree" ? 440 : 480,
-      height: ["projects", "attach-task"].includes(form) ? 0.6 : popup ? undefined : form === "jump" ? 0.6 : ["done", "remove-merged"].includes(form) ? 0.75 : form === "new" ? 480 : form === "ticket" ? 420 : form === "remove-tree" ? 360 : 240,
-      modal: ["new", "rename", "stop-agent", "remove-tree", "done", "remove-merged"].includes(form),
+      height: ["projects", "attach-task"].includes(form) ? 0.6 : popup ? undefined : form === "jump" ? 0.6 : ["done", "remove-merged"].includes(form) ? 0.75 : form === "new" ? 480 : form === "settings" ? 240 : form === "ticket" ? 420 : form === "remove-tree" ? 360 : 240,
+      modal: ["new", "settings", "rename", "stop-agent", "remove-tree", "done", "remove-merged"].includes(form),
       ...(popup ? {at:"pointer"} : {}),
-      props:{ form, project:this.project, binary:this.binary, agent:this.agent,
+      props:{ form, project:this.project, binary:this.binary, agent:shared("berbr.settings")?.agent ?? this.agent,
         ...(form === "new" ? this.newTaskProps() : {}), ...this.actionContext(), ...extra } });
   }
 
@@ -714,15 +718,70 @@ export default class Berbr extends View {
     });
   }
 
+  loadSettings(cx) {
+    if (this.busy || this.settingsLoading) return;
+    this.settingsLoading = true; this.settingsError = null;
+    if (this.form === "settings") this.loading = true;
+    cx.notify();
+    cx.spawn(async cx => {
+      try {
+        const data = JSON.parse(await this.cli(["settings"]));
+        if (this.form === "settings") this.agent = data.agent;
+        this.generationAgent = data.generation_agent;
+        this.namingModels = data.model_choices ?? {};
+        this.namingModel = data.generation_model ?? "";
+        this.settingsReady = true;
+      } catch (error) {
+        this.settingsError = String(error.message ?? error);
+        if (this.form === "settings") this.error = this.settingsError;
+      }
+      this.settingsLoading = false;
+      if (this.form === "settings") this.loading = false;
+      cx.notify();
+    });
+  }
+
+  availableNamingModels() {
+    return this.namingModels?.[this.generationAgent] ?? [{id:"", label:"CLI default"}];
+  }
+
+  selectNamingModel(id, cx) {
+    if (this.busy || this.settingsLoading || !this.settingsReady || !this.availableNamingModels().some(model => model.id === id)) return;
+    this.namingModel = id; this.namingDirty = true; cx.notify();
+  }
+
+  submitSettings(cx) {
+    if (!this.settingsReady || this.loading || this.busy) return;
+    this.busy = true; this.error = null; cx.notify();
+    const args = ["settings", "--default-agent", this.agent];
+    cx.spawn(async cx => {
+      try {
+        const data = JSON.parse(await this.cli(args));
+        setShared("berbr.settings", data);
+        run("berbr.refresh"); closeOverlay(props().overlay);
+        notify({title:"Berbr", body:"Settings saved", level:"info"});
+      } catch (error) { this.error = String(error.message ?? error); }
+      this.busy = false; cx.notify();
+    });
+  }
+
   submitNew(cx) {
     if (this.busy) return;
-    const {args, error} = newTaskArgs({source:this.source, text:this.source === "smart" ? "" : this.values.title, ticket:this.ticket,
+    const {args, error, target} = newTaskArgs({source:this.source, text:this.source === "smart" ? "" : this.values.title, ticket:this.ticket,
       agent:this.agent, worktree:this.worktree, newTicket:this.newTicket, description:this.values.description});
     if (error) { this.error = error; cx.notify(); return; }
+    const saveNaming = target.kind === "empty" && Boolean(this.values.description?.trim()) && this.namingDirty;
+    if (saveNaming && (!this.settingsReady || this.settingsLoading || !this.availableNamingModels().some(model => model.id === this.namingModel))) {
+      this.error = "Choose an available Task naming model."; cx.notify(); return;
+    }
+    const namingArgs = ["settings", "--task-naming-agent", this.generationAgent, "--task-naming-model", this.namingModel];
     this.choosing = null; this.created = false;
     // Create more: the form stays for the next task, its text cleared
     const more = this.createMore;
-    this.perform(cx, args, {close:!more, action:"start", after:more ? () => {
+    this.perform(cx, args, {close:!more, action:"start", before:saveNaming ? async () => {
+      const data = JSON.parse(await this.cli(namingArgs));
+      setShared("berbr.settings", data); this.namingDirty = false;
+    } : null, after:more ? () => {
       for (const key of ["title", "description"]) { this.inputs[key].set_value(""); this.values[key] = ""; }
       this.ticket = null; this.created = true; this.inputs[this.source === "smart" ? "description" : "title"].focus();
     } : null});
@@ -1407,16 +1466,6 @@ export default class Berbr extends View {
           ? this.taskBlock(t, row) : this.looseBlock(t, row, section.id));
       }
     }
-    const sources = h_flex().min_w(0).gap(4).items_center().text_size(11);
-    if (this.loading) sources.child(icon("spinner", 11).text_color(t.dim).spin(900))
-      .child(div().text_color(t.dim).child("Syncing"));
-    else for (const [index, name] of ["jira", "gitlab"].entries()) {
-      const value = String(this.data?.sources?.[name] ?? "…").toLowerCase();
-      if (index) sources.child(div().text_color(t.dim).child("·"));
-      sources.child(div().min_w(0).truncate()
-        .text_color(!this.data || ["cached", "online", "live", "ok"].includes(value) ? t.dim : t.blocked)
-        .child(`${name === "jira" ? "Jira" : "GitLab"} ${value}`));
-    }
     return v_flex().id("berbr").track_focus(this.handle).on_key_down((event, cx) => this.key(event, cx))
       .size_full().min_h(0).min_w(0).bg(t.surface).text_color(t.foreground)
       .child(h_flex().h(40).flex_none().px(12).gap(4).items_center().bg(t.chrome).border_b_1().border_color(t.border)
@@ -1439,10 +1488,12 @@ export default class Berbr extends View {
       .when(Boolean(this.error), el => el.child(this.banner(t, "dismiss-error", this.error, cx => {this.error = null; cx.notify();})))
       .when(Boolean(this.data?.warnings?.length), el => el.child(this.banner(t, "warnings", this.data.warnings.join("\n"))))
       .child(list)
-      .child(h_flex().h(30).flex_none().px(12).gap(8).items_center().border_t_1().border_color(t.border)
+      .child(h_flex().id("berbr-footer").h(30).flex_none().px(12).gap(8).items_center().border_t_1().border_color(t.border)
         .child(div().id("toggle-done").text_size(11).text_color(this.all ? t.foreground : t.dim).cursor_pointer()
           .tooltip("Show completed tasks (d)").on_click((_event, cx) => {this.all = !this.all; cx.notify();}).child(`Done ${done}`))
         .child(div().flex_1())
-        .child(panelFocused ? kbd(t, "⌘K jump · ↑↓ move · → expand · ⏎ open").min_w(0).truncate() : sources));
+        .when(panelFocused, el => el.child(kbd(t, "⌘K jump · ↑↓ move · → expand · ⏎ open").min_w(0).truncate()))
+        .child(keyboardControl(iconButton(t, "settings", "settings", "Settings", () => this.formOverlay("settings"), {disabled, size:22}),
+          () => this.formOverlay("settings"), disabled)));
   }
 }

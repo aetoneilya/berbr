@@ -29,6 +29,8 @@ pub(super) fn snapshot(projects: &[Config], chosen: usize, cached: bool) -> Resu
             "version": 3, "project": config.name,
             "projects": projects.iter().map(|c| json!({"name":c.name,"cwd":c.repos.first().map(|r|&r.path),"agent":c.workflow.agent})).collect::<Vec<_>>(),
             "rows": rows, "warnings": table.warnings, "debug": crate::log::debug_enabled(),
+            "settings": {"agent":config.workflow.agent, "generation_agent":config.workflow.generation_agent,
+                "generation_model":config.workflow.generation_model},
             "store": if config.vault.own { "berbr" } else { "vault" },
             "sources": {"jira":format!("{:?}",table.jira.fresh),"gitlab":format!("{:?}",table.gitlab.fresh)}
         })

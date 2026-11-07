@@ -11,6 +11,76 @@ pub enum AgentKind {
     Codex,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ModelChoice {
+    pub id: String,
+    pub label: String,
+}
+
+/// Explicit picker options. Codex's own cache reflects this installation's catalog.
+pub fn model_choices(kind: AgentKind) -> Vec<ModelChoice> {
+    let mut choices = vec![ModelChoice {
+        id: String::new(),
+        label: "CLI default".into(),
+    }];
+    match kind {
+        AgentKind::Claude => {
+            for (id, label) in [
+                ("haiku", "Haiku"),
+                ("sonnet", "Sonnet"),
+                ("opus", "Opus"),
+                ("fable", "Fable"),
+            ] {
+                choices.push(ModelChoice {
+                    id: id.into(),
+                    label: label.into(),
+                });
+            }
+        }
+        AgentKind::Codex => {
+            let home = std::env::var_os("CODEX_HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"));
+            if let Ok(data) = std::fs::read(home.join("models_cache.json")) {
+                choices.extend(codex_model_choices(&data));
+            }
+        }
+    }
+    choices
+}
+
+fn codex_model_choices(data: &[u8]) -> Vec<ModelChoice> {
+    let mut choices: Vec<ModelChoice> = Vec::new();
+    let Ok(data) = serde_json::from_slice::<serde_json::Value>(data) else {
+        return choices;
+    };
+    for model in data["models"].as_array().into_iter().flatten() {
+        if model["visibility"].as_str() != Some("list") {
+            continue;
+        }
+        if let Some(id) = model["slug"].as_str().filter(|id| !id.is_empty()) {
+            if choices.iter().any(|choice| choice.id == id) {
+                continue;
+            }
+            choices.push(ModelChoice {
+                id: id.into(),
+                label: model["display_name"].as_str().unwrap_or(id).into(),
+            });
+        }
+    }
+    choices
+}
+
+pub fn validate_naming_model(kind: AgentKind, model: &str) -> Result<(), String> {
+    if model_choices(kind).iter().any(|choice| choice.id == model) {
+        Ok(())
+    } else {
+        Err(format!(
+            "model {model:?} is not an available Task naming model for {kind}; choose a listed model or CLI default"
+        ))
+    }
+}
+
 impl AgentKind {
     pub fn binary(self) -> &'static str {
         match self {
@@ -94,6 +164,35 @@ impl fmt::Display for AgentKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_catalog_filters_hidden_and_duplicate_ids() {
+        let choices = codex_model_choices(
+            br#"{"models":[
+            {"slug":"first", "display_name":"First", "visibility":"list"},
+            {"slug":"hidden", "visibility":"hide"},
+            {"slug":"first", "visibility":"list"},
+            {"slug":"second", "visibility":"list"},
+            {"visibility":"list"}
+        ]}"#,
+        );
+        assert_eq!(
+            choices.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(choices[0].label, "First");
+        assert_eq!(choices[1].label, "second");
+        assert!(codex_model_choices(b"broken cache").is_empty());
+        assert!(codex_model_choices(br#"{}"#).is_empty());
+    }
+
+    #[test]
+    fn naming_models_require_a_listed_choice_and_always_allow_cli_default() {
+        assert!(validate_naming_model(AgentKind::Claude, "haiku").is_ok());
+        assert!(validate_naming_model(AgentKind::Claude, "").is_ok());
+        assert!(validate_naming_model(AgentKind::Codex, "").is_ok());
+        assert!(validate_naming_model(AgentKind::Claude, "invented-model").is_err());
+    }
 
     #[test]
     fn session_keys_keep_legacy_claude_ids_and_separate_codex() {

@@ -46,6 +46,8 @@ The first of `BERBR_CONFIG`, `~/.berbr/config.toml`,
 branch_prefix = "demo/"
 worktree_dir = ".herdr/worktrees" # relative to each main checkout
 # agent = "codex"           # default: "claude"; also accepts --agent per command
+# generation_agent = "claude" # independent CLI for naming tasks from Description
+# generation_model = ""      # empty: the naming CLI's configured default
 # review_model = "claude-fable-5-1"
 # ide = "IntelliJ IDEA"
 
@@ -175,6 +177,20 @@ command = "zsh -ic 'BERBR_POPUP=1 exec berbr'"
 
 The desktop version has a native task list in the right panel, alongside Files
 and Changes. See [Herdr App installation and behavior](herdr-app/README.md).
+
+The small **Settings** button at the bottom of the panel sets the default work
+agent. **New task → Generate → Task naming** expands the agent and model used to
+name the task and branch from Description. Choices are saved when creating a task;
+opening the section or cancelling does not change settings. Naming and working
+agents are independent. Models come from Claude CLI aliases or Codex's visible
+local model catalog; **CLI default** is always available.
+
+These defaults apply to every project and are stored in `[workflow]`, preserving
+comments and project data. Legacy project-level agent and naming overrides are
+ignored; existing conversations retain their owning CLI. They are also available
+through `berbr settings`, `berbr settings --default-agent codex`, and
+`berbr settings --task-naming-agent claude --task-naming-model haiku`. An explicit
+task name skips naming; a naming failure leaves the task uncreated.
 
 `berbr app-snapshot [--cached]` emits snapshot version 3, retaining all v1/v2 fields.
 Task `body` is a human preview capped at 2 KiB of UTF-8, before fenced-code-aware

@@ -3335,3 +3335,120 @@ test("New task can create a ticket from only a description, clears it for Create
   assert.ok(!byId(view.render(cx), "new-body").attributes.overflow_y_scrollbar);
   assert.equal(jobs.length, 0);
 });
+
+const namingSettings = (fields = {}) => ({scope:"global", agent:"claude", generation_agent:"claude", generation_model:"haiku",
+  model_choices:{claude:[{id:"", label:"CLI default"}, {id:"haiku", label:"Haiku"}, {id:"sonnet", label:"Sonnet"}],
+    codex:[{id:"", label:"CLI default"}, {id:"codex-fixture", label:"Codex fixture"}]}, ...fields});
+
+test("Settings is a small footer button, replacing cache labels and accessible with the keyboard", () => {
+  for (const focused of [true, false]) {
+    const {view, cx} = setup();
+    view.handle.focused = focused;
+    const root = view.render(cx), footer = byId(root, "berbr-footer"), settings = byId(footer, "settings");
+    assert.ok(settings);
+    assert.equal(nodes(root).filter(node => node.attributes.id?.[0] === "settings").length, 1);
+    assert.equal(settings.attributes.size[0], 22);
+    assert.equal(settings.attributes.accessibility_label[0], "Settings");
+    assert.doesNotMatch(text(footer), /Jira|GitLab|cache/i);
+    settings.attributes.on_key_down[0]({key:"enter"}, cx);
+    assert.equal(state.overlays.at(-1).props.form, "settings");
+  }
+});
+
+test("General Settings only saves the default work agent, preserving the naming configuration", async () => {
+  const {view, cx, jobs} = setup({props:{form:"settings", overlay:"settings"}, keepJobs:true});
+  const calls = [];
+  view.cli = async args => {calls.push(args); return JSON.stringify(namingSettings({generation_model:"removed-model"}));};
+  await jobs.shift()(cx);
+  assert.equal(byId(view.render(cx), "naming-agent-claude"), undefined);
+  assert.equal(byId(view.render(cx), "naming-model-options"), undefined);
+  click(byId(view.render(cx), "default-agent-codex"), cx);
+  click(byId(view.render(cx), "save-settings"), cx);
+  await jobs.shift()(cx);
+  assert.deepEqual(calls, [["settings"], ["settings", "--default-agent", "codex"]]);
+  assert.deepEqual(state.calls.at(-1), ["closeOverlay", "settings"]);
+});
+
+test("Task naming is collapsed, loads models only when opened and preserves the chosen work agent", async () => {
+  const {view, cx, jobs} = setup({props:{form:"new", agent:"none", overlay:"new"}});
+  view.cli = async () => JSON.stringify(namingSettings());
+  assert.equal(jobs.length, 0);
+  assert.equal(byId(view.render(cx), "naming-details"), undefined);
+  const toggle = byId(view.render(cx), "naming-toggle");
+  toggle.attributes.on_key_down[0]({key:"space"}, cx);
+  assert.ok(byId(view.render(cx), "new-body").attributes.overflow_y_scrollbar);
+  assert.match(text(byId(view.render(cx), "naming-details")), /names the task and branch from Description/);
+  assert.match(text(view.render(cx)), /Loading models/);
+  click(byId(view.render(cx), "naming-toggle"), cx);
+  click(byId(view.render(cx), "naming-toggle"), cx);
+  assert.equal(jobs.length, 1, "opening again while loading does not request twice");
+  await jobs.shift()(cx);
+  assert.equal(view.agent, "none");
+  assert.ok(byId(view.render(cx), "naming-model-haiku"));
+  click(byId(view.render(cx), "naming-agent-codex"), cx);
+  assert.equal(view.namingModel, "");
+  assert.equal(byId(view.render(cx), "naming-model-haiku"), undefined);
+  view.selectNamingModel("haiku", cx); assert.equal(view.namingModel, "");
+  click(byId(view.render(cx), "naming-model-codex-fixture"), cx);
+  assert.equal(view.namingModel, "codex-fixture");
+  click(byId(view.render(cx), "cancel"), cx);
+  assert.equal(jobs.length, 0, "cancel never saves choices");
+  assert.deepEqual(state.calls.at(-1), ["closeOverlay", "new"]);
+});
+
+test("Creating from Description saves the chosen naming model before starting, with duplicate submits blocked", async () => {
+  const {view, cx, jobs} = setup({props:{form:"new", agent:"none", overlay:"new"}});
+  const calls = [];
+  view.cli = async args => {calls.push(args); return args[0] === "settings" ? JSON.stringify(namingSettings()) : "Created";};
+  click(byId(view.render(cx), "naming-toggle"), cx); await jobs.shift()(cx);
+  click(byId(view.render(cx), "naming-model-sonnet"), cx);
+  view.inputs.description.set_value("Fix login"); view.inputs.description.emit("change", cx);
+  click(byId(view.render(cx), "create"), cx);
+  view.submitNew(cx);
+  click(byId(view.render(cx), "naming-agent-codex"), cx);
+  assert.equal(view.generationAgent, "claude");
+  assert.equal(jobs.length, 1);
+  await jobs.shift()(cx);
+  assert.deepEqual(calls, [["settings"], ["settings", "--task-naming-agent", "claude", "--task-naming-model", "sonnet"],
+    ["start", "--description", "Fix login", "--bg", "--no-agent"]]);
+  assert.equal(view.namingDirty, false);
+});
+
+test("Naming load failures support retry; a save failure prevents task creation and keeps the draft", async () => {
+  const {view, cx, jobs} = setup({props:{form:"new", overlay:"new"}});
+  const calls = [];
+  view.cli = async args => {calls.push(args); throw new Error("Config unavailable");};
+  click(byId(view.render(cx), "naming-toggle"), cx); await jobs.shift()(cx);
+  assert.match(text(byId(view.render(cx), "naming-details")), /Config unavailable/);
+  view.cli = async args => {calls.push(args); return JSON.stringify(namingSettings());};
+  click(byId(view.render(cx), "naming-retry"), cx); await jobs.shift()(cx);
+  click(byId(view.render(cx), "naming-model-sonnet"), cx);
+  view.inputs.description.set_value("Keep my draft"); view.inputs.description.emit("change", cx);
+  view.cli = async args => {calls.push(args); throw new Error("Config changed on disk");};
+  view.submitNew(cx); await jobs.shift()(cx);
+  assert.equal(view.busy, false); assert.equal(view.namingDirty, true);
+  assert.equal(view.values.description, "Keep my draft");
+  assert.match(view.error, /Config changed/);
+  assert.ok(!calls.some(args => args[0] === "start"));
+  assert.ok(!state.calls.some(call => call[0] === "closeOverlay"));
+});
+
+test("Explicit targets do not save naming settings, and Create more saves them only once", async () => {
+  for (const source of ["name", "smart"]) {
+    const {view, cx, jobs} = setup({props:{form:"new", overlay:"new"}});
+    const calls = [];
+    view.cli = async args => {calls.push(args); return args[0] === "settings" ? JSON.stringify(namingSettings()) : "Created";};
+    click(byId(view.render(cx), "naming-toggle"), cx); await jobs.shift()(cx);
+    click(byId(view.render(cx), "naming-model-sonnet"), cx);
+    view.createMore = true;
+    for (let index = 0; index < 2; index++) {
+      click(byId(view.render(cx), `source-${source}`), cx);
+      view.inputs.description.set_value("Task description"); view.inputs.description.emit("change", cx);
+      if (source === "name") {view.inputs.title.set_value("Explicit title"); view.inputs.title.emit("change", cx);}
+      view.submitNew(cx); await jobs.shift()(cx);
+    }
+    assert.equal(calls.filter(args => args[0] === "settings" && args.length > 1).length, source === "name" ? 0 : 1);
+    assert.equal(calls.filter(args => args[0] === "start").length, 2);
+    assert.ok(!state.calls.some(call => call[0] === "closeOverlay"));
+  }
+});

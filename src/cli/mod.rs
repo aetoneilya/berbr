@@ -35,6 +35,16 @@ enum CliCommands {
         #[arg(long)]
         cached: bool,
     },
+    /// Show universal settings as JSON, or save defaults for every project.
+    Settings {
+        #[arg(long, value_enum)]
+        default_agent: Option<AgentKind>,
+        #[arg(long = "task-naming-agent", alias = "generation-agent", value_enum)]
+        generation_agent: Option<AgentKind>,
+        /// Empty string selects the Task naming CLI's default model.
+        #[arg(long = "task-naming-model", alias = "generation-model")]
+        generation_model: Option<String>,
+    },
     /// (internal) Open the Herdr plugin's board without loading project config.
     #[command(hide = true)]
     PluginOpen,
@@ -311,6 +321,38 @@ pub fn run() -> Result<(), String> {
             .map_err(|e| format!("can't enter {}: {e}", dir.display()))?;
     }
     let mut projects = load_projects().map_err(|err| err.to_string())?;
+    if let Some(CliCommands::Settings {
+        default_agent,
+        generation_agent,
+        generation_model,
+    }) = cli.command
+    {
+        let workflow = if default_agent.is_some()
+            || generation_agent.is_some()
+            || generation_model.is_some()
+        {
+            crate::config::update_settings(
+                default_agent,
+                generation_agent,
+                generation_model.as_deref(),
+            )?
+        } else {
+            projects[0].workflow.clone()
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "scope": "global", "agent": workflow.agent,
+                "generation_agent": workflow.generation_agent, "generation_model": workflow.generation_model,
+                "model_choices": {
+                    "claude": crate::client::agent::model_choices(AgentKind::Claude),
+                    "codex": crate::client::agent::model_choices(AgentKind::Codex),
+                },
+            })
+        );
+        return Ok(());
+    }
+
     if let Some(agent) = cli.agent {
         for project in &mut projects {
             project.workflow.agent = agent;
@@ -341,6 +383,7 @@ pub fn run() -> Result<(), String> {
     let _operation = crate::client::herdr::operation();
     match command {
         CliCommands::AppSnapshot { .. } => unreachable!(),
+        CliCommands::Settings { .. } => unreachable!(),
         CliCommands::Status(args) => table::cli_status(&config, args),
         CliCommands::Start(args) => work::cli_start(&config, args),
         CliCommands::Add(args) => work::cli_add(&config, args),
@@ -369,6 +412,11 @@ pub fn run() -> Result<(), String> {
 /// are always logged.
 fn changes(command: &CliCommands) -> bool {
     match command {
+        CliCommands::Settings {
+            default_agent,
+            generation_agent,
+            generation_model,
+        } => default_agent.is_some() || generation_agent.is_some() || generation_model.is_some(),
         CliCommands::Start(_)
         | CliCommands::Add(_)
         | CliCommands::Attach { .. }

@@ -33,6 +33,10 @@ pub struct WorkflowConfig {
     pub worktree_dir: PathBuf,
     /// CLI used for new conversations; existing conversations keep their owner.
     pub agent: AgentKind,
+    /// CLI used only to generate a task title and worktree name from description.
+    pub generation_agent: AgentKind,
+    /// The generation CLI's default model when empty.
+    pub generation_model: Option<String>,
     /// Optional separate CLI for reviews.
     pub review_agent: Option<AgentKind>,
     /// An explicit --agent filter for this invocation only.
@@ -55,6 +59,8 @@ impl Default for WorkflowConfig {
             branch_prefix: String::new(),
             worktree_dir: PathBuf::from(crate::client::worktree::DEFAULT_DIRECTORY),
             agent: AgentKind::Claude,
+            generation_agent: AgentKind::Claude,
+            generation_model: None,
             review_agent: None,
             agent_override: None,
             review_model: None,
@@ -149,8 +155,6 @@ struct ProjectFile {
     /// Default: `[workflow] branch_prefix`.
     branch_prefix: Option<String>,
     worktree_dir: Option<PathBuf>,
-    /// Default: [workflow] agent.
-    agent: Option<AgentKind>,
     #[serde(default, rename = "repo")]
     repos: Vec<RepoConfig>,
 }
@@ -189,8 +193,10 @@ impl FileConfig {
                 }
                 crate::client::worktree::validate_directory(&workflow.worktree_dir)
                     .map_err(|e| e.to_string())?;
-                if let Some(agent) = p.agent {
-                    workflow.agent = agent;
+                if workflow.generation_model.is_none()
+                    && workflow.generation_agent == AgentKind::Claude
+                {
+                    workflow.generation_model = Some(workflow.naming_model.clone());
                 }
                 Ok(Config {
                     name: p.name,
@@ -332,6 +338,84 @@ pub fn add_project(name: &str, task_dir: &str, repo: Option<&str>) -> Result<Con
         .ok_or_else(|| "the project did not make it into the config".to_string())?;
     fs::write(&path, contents).map_err(|e| format!("can't write {}: {e}", path.display()))?;
     Ok(config)
+}
+
+/// Save universal defaults in [workflow]; retain project data and comments.
+pub fn update_settings(
+    agent: Option<AgentKind>,
+    generation_agent: Option<AgentKind>,
+    generation_model: Option<&str>,
+) -> Result<WorkflowConfig, String> {
+    update_settings_at(&config_path(), agent, generation_agent, generation_model)
+}
+
+fn update_settings_at(
+    path: &Path,
+    agent: Option<AgentKind>,
+    generation_agent: Option<AgentKind>,
+    generation_model: Option<&str>,
+) -> Result<WorkflowConfig, String> {
+    use std::io::Write;
+    let path = fs::canonicalize(path).map_err(|e| e.to_string())?;
+    let original = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let mut document: toml_edit::DocumentMut = original.parse().map_err(|e| format!("{e}"))?;
+    if !document.contains_key("workflow") {
+        document["workflow"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let entry = document["workflow"]
+        .as_table_mut()
+        .ok_or_else(|| "[workflow] must be a table".to_string())?;
+    if let Some(agent) = agent {
+        set_setting(entry, "agent", agent.binary());
+    }
+    if let Some(agent) = generation_agent {
+        set_setting(entry, "generation_agent", agent.binary());
+    }
+    if let Some(model) = generation_model {
+        // Empty selects the naming CLI's configured default.
+        set_setting(entry, "generation_model", model.trim());
+    }
+    let updated = document.to_string();
+    let parsed: FileConfig = toml::from_str(&updated).map_err(|e| e.to_string())?;
+    let config = parsed
+        .projects()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no [[project]]".to_string())?
+        .workflow;
+    if generation_agent.is_some() || generation_model.is_some() {
+        crate::client::agent::validate_naming_model(
+            config.generation_agent,
+            config.generation_model.as_deref().unwrap_or("").trim(),
+        )?;
+    }
+    let mut pending =
+        tempfile::NamedTempFile::new_in(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    pending
+        .as_file()
+        .set_permissions(
+            fs::metadata(&path)
+                .map_err(|e| e.to_string())?
+                .permissions(),
+        )
+        .map_err(|e| e.to_string())?;
+    pending
+        .write_all(updated.as_bytes())
+        .map_err(|e| e.to_string())?;
+    pending.as_file().sync_all().map_err(|e| e.to_string())?;
+    if fs::read_to_string(&path).map_err(|e| e.to_string())? != original {
+        return Err("config changed on disk; reload settings and retry".into());
+    }
+    pending.persist(&path).map_err(|e| e.to_string())?;
+    Ok(config)
+}
+
+fn set_setting(table: &mut toml_edit::Table, key: &str, text: &str) {
+    let mut value = toml_edit::Value::from(text);
+    if let Some(previous) = table.get(key).and_then(toml_edit::Item::as_value) {
+        *value.decor_mut() = previous.decor().clone();
+    }
+    table[key] = toml_edit::Item::Value(value);
 }
 
 fn project_block(name: &str, task_dir: &str, repo: Option<&str>) -> String {
@@ -500,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_defaults_and_project_overrides_are_backward_compatible() {
+    fn agent_defaults_are_universal_and_legacy_project_overrides_are_ignored() {
         let text = r#"
             [vault]
             path = "/v"
@@ -532,7 +616,7 @@ mod tests {
         let file: FileConfig = toml::from_str(text).unwrap();
         let projects = file.projects().unwrap();
         assert_eq!(projects[0].workflow.agent, AgentKind::Codex);
-        assert_eq!(projects[1].workflow.agent, AgentKind::Claude);
+        assert_eq!(projects[1].workflow.agent, AgentKind::Codex);
         assert_eq!(projects[0].workflow.review_agent, Some(AgentKind::Claude));
         assert_eq!(
             projects[0].workflow.codex_review_model.as_deref(),
@@ -542,6 +626,118 @@ mod tests {
             toml::from_str::<FileConfig>(&text.replace("agent = \"codex\"", "agent = \"typo\""))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn naming_settings_are_universal_even_with_legacy_project_values() {
+        let file: FileConfig = toml::from_str(
+            r#"
+            [workflow]
+            agent = "codex"
+            generation_agent = "claude"
+            generation_model = "haiku"
+            [[project]]
+            name = "one"
+            [[project]]
+            name = "two"
+            agent = "claude"
+            generation_agent = "codex"
+            generation_model = "old-model"
+        "#,
+        )
+        .unwrap();
+        for project in file.projects().unwrap() {
+            assert_eq!(project.workflow.agent, AgentKind::Codex);
+            assert_eq!(project.workflow.generation_agent, AgentKind::Claude);
+            assert_eq!(project.workflow.generation_model.as_deref(), Some("haiku"));
+        }
+    }
+
+    #[test]
+    fn changing_work_agent_does_not_require_a_valid_naming_model() {
+        let dir = crate::table::fixtures::temp_dir();
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            "[workflow]\ngeneration_model = \"removed-model\"\n[[project]]\nname = \"demo\"\n",
+        )
+        .unwrap();
+        let updated = update_settings_at(&path, Some(AgentKind::Codex), None, None).unwrap();
+        assert_eq!(updated.agent, AgentKind::Codex);
+        assert_eq!(updated.generation_model.as_deref(), Some("removed-model"));
+        let before = fs::read(&path).unwrap();
+        assert!(
+            update_settings_at(&path, None, Some(AgentKind::Claude), Some("invalid-model"))
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn global_settings_preserve_projects_comments_permissions_and_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = crate::table::fixtures::temp_dir();
+        let path = dir.join("config.toml");
+        let link = dir.join("linked.toml");
+        let source = "# Keep this\n[workflow]\nagent = \"claude\" # default CLI\n[[project]]\nname = \"one\" # chosen\n[[project.repo]]\npath = \"/repo\"\n[[project]]\nname = \"two\"\nagent = \"claude\" # legacy value retained\n";
+        fs::write(&path, source).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&path, &link).unwrap();
+        let config = update_settings_at(
+            &link,
+            Some(AgentKind::Codex),
+            Some(AgentKind::Claude),
+            Some(" haiku "),
+        )
+        .unwrap();
+        assert_eq!(config.generation_model.as_deref(), Some("haiku"));
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.starts_with("# Keep this\n"));
+        assert!(updated.contains("agent = \"codex\" # default CLI"));
+        assert!(updated.ends_with(
+            "[[project]]\nname = \"two\"\nagent = \"claude\" # legacy value retained\n"
+        ));
+        for project in toml::from_str::<FileConfig>(&updated)
+            .unwrap()
+            .projects()
+            .unwrap()
+        {
+            assert_eq!(project.workflow.agent, AgentKind::Codex);
+            assert_eq!(project.workflow.generation_model.as_deref(), Some("haiku"));
+        }
+        assert!(link.is_symlink());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let cleared = update_settings_at(&link, None, None, Some("")).unwrap();
+        assert_eq!(cleared.agent, AgentKind::Codex);
+        assert_eq!(cleared.generation_model.as_deref(), Some(""));
+        let before = fs::read(&path).unwrap();
+        assert!(update_settings_at(&path, None, None, Some("invented-model")).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn settings_create_a_workflow_table_without_changing_project_tables() {
+        let dir = crate::table::fixtures::temp_dir();
+        let path = dir.join("config.toml");
+        let source = "[[project]]\nname = \"one\"\n[[project]]\nname = \"two\"\n";
+        fs::write(&path, source).unwrap();
+        update_settings_at(&path, Some(AgentKind::Codex), None, Some("")).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.starts_with(source));
+        assert!(updated.contains("[workflow]"));
+        for project in toml::from_str::<FileConfig>(&updated)
+            .unwrap()
+            .projects()
+            .unwrap()
+        {
+            assert_eq!(project.workflow.agent, AgentKind::Codex);
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

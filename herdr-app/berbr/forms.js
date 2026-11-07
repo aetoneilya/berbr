@@ -279,6 +279,69 @@ function choice(view, t, id, label, options, value, choose, placeholder, empty) 
     .child(Popup.new(`${id}-popup`, trigger).w_full().anchor("bottom_left").when(open, el => el.content(list)));
 }
 
+function field(t, label, control) {
+  return h_flex().gap(12).items_center()
+    .child(div().w(84).flex_none().text_size(12).text_color(t.muted).child(label)).child(control);
+}
+
+function namingModelPicker(view, t, disabled) {
+  const models = view.availableNamingModels();
+  return v_flex().id("naming-model-options").w_full().min_w(0).h(Math.min(models.length, 5) * 32 + 8)
+    .overflow_y_scrollbar().p(4).gap(2).rounded(6).border_1().border_color(t.border).bg(t.background)
+    .children(models.map(model => button(t, `naming-model-${model.id || "default"}`, model.label,
+      cx => view.selectNamingModel(model.id, cx), "ghost", disabled).w_full().flex_none().justify_start()
+      .when(model.id === view.namingModel, el => el.bg(t.selected))
+      .child(div().flex_1()).child(icon("check", 12).when(model.id !== view.namingModel, el => el.invisible()))));
+}
+
+function settingsForm(view, t) {
+  const disabled = view.busy || view.loading || !view.settingsReady;
+  return v_flex().size_full().min_h(0).p(24).gap(16).bg(t.popover).text_color(t.foreground)
+    .child(div().text_size(20).font_semibold().child("Settings"))
+    .child(div().text_size(12).text_color(t.dim).child("Default agent for new tasks in every project."))
+    .child(field(t, "Default agent", segmented(t, "default-agent", [["codex", "Codex"], ["claude", "Claude"]], view.agent,
+      (value, cx) => {view.agent = value; cx.notify();}, disabled)))
+    .when(view.loading, el => el.child(div().text_size(12).text_color(t.dim).child("Loading settings…")))
+    .when(Boolean(view.error), el => el.child(errorLine(view, t)))
+    .child(div().flex_1())
+    .child(h_flex().gap(8).justify_end().child(cancel(view, t))
+      .child(button(t, "save-settings", "Save", cx => view.submitSettings(cx), "primary", disabled, view.busy)));
+}
+
+function namingSettings(view, t) {
+  const disabled = view.busy || view.settingsLoading || !view.settingsReady;
+  const toggle = cx => {
+    if (view.busy) return;
+    view.namingExpanded = !view.namingExpanded;
+    if (view.namingExpanded && !view.settingsReady && !view.settingsLoading) view.loadSettings(cx);
+    cx.notify();
+  };
+  return v_flex().id("new-naming").flex_none().gap(8)
+    .child(keyboardControl(h_flex().id("naming-toggle"), toggle, view.busy)
+      .h(26).gap(6).items_center().cursor_pointer().text_color(t.muted).hover(el => el.text_color(t.foreground))
+      .accessibility_label("Task naming settings").tooltip("Choose the agent and model that name the task")
+      .on_click((_event, cx) => {cx.stop_propagation(); toggle(cx);})
+      .child(icon(view.namingExpanded ? "chevron-down" : "chevron-right", 12))
+      .child(div().text_size(12).child("Task naming")))
+    .when(view.namingExpanded, el => el.child(v_flex().id("naming-details").flex_none().gap(10)
+      .child(div().text_size(12).text_color(t.dim).whitespace_normal()
+        .child("Choose the model that names the task and branch from Description. Saved as the default when you create a task."))
+      .when(view.settingsLoading, el => el.child(div().text_size(12).text_color(t.dim).child("Loading models…")))
+      .when(Boolean(view.settingsError), el => el.child(v_flex().gap(6)
+        .child(div().text_size(12).text_color(t.blocked).whitespace_normal().child(view.settingsError))
+        .child(button(t, "naming-retry", "Retry", cx => view.loadSettings(cx), "ghost", view.busy || view.settingsLoading))))
+      .when(view.settingsReady, el => el
+        .child(field(t, "Agent", segmented(t, "naming-agent", [["codex", "Codex"], ["claude", "Claude"]], view.generationAgent,
+          (value, cx) => {
+            if (value !== view.generationAgent) {
+              view.generationAgent = value; view.namingModel = ""; view.namingDirty = true; cx.notify();
+            }
+          }, disabled)))
+        .child(field(t, "Model", div().flex_1().min_w(0).child(namingModelPicker(view, t, disabled))))
+        .when(!view.availableNamingModels().some(model => model.id === view.namingModel), el => el
+          .child(div().text_size(12).text_color(t.blocked).whitespace_normal().child("Choose an available model or CLI default."))))));
+}
+
 function newForm(view, t) {
   const p = props() ?? {};
   const projects = (p.projects?.length ? p.projects : [view.project].filter(Boolean)).map(name => [name, name]);
@@ -324,7 +387,7 @@ function newForm(view, t) {
     .child(worktreeSwitch(t, value, (next, cx) => { if (!view.busy) { flip(next); view.error = null; cx.notify(); } }, view.busy, id)
       .tab_index(0).tab_stop(!view.busy).accessibility_label(label))
     .child(div().text_size(12).text_color(t.foreground).child(label));
-  const scrollBody = view.source === "jira";
+  const scrollBody = view.source === "jira" || (generate && view.namingExpanded);
   const body = v_flex().id("new-body").min_h(0).gap(12)
     .when(scrollBody, el => el.flex_1().overflow_y_scrollbar())
     .when(!scrollBody, el => el.flex_none())
@@ -348,7 +411,8 @@ function newForm(view, t) {
       .when(view.source !== "jira", el => el.child(toggle("new-jira-ticket", view.newTicket, "New Jira ticket", next => { view.newTicket = next; })))
       .when(Boolean(view.error) || view.created, el => el.child(div().id("new-status").flex_1().min_w(0).h(16)
         .when(Boolean(view.error), el => el.child(errorLine(view, t).truncate().tooltip(view.error)))
-        .when(!view.error && view.created, el => el.child(div().text_size(12).text_color(t.done).child("Task created."))))));
+        .when(!view.error && view.created, el => el.child(div().text_size(12).text_color(t.done).child("Task created."))))))
+    .when(generate, el => el.child(namingSettings(view, t)));
   return v_flex().size_full().min_h(0).p(24).gap(16).line_height(1.25).bg(t.popover).text_color(t.foreground)
     .child(h_flex().h(28).flex_none().items_center()
       .child(div().flex_1().text_size(20).font_semibold().child("New task"))
@@ -578,6 +642,7 @@ export function formView(view, t) {
   if (view.form === "stop-agent") return stopAgentForm(view, t, p);
   if (view.form === "note") return noteForm(view, t, p);
   if (view.form === "new") return newForm(view, t);
+  if (view.form === "settings") return settingsForm(view, t);
   if (view.form === "ticket") return ticketForm(view, t, p);
   if (view.form === "projects") return projectsForm(view, t, p);
   if (view.form === "jump") return jumpForm(view, t);

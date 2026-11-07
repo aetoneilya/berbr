@@ -46,8 +46,8 @@ fn start_with(
             // a headless call of its own: works without an agent for the task too
             ui.say("generating a task name from the description…".into());
             let names = super::naming::from_description(
+                &config.workflow,
                 args.description.as_deref().unwrap(),
-                &config.workflow.naming_model,
             )?;
             if args.name.is_none() {
                 worktree::validate_name(&names.worktree).map_err(err)?;

@@ -741,3 +741,155 @@ fn fresh_codex_session_restores_a_removed_worktree_from_claude_history() {
     assert!(tree.exists());
     assert!(pane_command(&commands).starts_with(&format!("{} 'Context:", fixture.codex_prefix())));
 }
+
+fn fake_naming_cli(fixture: &Fixture, kind: &str) {
+    let script = r#"#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+prompt = sys.stdin.read()
+root = Path(os.environ['BERBR_TEST_CAPTURE']).parent
+(root / 'naming.json').write_text(json.dumps({'kind': Path(sys.argv[0]).name, 'args': args, 'input': prompt, 'cwd': os.getcwd()}))
+if os.environ.get('BERBR_TEST_NAMING_FAIL'):
+    print('generation failed', file=sys.stderr)
+    sys.exit(1)
+result = {'title': 'Generated task', 'worktree': 'generated-task'}
+if Path(sys.argv[0]).name == 'claude':
+    print(json.dumps({'structured_output': result}))
+else:
+    schema = json.loads(Path(args[args.index('--output-schema') + 1]).read_text())
+    assert schema['required'] == ['title', 'worktree']
+    Path(args[args.index('--output-last-message') + 1]).write_text(json.dumps(result))
+"#;
+    let path = fixture.root.join("bin").join(kind);
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn naming_uses_its_configured_cli_and_model_independently_of_the_work_agent() {
+    for (kind, work) in [("claude", "codex"), ("codex", "claude")] {
+        let fixture = Fixture::new(&format!(
+            "agent = \"{work}\"\ngeneration_agent = \"{kind}\"\ngeneration_model = \"test model; literal\""
+        ));
+        fake_naming_cli(&fixture, kind);
+        let description = "Implement a task\nPreserve multiline context and $(literal).";
+        let commands = fixture.run(&[
+            "start",
+            "--description",
+            description,
+            "--no-worktree",
+            "--bg",
+            "--agent",
+            work,
+        ]);
+        assert!(pane_command(&commands).starts_with(&format!("command {work}")));
+        assert!(pane_command(&commands).contains("then work on the task description"));
+        let call: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.root.join("naming.json")).unwrap()).unwrap();
+        assert_eq!(call["kind"], kind);
+        let args = call["args"].as_array().unwrap();
+        let at = args.iter().position(|arg| arg == "--model").unwrap();
+        assert_eq!(args[at + 1], "test model; literal");
+        assert!(
+            call["input"]
+                .as_str()
+                .unwrap()
+                .contains("Preserve multiline context")
+        );
+        assert_ne!(
+            call["cwd"].as_str().unwrap(),
+            fixture.repo.to_str().unwrap()
+        );
+        if kind == "codex" {
+            assert_eq!(args[0], "--no-daemon");
+            assert!(args.iter().any(|arg| arg == "--ephemeral"));
+        }
+        let note = fs::read_dir(fixture.root.join("vault/tasks"))
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        assert!(note.contains(description));
+        assert!(note.contains("Generated task"));
+    }
+}
+
+#[test]
+fn generation_failure_creates_no_notes_or_worktrees_and_an_explicit_title_skips_generation() {
+    let fixture = Fixture::new("generation_agent = \"codex\"");
+    fake_naming_cli(&fixture, "codex");
+    let output = fixture
+        .command(env!("CARGO_BIN_EXE_berbr"))
+        .env("BERBR_TEST_NAMING_FAIL", "1")
+        .args(["start", "--description", "Work on this", "--bg"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("generation failed"));
+    assert_eq!(
+        fs::read_dir(fixture.root.join("vault/tasks"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(fixture.commands().is_empty());
+    fs::remove_file(fixture.root.join("naming.json")).unwrap();
+    fixture.run(&[
+        "start",
+        "Explicit title",
+        "--description",
+        "Work on this",
+        "--no-worktree",
+        "--bg",
+    ]);
+    assert!(!fixture.root.join("naming.json").exists());
+}
+
+#[test]
+fn saved_settings_are_visible_to_subsequent_commands_and_drive_new_work() {
+    let fixture = Fixture::new("");
+    let settings = |args: &[&str]| {
+        let output = fixture
+            .command(env!("CARGO_BIN_EXE_berbr"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let mut text = fs::read_to_string(&fixture.config).unwrap();
+    text.push_str("\n[[project]]\nname = \"other\"\ntask_dirs = [\"other-tasks\"]\nagent = \"claude\"\ngeneration_agent = \"codex\"\n");
+    fs::write(&fixture.config, text).unwrap();
+    let saved = settings(&[
+        "settings",
+        "--default-agent",
+        "codex",
+        "--generation-agent",
+        "claude",
+        "--generation-model",
+        "haiku",
+    ]);
+    assert_eq!(saved["agent"], "codex");
+    assert_eq!(saved["generation_agent"], "claude");
+    assert_eq!(settings(&["settings"]), saved);
+    assert_eq!(settings(&["settings", "-p", "other"]), saved);
+    assert_eq!(settings(&["settings", "-p", "unrelated"]), saved);
+    assert_eq!(saved["scope"], "global");
+    let before = fs::read(&fixture.config).unwrap();
+    let refused = fixture
+        .command(env!("CARGO_BIN_EXE_berbr"))
+        .args(["settings", "--task-naming-model", "invented-model"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert_eq!(fs::read(&fixture.config).unwrap(), before);
+    let commands = fixture.run(&["start", "Explicit title", "--no-worktree", "--bg"]);
+    assert!(pane_command(&commands).starts_with("command codex --no-daemon"));
+    let cleared = settings(&["settings", "--generation-model", ""]);
+    assert_eq!(cleared["generation_model"], "");
+    assert_eq!(cleared["agent"], "codex");
+}
