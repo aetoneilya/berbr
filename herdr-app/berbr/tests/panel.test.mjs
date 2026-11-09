@@ -3466,3 +3466,51 @@ test("Explicit targets do not save naming settings, and Create more saves them o
     assert.ok(!state.calls.some(call => call[0] === "closeOverlay"));
   }
 });
+
+test("GitHub-only new task shows issues, hides Jira creation, and submits a qualified issue", () => {
+  const key = "github.com/demo/repo#42";
+  const {view,cx} = setup({props:{form:"new",project:"demo",projects:["demo"],
+    integrations:{demo:{github:true,jira:false}},tickets:{demo:[{key,title:"Fix login"}]}}});
+  let root = view.render(cx);
+  assert.ok(byId(root,"source-github"));
+  assert.equal(byId(root,"source-jira"),undefined);
+  assert.equal(byId(root,"new-jira-ticket"),undefined);
+  click(byId(root,"source-github"),cx);
+  root = view.render(cx);
+  assert.ok(text(root).includes("Fix login"));
+  click(byId(root,`new-ticket-${key}`),cx);
+  let args;
+  view.perform = (_cx,values) => {args=values;};
+  view.submitNew(cx);
+  assert.deepEqual(args,["start",key,"--bg","--agent","codex"]);
+});
+
+test("GitHub PR and issue links use GitHub labels and preserve the PR number", () => {
+  const {view} = setup();
+  const pr = {kind:"mr",provider:"github",label:"#7 Demo",url:"https://github.com/demo/repo/pull/7",state:"open"};
+  const issue = {kind:"ticket",provider:"github",target:"github.com/demo/repo#1",url:"https://github.com/demo/repo/issues/1"};
+  assert.equal(view.externalLink(theme,"pr-link",pr).attributes.tooltip[0],"Open #7 in GitHub");
+  assert.equal(view.externalLink(theme,"issue-link",issue).attributes.tooltip[0],"Open github.com/demo/repo#1 in GitHub");
+});
+
+test("switching Jira and GitHub clears the previous provider selection before typed input", () => {
+  const gh = "github.com/demo/repo#42";
+  const {view,cx} = setup({props:{form:"new",project:"demo",projects:["demo"],
+    integrations:{demo:{jira:true,github:true}},tickets:{demo:[{key:"DEMO-1",title:"Jira issue"},{key:gh,title:"GitHub issue"}]}}});
+  click(byId(view.render(cx),"source-jira"),cx);
+  click(byId(view.render(cx),"new-ticket-DEMO-1"),cx);
+  assert.equal(view.ticket,"DEMO-1");
+  click(byId(view.render(cx),"source-github"),cx);
+  assert.equal(view.ticket,null);
+  view.values.title=gh;
+  let args;
+  view.perform = (_cx,values) => {args=values;};
+  view.submitNew(cx);
+  assert.deepEqual(args,["start",gh,"--bg","--agent","codex"]);
+  click(byId(view.render(cx),`new-ticket-${gh}`),cx);
+  click(byId(view.render(cx),"source-jira"),cx);
+  assert.equal(view.ticket,null);
+  view.values.title="DEMO-2";
+  view.submitNew(cx);
+  assert.deepEqual(args,["start","DEMO-2","--bg","--agent","codex"]);
+});

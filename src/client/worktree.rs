@@ -466,7 +466,15 @@ pub fn reserve_name(
             1 => format!("{base}-{task}"),
             n => format!("{base}-{task}-{n}"),
         };
-        let suffix = key.map_or_else(|| name.clone(), |k| format!("{k}-{name}"));
+        let suffix = key.map_or_else(
+            || name.clone(),
+            |k| {
+                let key = crate::client::issue::github_parts(k)
+                    .map(|(_, n)| format!("issue-{n}"))
+                    .unwrap_or_else(|| k.to_string());
+                format!("{key}-{name}")
+            },
+        );
         if worktree_roots(main, directory).iter().any(|root| {
             root.join(&name).symlink_metadata().is_ok()
                 || root

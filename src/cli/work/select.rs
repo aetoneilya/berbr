@@ -39,7 +39,7 @@ fn first_worktree(
     let key = task.tickets.first();
     let issue = key.map(|k| fetch_issue(config, k)).transpose()?;
     let desired = work_name(task, tree_name, issue.as_ref());
-    let main = super::common::choose_discovered_repo(mains, ui)?;
+    let main = super::common::choose_issue_repo(config, key.map(String::as_str), mains, ui)?;
     let name = worktree::reserve_name(
         &main,
         &config.workflow.worktree_dir,
@@ -86,6 +86,7 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
         new_session,
         bg,
     } = args;
+    let target = target.as_deref().map(|t| config.issue_key(t)).transpose()?;
     let table = table::build(config, load(config)?, false);
     let key = target.clone().filter(|t| is_ticket_key(t));
     let work = match target {

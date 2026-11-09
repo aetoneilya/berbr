@@ -1,3 +1,21 @@
+/** Provider metadata is explicit in new snapshots; URL fallback supports old ones. */
+export function forgeName(row) {
+  return row?.provider === "github" || /^https:\/\/github\.com\//.test(row?.url ?? "") ? "GitHub"
+    : row?.kind === "ticket" ? "Jira" : "GitLab";
+}
+export function changeKind(row) { return forgeName(row) === "GitHub" ? "PR" : "MR"; }
+export function changeNumber(row) { return row?.label?.match(/[!#]\d+/)?.[0] ?? changeKind(row); }
+export function githubIssue(text) {
+  const value = String(text ?? "").trim();
+  const url = value.match(/^https:\/\/github\.com\/([a-z0-9_.-]+\/[a-z0-9_.-]+)\/issues\/([0-9]+)\/?(?:[?#]\S*)?$/i);
+  const ref = value.match(/^(?:github\.com\/)?([a-z0-9_.-]+\/[a-z0-9_.-]+)#([0-9]+)$/i);
+  const match = url || ref;
+  if (match && Number(match[2]) > 0 && !match[1].split("/").some(p => p === "." || p === ".."))
+    return `github.com/${match[1].toLowerCase()}#${Number(match[2])}`;
+  if (/^#[1-9][0-9]*$/.test(value)) return value;
+  return null;
+}
+
 export function taskSpaceMatches(row, label) {
   const key = String(label ?? "").trim().toLowerCase();
   return Boolean(key) && [row?.task, row?.title].some(value =>
@@ -33,7 +51,7 @@ export function rowMenu(row, ctx = {}) {
     }
     if (row.task && row.tree) add("review", "Review");
     const mr = ctx.mr ?? row.children?.find(child => child.kind === "mr");
-    if (mr?.url) add("mr", "Open MR");
+    if (mr?.url) add("mr", `Open ${changeKind(mr)}`);
     if (row.cwd || treeMarks(row).path) add("copy-path", "Copy path");
     if (row.branch) add("copy-branch", "Copy branch");
     if (row.tree) add("remove-tree", "Remove worktree…", {danger:true, separatorBefore:items.length > 0});
@@ -45,7 +63,7 @@ export function rowMenu(row, ctx = {}) {
     }
   } else if (["mr", "ticket"].includes(row.kind)) {
     if (row.url) {
-      add("url", row.kind === "mr" ? "Open in GitLab" : "Open in Jira");
+      add("url", `Open in ${forgeName(row)}`);
       add("copy-link", "Copy link");
     }
     if (row.kind === "mr" && row.branch) add("copy-branch", "Copy branch");
@@ -141,16 +159,16 @@ export function closePlan(row, liveSpaces = [], related = walk(row?.children)) {
   const removals = trees.map(tree => ({name:tree.tree ?? tree.label ?? "Worktree",
     ...parseTreeMarks(tree.body, tree.state)}));
   const blockers = mrs.filter(mr => ["opened", "open"].includes(mr.state?.toLowerCase()))
-    .map(mr => `MR ${mr.label?.match(/!\d+/)?.[0] ?? `!${mr.url?.match(/\/(\d+)\/?$/)?.[1] ?? mr.target ?? "?"}`} is open`);
+    .map(mr => `${changeKind(mr)} ${changeNumber(mr)} is open`);
   blockers.push(...removals.filter(tree => tree.unpushed).map(tree => `${tree.name}: ↑${tree.unpushed} unpushed`));
   // Snapshot tickets have no assignee; the CLI re-checks ownership before closing.
-  const jira = [...new Set(related.filter(item => item.kind === "ticket" && !isClosedTicket(item))
+  const jira = [...new Set(related.filter(item => item.kind === "ticket" && forgeName(item) !== "GitHub" && !isClosedTicket(item))
     .map(ticket => ticket.target).filter(Boolean))];
   const also = ["Marks the note done"];
   if (taskSpace(row, liveSpaces)) also.push("Closes the Herdr space");
   // Snapshots have no merge timestamps. MR iid is the stable fallback order.
   const merged = mrs.filter(mr => mr.state?.toLowerCase() === "merged").sort((a, b) =>
-    Number(b.label?.match(/!(\d+)/)?.[1] ?? 0) - Number(a.label?.match(/!(\d+)/)?.[1] ?? 0));
+    Number(b.label?.match(/[!#](\d+)/)?.[1] ?? 0) - Number(a.label?.match(/[!#](\d+)/)?.[1] ?? 0));
   return {blockers, removals, jira, also, proof:{count:merged.length, latest:merged[0] ?? null}};
 }
 
@@ -193,10 +211,12 @@ export function mrFlags(mr) {
   const conflict = mr.conflict ?? legacy.conflict;
   const draft = mr.draft ?? legacy.draft;
   const unresolved = Math.max(0, Number(mr.unresolved) || 0);
-  const worst = ci === "failed" ? "CI failed" : conflict ? "conflict" : unresolved
-    ? `${unresolved} ${unresolved === 1 ? "thread" : "threads"}` : draft ? "draft" : mr.ready ? "ready to merge" : null;
+  const changesRequested = mr.review_decision === "CHANGES_REQUESTED";
+  const reviewRequired = mr.review_decision === "REVIEW_REQUIRED";
+  const worst = ci === "failed" ? "CI failed" : conflict ? "conflict" : changesRequested ? "changes requested" : unresolved
+    ? `${unresolved} ${unresolved === 1 ? "thread" : "threads"}` : draft ? "draft" : reviewRequired ? "review required" : mr.ready ? "ready to merge" : null;
   return {ci, conflict, draft, unresolved, ready:Boolean(mr.ready), age:legacy.age, worst,
-    needsYou:ci === "failed" || Boolean(conflict) || unresolved > 0};
+    needsYou:ci === "failed" || Boolean(conflict) || changesRequested || unresolved > 0};
 }
 
 // Presentation only: attention/needsYou semantics stay in mrFlags.
@@ -309,24 +329,24 @@ export function looseWhy(row) {
   if (isMergedTree(row) || row.children?.some(isMergedTree)) return "The branch is merged; its worktree is still on disk.";
   if (row.kind === "ticket") {
     const tree = row.children?.find(child => child.kind === "tree");
-    const mr = walk(row.children).find(child => child.kind === "mr" && child.state?.toLowerCase() === "opened");
+    const mr = walk(row.children).find(child => child.kind === "mr" && ["opened", "open"].includes(child.state?.toLowerCase()));
     const key = row.target ?? "this ticket";
     const needle = String(row.target ?? "").trim().toLowerCase();
     const mentions = text => Boolean(needle) && String(text ?? "").toLowerCase().includes(needle);
     const treeMr = tree?.children?.find(child => child.kind === "mr" && mentions(child.label));
-    const mrKey = treeMr?.label?.match(/!\d+/)?.[0];
+    const mrKey = treeMr?.label?.match(/[!#]\d+/)?.[0];
     const relation = mentions(tree?.branch)
       ? `is on branch ${tree.branch}, which mentions ${key}.`
-      : mrKey ? `has MR ${mrKey}, whose title mentions ${key}.` : `is linked to ${key}.`;
+      : mrKey ? `has ${changeKind(treeMr)} ${mrKey}, whose title mentions ${key}.` : `is linked to ${key}.`;
     const why = tree
       ? `Your worktree ${tree.label ?? tree.tree ?? "unnamed"} ${relation}`
-      : mr ? `Your open MR ${mr.label?.match(/!\d+/)?.[0] ?? ""} mentions ${key}.`
-      : "Assigned to you in Jira; nothing started yet.";
+      : mr ? `Your open ${changeKind(mr)} ${changeNumber(mr)} mentions ${key}.`
+      : forgeName(row) === "GitHub" ? "Open GitHub issue; nothing started yet." : "Assigned to you in Jira; nothing started yet.";
     if (!isClosedTicket(row)) return why;
     return tree || mr ? `The ticket is closed, but ${why.charAt(0).toLowerCase()}${why.slice(1)}`
       : "The ticket is closed; no worktree or open MR remains.";
   }
-  if (row.kind === "mr") return "Your open MR has no ticket key in its branch or title.";
+  if (row.kind === "mr") return `Your open ${changeKind(row)} has no ticket key in its branch or title.`;
   if (row.kind === "tree") return "This worktree's branch matches no ticket or task.";
   return "This item is not attached to a task.";
 }
@@ -353,7 +373,7 @@ export function taskDetail(row, liveAgents = [], liveByTerminal = new Map(liveAg
     return { row:item, live, status:live ? live.status : item.state ?? "unknown" };
   };
   const treeRank = tree => tree.agents.some(agent => agent.live) ? 0
-    : tree.mr?.state?.toLowerCase() === "opened" ? 1
+    : ["opened", "open"].includes(tree.mr?.state?.toLowerCase()) ? 1
     : isMergedTree(tree.row) || ["merged", "closed"].includes(tree.mr?.state?.toLowerCase()) ? 3 : 2;
   const treeName = tree => tree.row.label ?? tree.row.tree ?? "";
   const trees = children.filter(item => item.kind === "tree").map(tree => ({
@@ -382,7 +402,7 @@ export function taskDetail(row, liveAgents = [], liveByTerminal = new Map(liveAg
     tickets:{open:tickets.filter(item => !isClosedTicket(item)), closed:tickets.filter(isClosedTicket)},
     trees,
     mainAgents:children.filter(item => item.kind === "agent").map(agentDetail),
-    openMrs:[...loose.values()].filter(item => item.row.state?.toLowerCase() === "opened"),
+    openMrs:[...loose.values()].filter(item => ["opened", "open"].includes(item.row.state?.toLowerCase())),
     history:[...loose.values()].filter(item => ["merged", "closed"].includes(item.row.state?.toLowerCase())),
     subtasks:children.filter(item => item.kind === "task"),
     excerpt:paragraph && (paragraph.length > 240 || row?.body_truncated)
@@ -425,7 +445,7 @@ export function taskSignals(row, liveAgents = [], liveSpaces = [], related = wal
     .reduce((latest, agent) => !latest || (agent.seq ?? 0) > (latest.seq ?? 0) ? agent : latest, null);
   const seen = new Set();
   const mrs = related.filter(item => {
-    if (item.kind !== "mr" || item.state?.toLowerCase() !== "opened" || seen.has(item.id)) return false;
+    if (item.kind !== "mr" || !["opened", "open"].includes(item.state?.toLowerCase()) || seen.has(item.id)) return false;
     seen.add(item.id);
     return true;
   });
@@ -443,7 +463,7 @@ export function taskSignals(row, liveAgents = [], liveSpaces = [], related = wal
     attention: attention === "blocked" ? "Needs you" : attention === "done" ? "Finished"
       : working ? `${working} working` : "",
     ticket: related.find(item => item.kind === "ticket" && !isClosedTicket(item) && item.target),
-    mrs, mrKey: mrs[0]?.label?.match(/!\d+/)?.[0] ?? "",
+    mrs, mrKey: mrs[0]?.label?.match(/[!#]\d+/)?.[0] ?? "",
     mrFlag: flags.worst, mrNeedsYou:Boolean(attentionMr),
     trees: related.filter(item => item.kind === "tree"),
     liveSpace: taskSpace(row, liveSpaces),
@@ -491,7 +511,7 @@ export function groupSections(rows = [], liveAgents = [], liveSpaces = [], signa
   // Snapshots may nest rows under a header or use it as a sibling delimiter.
   for (const row of rows ?? []) {
     if (row.kind === "header") {
-      looseSection = String(row.label ?? "").trim().toLowerCase() === "assigned to me in jira"
+      looseSection = ["assigned to me in jira", "github issues", "open tickets"].includes(String(row.label ?? "").trim().toLowerCase())
         ? "todo" : "cleanup";
       for (const child of row.children ?? []) addLoose(child);
     } else if (row.kind !== "task") addLoose(row);
@@ -505,12 +525,12 @@ export function looseReason(row) {
     const tree = (row.children ?? []).find(child => child.kind === "tree" &&
       (!isClosedTicket(row) || child.state?.toLowerCase() === "active"));
     const mrs = [...new Map(walk(row.children)
-      .filter(child => child.kind === "mr" && child.state?.toLowerCase() === "opened")
+      .filter(child => child.kind === "mr" && ["opened", "open"].includes(child.state?.toLowerCase()))
       .map(mr => [mr.url || mr.id || mr, mr])).values()];
     if (!isClosedTicket(row)) return tree ? `worktree ${tree.label ?? tree.tree ?? "unnamed"}`
-      : mrs.length ? `MR ${mrs[0].label?.match(/!\d+/)?.[0] ?? mrs[0].target ?? ""} open` : "ticket open";
+      : mrs.length ? `${changeKind(mrs[0])} ${changeNumber(mrs[0])} open` : "ticket open";
     const reason = tree ? "ticket closed · worktree left" : "ticket closed";
-    return mrs.length ? `${reason} · ${mrs.length} ${mrs.length === 1 ? "MR" : "MRs"} open` : reason;
+    return mrs.length ? `${reason} · ${mrs.length} ${mrs.every(m => changeKind(m) === "PR") ? (mrs.length === 1 ? "PR" : "PRs") : (mrs.length === 1 ? "MR" : "MRs")} open` : reason;
   }
   const age = row.kind === "mr" ? parseMrFlags(row.body).age : null;
   return age === null ? "no ticket" : `no ticket · ${age}d`;
@@ -540,8 +560,8 @@ export function mergedPlan(trees = []) {
   for (const row of trees) {
     const marks = treeMarks(row);
     const reason = marks.changes ? "uncommitted changes" : marks.unpushed ? "unpushed commits"
-      : row.mr_state === "opened" || row.children?.some(child => child.kind === "mr" && child.state === "opened")
-        ? "open MR" : !marks.merged ? "not merged" : null;
+      : ["opened", "open"].includes(row.mr_state) || row.children?.some(child => child.kind === "mr" && ["opened", "open"].includes(child.state))
+        ? `open ${changeKind(row.children?.find(child => child.kind === "mr"))}` : !marks.merged ? "not merged" : null;
     if (reason) keep.push({tree:row.tree ?? row.label, reason});
     else remove.push({tree:row.tree ?? row.label, path:row.cwd ?? marks.path,
       uncommitted:marks.changes, unpushed:marks.unpushed, merged:true});
@@ -722,6 +742,8 @@ const JIRA_KEY = /^[A-Z][A-Z0-9]*-\d+$/;
 export function smartTarget(text) {
   const value = String(text ?? "").trim();
   if (!value) return {kind:"empty"};
+  const github = githubIssue(value);
+  if (github) return {kind:"ticket", key:github};
   const link = value.match(/^https?:\/\/\S+\/browse\/([A-Z][A-Z0-9]*-\d+)\/?(?:[?#]\S*)?$/);
   if (link) return {kind:"ticket", key:link[1]};
   if (JIRA_KEY.test(value)) return {kind:"ticket", key:value};
@@ -735,11 +757,11 @@ export function targetHint(target, tickets = [], description = "") {
   switch (target.kind) {
     case "ticket": {
       const title = tickets.find(ticket => ticket.key === target.key)?.title;
-      return `Jira ticket ${target.key}${title ? ` — ${title}` : ""}: the task is named after it`;
+      return `${githubIssue(target.key) ? "GitHub issue" : "Jira ticket"} ${target.key}${title ? ` — ${title}` : ""}: the task is named after it`;
     }
     case "branch": return `Branch ${target.branch}: checked out if it exists, else created from origin`;
     case "name": return `New task “${target.name}”`;
-    case "unsupported": return "Only Jira links are understood here";
+    case "unsupported": return "Paste a Jira or GitHub issue link";
     default: return String(description ?? "").trim()
       ? "A small model will name the task and branch from the description; takes a few seconds."
       : "Leave empty and the agent will name it.";
@@ -755,9 +777,13 @@ export function newTaskArgs(form) {
   const description = String(form.description ?? "").trim();
   const fail = error => ({error});
   let target;
-  if (form.source === "jira") {
+  if (form.source === "github") {
+    const key = githubIssue(form.ticket || text);
+    if (!key) return fail("Pick a GitHub issue or enter owner/repo#number or an issue URL.");
+    target = {kind:"ticket", key};
+  } else if (form.source === "jira") {
     target = smartTarget(form.ticket || text);
-    if (target.kind !== "ticket") return fail("Pick a Jira ticket or enter a valid Jira ticket key (for example DEMO-123).");
+    if (target.kind !== "ticket" || githubIssue(target.key)) return fail("Pick a Jira ticket or enter a valid Jira ticket key (for example DEMO-123).");
   } else if (form.source === "branch") {
     if (!text) return fail("Enter a branch.");
     if (/\s/.test(text)) return fail("A branch name has no spaces.");

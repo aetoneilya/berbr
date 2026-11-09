@@ -1,7 +1,7 @@
 //! The agent's brief and first prompt.
 
 use super::common::err;
-use crate::client::jira::JiraIssue;
+use crate::client::issue::Issue;
 use crate::client::worktree;
 use crate::vault::task::Task;
 use std::path::{Path, PathBuf};
@@ -61,16 +61,14 @@ pub(super) fn brief_text(
     tree: &Path,
     branch: &str,
     task: Option<&Task>,
-    issue: Option<&JiraIssue>,
+    issue: Option<&Issue>,
     task_tickets: &[String],
     message: Option<&str>,
 ) -> String {
     let mut brief = String::new();
     match (task, issue) {
         (Some(task), _) => brief.push_str(&format!("# {}\n\n", task.display_name())),
-        (None, Some(issue)) => {
-            brief.push_str(&format!("# {}: {}\n\n", issue.key, issue.fields.summary))
-        }
+        (None, Some(issue)) => brief.push_str(&format!("# {}: {}\n\n", issue.key, issue.summary)),
         (None, None) => {}
     }
     if let Some(task) = task {
@@ -81,12 +79,14 @@ pub(super) fn brief_text(
         tree.display()
     ));
     if let Some(issue) = issue {
+        if let Some(url) = crate::client::issue::url(&issue.key) {
+            brief.push_str(&format!("\nIssue: {url}\n"));
+        }
         brief.push_str(&format!(
             "\n## {}: {}\n\n{}\n",
             issue.key,
-            issue.fields.summary,
+            issue.summary,
             issue
-                .fields
                 .description
                 .as_deref()
                 .unwrap_or("(no description)")
