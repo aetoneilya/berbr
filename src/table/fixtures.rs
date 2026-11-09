@@ -136,6 +136,7 @@ pub fn inputs(tasks: Vec<Task>, tickets: Vec<Ticket>, mrs: Vec<Mr>, trees: Vec<T
         complete: true,
         jira: live(),
         gitlab: live(),
+        github: live(),
         warnings: Vec::new(),
         jira_host: "https://jira".to_string(),
     }

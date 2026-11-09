@@ -7,7 +7,7 @@ use super::common::{
 };
 use super::launch::{Context, Open, Space, launch, open_added_work, open_work};
 use crate::cli::{AddArgs, StartArgs, load};
-use crate::client::jira::JiraIssue;
+use crate::client::issue::Issue;
 use crate::client::worktree;
 use crate::config::Config;
 use crate::vault::task::{Task, ticket_keys};
@@ -40,7 +40,7 @@ fn start_with(
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
     {
-        Some(target) => target,
+        Some(target) => config.issue_key(&target)?,
         None if args.unnamed => String::new(),
         None if args.description.is_some() => {
             // a headless call of its own: works without an agent for the task too
@@ -85,7 +85,7 @@ fn start_with(
         // work always gets a task: a note for shared context and agents' findings,
         // named after the ticket
         let issue = fetch_issue(config, &target)?;
-        let title = note_title(&issue.fields.summary);
+        let title = note_title(&issue.summary);
         if title.is_empty() {
             return Err(format!("{target} has no summary to name the task after"));
         }
@@ -126,7 +126,24 @@ fn start_with(
         }
     }
 
-    let mut keys: Vec<String> = tickets.iter().flat_map(|t| ticket_keys(t)).collect();
+    let mut keys: Vec<String> = tickets
+        .iter()
+        .map(|t| config.issue_key(t))
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .flat_map(|t| ticket_keys(t))
+        .collect();
+    // Validate every explicitly linked GitHub issue before creating either a
+    // note or a Jira ticket, including tasks with no checkout and no agent.
+    let mut github_issues = std::collections::HashMap::new();
+    for key in keys
+        .iter()
+        .filter(|k| crate::client::issue::github_parts(k).is_some())
+    {
+        if !github_issues.contains_key(key) {
+            github_issues.insert(key.clone(), fetch_issue(config, key)?);
+        }
+    }
     let tree_name = name;
     if new_ticket {
         let key = create_ticket(config, &target)?;
@@ -163,8 +180,16 @@ fn start_with(
         return Ok(());
     }
 
-    let issue = keys.first().map(|k| fetch_issue(config, k)).transpose()?;
-    let main = choose_repo(config, ui)?;
+    let issue = keys
+        .first()
+        .map(|key| {
+            github_issues
+                .remove(key)
+                .map(Ok)
+                .unwrap_or_else(|| fetch_issue(config, key))
+        })
+        .transpose()?;
+    let main = choose_repo(config, keys.first().map(String::as_str), ui)?;
     if no_worktree {
         // The agent in the main checkout, its brief in berbr's cache
         let label = work_name(&task, tree_name, issue.as_ref());
@@ -278,6 +303,7 @@ fn add_with(
         [task, key] => (Some(task.clone()), Some(key.clone())),
         _ => return Err("berbr add [<task>] <KEY>".to_string()),
     };
+    let key = key.as_deref().map(|k| config.issue_key(k)).transpose()?;
     if let Some(key) = &key
         && !is_ticket_key(key)
     {
@@ -304,7 +330,7 @@ fn add_with(
     }
     let issue = key
         .as_deref()
-        .filter(|_| config.jira.is_some())
+        .filter(|key| config.jira.is_some() || crate::client::issue::github_parts(key).is_some())
         .map(|key| fetch_issue(config, key))
         .transpose()?;
     let main = match &in_tree {
@@ -330,7 +356,7 @@ fn add_with(
                 }
             }
         }
-        None => super::common::choose_discovered_repo(&table.mains, ui)?,
+        None => super::common::choose_issue_repo(config, key.as_deref(), &table.mains, ui)?,
     };
     let existing = in_tree.is_some();
     let (tree, branch, wt_name) = match in_tree {
@@ -408,22 +434,49 @@ fn add_with(
 
 /// My open Jira tickets that belong to no task, plus "new task…".
 fn pick_start_target(config: &Config, tasks: &[Task], ui: &mut dyn Ui) -> Result<String, String> {
-    let client = config.jira_client()?;
-    let issues = client
-        .search_issues_brief(
-            "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC",
-            50,
-        )
-        .map_err(err)?;
-    let free: Vec<&JiraIssue> = issues
+    let mut issues: Vec<Issue> = if config.has_github() {
+        crate::client::github::GitHub::from_env()?
+            .tickets(&config.github_repos(), &[], &[])?
+            .into_values()
+            .filter(|i| !i.closed())
+            .map(|i| Issue {
+                key: i.key,
+                summary: i.summary,
+                description: None,
+            })
+            .collect()
+    } else {
+        config
+            .jira_client()?
+            .search_issues_brief(
+                "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC",
+                50,
+            )
+            .map_err(err)?
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    };
+    if config.has_github() && config.jira.is_some() {
+        issues.extend(
+            config
+                .jira_client()?
+                .search_issues_brief(
+                    "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC",
+                    50,
+                )
+                .map_err(err)?
+                .into_iter()
+                .map(Into::into),
+        );
+    }
+    issues.sort_by(|a, b| a.key.cmp(&b.key));
+    let free: Vec<&Issue> = issues
         .iter()
         .filter(|i| !tasks.iter().any(|t| t.tickets.contains(&i.key)))
         .collect();
     let mut items = vec!["+ new task…".to_string()];
-    items.extend(
-        free.iter()
-            .map(|i| format!("{}  {}", i.key, i.fields.summary)),
-    );
+    items.extend(free.iter().map(|i| format!("{}  {}", i.key, i.summary)));
     match ui.pick("Start", &items)? {
         0 => ui.input("Task name"),
         i => Ok(free[i - 1].key.clone()),

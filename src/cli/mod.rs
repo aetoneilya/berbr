@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "berbr", author, version, long_about = None)]
-/// Tasks, Jira tickets, merge requests and worktrees in one table
+/// Tasks, GitHub Issues/PRs, Jira tickets, merge requests and worktrees in one table
 pub struct Cli {
     /// The project; default: the one the current directory is in, else the first
     #[arg(long, short = 'p', global = true)]
@@ -31,7 +31,7 @@ pub struct Cli {
 enum CliCommands {
     /// Read-only JSON board for the native Herdr App mod.
     AppSnapshot {
-        /// Read cached Jira/GitLab data without network calls.
+        /// Read cached GitHub/Jira/GitLab data without network calls.
         #[arg(long)]
         cached: bool,
     },

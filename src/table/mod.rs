@@ -83,6 +83,14 @@ impl Mr {
         }
     }
 
+    pub fn source_project(&self) -> &str {
+        if self.mr.github {
+            self.mr.head_repo.as_deref().unwrap_or("")
+        } else {
+            &self.project
+        }
+    }
+
     pub fn opened(&self) -> bool {
         self.mr.state() == MrState::Opened
     }
@@ -314,6 +322,7 @@ pub struct Table {
     pub sessions: HashMap<String, sessions::Session>,
     pub jira: Source,
     pub gitlab: Source,
+    pub github: Source,
     pub warnings: Vec<String>,
     pub jira_host: String,
 }
@@ -522,6 +531,7 @@ impl Table {
 
     /// The Jira page of `key`, fetched or not.
     pub fn ticket_url(&self, key: &str) -> String {
-        format!("{}/browse/{key}", self.jira_host.trim_end_matches('/'))
+        crate::client::issue::url(key)
+            .unwrap_or_else(|| format!("{}/browse/{key}", self.jira_host.trim_end_matches('/')))
     }
 }

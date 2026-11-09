@@ -1,6 +1,6 @@
 # berbr
 
-berbr joins Jira tickets, GitLab merge requests, git worktrees,
+berbr joins GitHub Issues and Pull Requests, Jira tickets, GitLab merge requests, git worktrees,
 [herdr](https://herdr.dev) agents and task notes into one table. A task is a markdown note; its tickets, MRs, worktrees, agents and claude
 sessions are found from branch names, herdr workspaces and transcripts. `berbr`
 shows the table as a TUI or as plain text and runs the daily workflow: start a
@@ -85,6 +85,73 @@ appends a `[[project]]` here. `[` `]` and Tab switch at once.
 
 Tokens come from `JIRA_TOKEN` and `GITLAB_TOKEN`. `BERBR_TRACE=1` prints how long
 each fetch, the matching and the rendering took to stderr.
+
+### GitHub.com
+
+GitHub works without Jira or GitLab. Configure the repository whose issues and
+PRs you want to see, and its local checkout:
+
+```toml
+[[project]]
+name = "demo"
+github = { repo = "example/demo" }
+
+[[project.repo]]
+path = "~/code/demo"
+```
+
+Authenticate with `gh auth login --hostname github.com` (Berbr reads its saved
+token), or set `GH_TOKEN` / `GITHUB_TOKEN`. Precedence is `GH_TOKEN`, then
+`GITHUB_TOKEN`, then `gh auth token --hostname github.com`. The token must have
+access to the configured repositories. A classic token needs `repo` for private
+repositories; a fine-grained token needs read access to repository metadata,
+Issues, Pull requests, Commit statuses and Checks. Organization SSO may also
+need authorization. Berbr only reads GitHub; it never creates/closes issues or
+publishes/merges PRs. GitHub Enterprise is outside this release.
+
+The CLI, TUI's new-task ticket picker, and Herdr's **GitHub** tab list open
+issues, including unassigned ones. In the CLI, use:
+
+```sh
+berbr start example/demo#42
+berbr start https://github.com/example/demo/issues/42
+berbr attach example/demo#42 demo-0
+berbr add demo-0 example/demo#42 --name followup
+berbr select example/demo#42
+```
+
+Quote `'#42'` to use a number when the project has exactly one configured GitHub
+repository. With multiple repositories use `owner/repo#42`. Task notes store
+`github.com/owner/repo#42`, so equal issue numbers in different repositories are
+distinct. GitHub issue branches use `issue-42-<name>`; the saved checkout path
+keeps the task binding. The agent's brief includes the issue title and body.
+
+For several checkouts, set `github_repo = "owner/repo"` in each
+`[[project.repo]]`. A repository can select GitHub or GitLab; a project may use
+both, alongside Jira. An explicit repository setting overrides the project
+default. To work in a fork, keep the upstream in `github.repo` and put the fork
+in the checkout's `github_repo`. Berbr also discovers a fork's upstream from
+GitHub repository metadata. PRs match the source repository **and** branch,
+while PR numbers and issue references belong to the target repository. Only
+API-confirmed issues from configured repositories are added to task notes;
+references to other PRs or unconfigured upstream issues are excluded. Jira keys
+in GitHub branches and PRs keep their existing task-matching behavior.
+
+PR discovery includes open PRs and recently updated merged/closed PRs (90 days),
+plus older PRs for local checkout branches. Tasks without issues match their PRs
+through their saved worktrees. The panel shows draft, checks, approvals, review
+decision, unresolved threads and conflicts, with GitHub links and PR labels.
+Ready requires complete current review data, successful checks for the current
+head, a clean merge verdict, and no draft, conflict or unresolved thread.
+Unknown checks, changed heads, incomplete reviews and cached data never show
+ready. Missing credentials, access failures, rate limits and network failures
+show a warning and reuse the last successful cache for the configured set of
+repositories. `app-snapshot --cached` makes no remote requests.
+
+Snapshot v3 retains `kind: "mr"` for compatibility. GitHub rows add
+`provider: "github"`, qualified `repository` / `head_repository`, and
+`review_decision`; open PRs use `state: "open"` and labels `#42`. The `sources`
+object adds `github`. Closing a Berbr task leaves its GitHub issues open.
 
 Commands that change something (start, select, done, rename, …) are logged with
 their arguments, folder, time and error to `~/.berbr/logs/berbr.log`

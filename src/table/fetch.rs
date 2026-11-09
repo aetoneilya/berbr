@@ -94,8 +94,12 @@ fn repositories(config: &Config, refs: bool) -> (Vec<Repository>, Vec<String>) {
                 refs,
                 default,
                 project: repo
-                    .gitlab_project
-                    .clone()
+                    .github_repo
+                    .as_ref()
+                    .or_else(|| config.github.as_ref().map(|g| &g.repo))
+                    .filter(|_| repo.gitlab_project.is_none())
+                    .map(|r| format!("github.com/{r}"))
+                    .or_else(|| repo.gitlab_project.clone())
                     .or_else(|| config.gitlab.as_ref().map(|g| g.project.clone())),
             })
         })();
@@ -140,12 +144,20 @@ impl ClosingScope {
         branches.extend(
             mrs.iter()
                 .filter(|m| m.keys.iter().any(|k| self.tickets.contains(k)))
-                .map(|m| (m.project.clone(), m.mr.source_branch().to_string())),
+                .map(|m| {
+                    (
+                        m.source_project().to_string(),
+                        m.mr.source_branch().to_string(),
+                    )
+                }),
         );
         mrs.into_iter()
             .filter(|m| {
                 m.keys.iter().any(|k| self.tickets.contains(k))
-                    || branches.contains(&(m.project.clone(), m.mr.source_branch().to_string()))
+                    || branches.contains(&(
+                        m.source_project().to_string(),
+                        m.mr.source_branch().to_string(),
+                    ))
             })
             .collect()
     }
@@ -218,7 +230,18 @@ pub(super) fn fetch(config: &Config, tasks: Vec<Task>, options: Options) -> Inpu
     } else {
         Vec::new()
     };
-    let (mine, by_key, mrs, trees, herdr) = std::thread::scope(|scope| {
+    let (mine, by_key, mrs, trees, herdr, github) = std::thread::scope(|scope| {
+        let github = scope.spawn(|| {
+            fetch_github(
+                config,
+                &repos,
+                &known,
+                online,
+                cached,
+                persist,
+                closing.as_ref(),
+            )
+        });
         let mine = scope.spawn(|| match &jira {
             Some(jira) => trace::time("jira: mine", || {
                 fetch_my_tickets(
@@ -267,6 +290,18 @@ pub(super) fn fetch(config: &Config, tasks: Vec<Task>, options: Options) -> Inpu
                     vec!["Herdr inventory panicked".into()],
                 )
             }),
+            github.join().unwrap_or_else(|_| {
+                let warning = "GitHub fetch worker panicked".to_string();
+                (
+                    HashMap::new(),
+                    Vec::new(),
+                    Source {
+                        fresh: Fresh::Missing,
+                        warning: Some(warning.clone()),
+                    },
+                    vec![warning],
+                )
+            }),
         )
     });
     let (agents, workspaces, mut warnings) = herdr;
@@ -276,19 +311,38 @@ pub(super) fn fetch(config: &Config, tasks: Vec<Task>, options: Options) -> Inpu
         Ok((mrs, tickets)) => (Ok(mrs), tickets),
         Err(err) => (Err(err), Ok(HashMap::new())),
     };
+    // Jira references in GitHub PRs follow the same contract as GitLab MR keys.
+    // Only newly discovered keys need this extra batch after the parallel fetch.
+    let github_jira_keys: Vec<_> = github
+        .1
+        .iter()
+        .flat_map(|m| m.keys.clone())
+        .filter(|key| crate::client::issue::github_parts(key).is_none() && !known.contains(key))
+        .collect();
+    let by_key = match &jira {
+        Some(Ok(client)) => by_key.and_then(|mut tickets| {
+            tickets.extend(fetch_new_jira_tickets(
+                client,
+                &github_jira_keys,
+                closing.is_some(),
+            )?);
+            Ok(tickets)
+        }),
+        _ => by_key,
+    };
     let tickets = all_tickets(mine, by_key, of_mrs);
 
     let complete = online && tickets.is_ok() && mrs.is_ok();
     let mut cache = (cached && !complete)
         .then(|| RemoteCache::load(&config.name))
         .flatten();
-    let (tickets, jira) = or_cached(
+    let (mut tickets, jira) = or_cached(
         "Jira",
         online.then_some(tickets),
         cache.as_mut().map(|c| std::mem::take(&mut c.tickets)),
         &mut warnings,
     );
-    let (mrs, gitlab) = or_cached(
+    let (mut mrs, gitlab) = or_cached(
         "GitLab",
         online.then_some(mrs),
         cache.map(|c| c.mrs),
@@ -297,6 +351,12 @@ pub(super) fn fetch(config: &Config, tasks: Vec<Task>, options: Options) -> Inpu
     if complete && persist {
         RemoteCache::save(&config.name, &tickets, &mrs);
     }
+
+    let (github_tickets, github_mrs, github, github_warnings) = github;
+    let complete = complete && (!config.has_github() || github.fresh == Fresh::Live);
+    tickets.extend(github_tickets);
+    mrs.extend(github_mrs);
+    warnings.extend(github_warnings);
 
     let sessions = early_sessions.unwrap_or_else(|| {
         trace::time("sessions", || {
@@ -316,6 +376,7 @@ pub(super) fn fetch(config: &Config, tasks: Vec<Task>, options: Options) -> Inpu
         complete,
         jira,
         gitlab,
+        github,
         warnings,
         jira_host: config
             .jira
@@ -323,6 +384,99 @@ pub(super) fn fetch(config: &Config, tasks: Vec<Task>, options: Options) -> Inpu
             .map(|j| j.host.clone())
             .unwrap_or_default(),
     }
+}
+
+fn fetch_github(
+    config: &Config,
+    repos: &[Repository],
+    known: &[String],
+    online: bool,
+    cached: bool,
+    persist: bool,
+    closing: Option<&ClosingScope>,
+) -> (HashMap<String, Ticket>, Vec<Mr>, Source, Vec<String>) {
+    use std::hash::{Hash, Hasher};
+    let configured = config.github_repos();
+    if configured.is_empty() {
+        return (
+            HashMap::new(),
+            Vec::new(),
+            Source {
+                fresh: Fresh::Live,
+                warning: None,
+            },
+            Vec::new(),
+        );
+    }
+    // Configuration changes must not reuse data from another set of repositories.
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    configured.hash(&mut hash);
+    let cache_name = format!("{}-github-{:x}", config.name, hash.finish());
+    let mut warnings = Vec::new();
+    let fetched = online.then(|| {
+        let github = crate::client::github::GitHub::from_env()?;
+        let mut branches: HashMap<String, HashSet<String>> = HashMap::new();
+        for repo in repos {
+            if let Some(project) = repo
+                .project
+                .as_deref()
+                .and_then(|p| p.strip_prefix("github.com/"))
+            {
+                branches
+                    .entry(project.into())
+                    .or_default()
+                    .extend(repo.trees.iter().filter_map(|t| t.branch.clone()));
+            }
+        }
+        let mut mrs = github.pulls(&configured, &branches)?;
+        if let Some(scope) = closing {
+            mrs = scope.select(mrs);
+        }
+        warnings.extend(github.reviews(&mut mrs));
+        let keys: Vec<_> = known
+            .iter()
+            .cloned()
+            .chain(mrs.iter().flat_map(|m| m.keys.clone()))
+            .filter(|key| {
+                crate::client::issue::github_parts(key)
+                    .is_some_and(|(r, _)| configured.iter().any(|c| c == r))
+            })
+            .collect();
+        let tickets = github.tickets(&configured, known, &keys)?;
+        confirmed_issue_references(&mut mrs, &tickets);
+        Ok::<_, String>(RemoteCache { tickets, mrs })
+    });
+    let cache = cached.then(|| RemoteCache::load(&cache_name)).flatten();
+    let fallback = cache.map(|c| (c.tickets, c.mrs));
+    let fetched = fetched.map(|r| r.map(|c| (c.tickets, c.mrs)));
+    let ((tickets, mrs), source) = or_cached("GitHub", fetched, fallback, &mut warnings);
+    if persist && online && source.fresh == Fresh::Live {
+        RemoteCache::save(&cache_name, &tickets, &mrs);
+    }
+    (tickets, mrs, source, warnings)
+}
+
+/// GitHub numbers are shared by issues and PRs. Only API-confirmed issues may
+/// enter task notes through automatic discovery; otherwise a PR reference would
+/// become a required issue on the next refresh and poison the source.
+fn confirmed_issue_references(mrs: &mut [Mr], tickets: &HashMap<String, Ticket>) {
+    for mr in mrs {
+        mr.keys.retain(|key| {
+            crate::client::issue::github_parts(key).is_none() || tickets.contains_key(key)
+        });
+    }
+}
+
+fn branch_keys(project: Option<&str>, branch: Option<&str>) -> Vec<String> {
+    let Some(branch) = branch else {
+        return Vec::new();
+    };
+    // A fork checkout cannot resolve a bare issue number to the target repo.
+    // Persisted task/worktree bindings and qualified PR references provide ownership.
+    if project.is_some_and(|p| p.starts_with("github.com/")) {
+        return crate::vault::task::jira_keys(branch);
+    }
+    ticket_keys(branch)
 }
 
 /// Every ticket Jira was asked for, or why not all of them: a ticket missing for
@@ -428,6 +582,13 @@ fn known_keys(repos: &[Repository], tasks: &[Task]) -> Vec<String> {
 
 /// My tickets that are not done (resolution alone misses Declined/Cancelled).
 fn fetch_my_tickets(jira: &JiraClient, keys: Option<&[String]>) -> Tickets {
+    let filtered = keys.map(|keys| {
+        keys.iter()
+            .filter(|k| crate::client::issue::github_parts(k).is_none())
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let keys = filtered.as_deref();
     if keys.is_some_and(|keys| keys.is_empty()) {
         return Ok(HashMap::new());
     }
@@ -447,6 +608,12 @@ fn fetch_my_tickets(jira: &JiraClient, keys: Option<&[String]>) -> Tickets {
 /// The tickets of `keys` that exist; keys Jira does not know are left out, but a
 /// query that fails otherwise fails them all.
 fn fetch_tickets_by_key(jira: &JiraClient, keys: &[String]) -> Tickets {
+    let keys: Vec<String> = keys
+        .iter()
+        .filter(|k| crate::client::issue::github_parts(k).is_none())
+        .cloned()
+        .collect();
+    let keys = keys.as_slice();
     let mut tickets = HashMap::new();
     for chunk in keys.chunks(100) {
         let jql = format!("key in ({})", chunk.join(","));
@@ -504,6 +671,16 @@ fn require_known_keys(keys: &[String], tickets: &HashMap<String, Ticket>) -> Res
             missing.join(", ")
         ))
     }
+}
+
+/// New references discovered after the initial Jira queries need an ownership
+/// query too when closing; the initial "mine" query was scoped to known keys.
+fn fetch_new_jira_tickets(jira: &JiraClient, keys: &[String], closing: bool) -> Tickets {
+    let mut tickets = fetch_tickets_by_key(jira, keys)?;
+    if closing {
+        tickets.extend(fetch_my_tickets(jira, Some(keys))?);
+    }
+    Ok(tickets)
 }
 
 /// The issue Jira answered with, None for a key it does not know (404, or 400).
@@ -578,13 +755,7 @@ fn fetch_mrs(
             .into_iter()
             .collect();
         let tickets = scope.spawn(move || match jira {
-            Some(Ok(jira)) => {
-                let mut tickets = fetch_tickets_by_key(jira, &keys)?;
-                if closing.is_some() {
-                    tickets.extend(fetch_my_tickets(jira, Some(&keys))?);
-                }
-                Ok(tickets)
-            }
+            Some(Ok(jira)) => fetch_new_jira_tickets(jira, &keys, closing.is_some()),
             _ => Ok(HashMap::new()),
         });
         let jobs: Vec<_> = found
@@ -679,7 +850,7 @@ fn inspect_tree(
             repo: repo.main.clone(),
             project: repo.project.clone(),
             wt: wt.clone(),
-            keys: wt.branch.as_deref().map(ticket_keys).unwrap_or_default(),
+            keys: branch_keys(repo.project.as_deref(), wt.branch.as_deref()),
             changes,
             unpushed,
             head,
@@ -872,6 +1043,39 @@ mod closing_scope_tests {
     use crate::table::fixtures::{mr, task_note, tree};
 
     #[test]
+    fn github_closing_scope_selects_own_fork_before_any_review_requests() {
+        let note = task_note(
+            "local",
+            "worktrees: [/r/.claude/worktrees/own]",
+            "2026-11-01",
+        );
+        let mut own = tree("own", "same");
+        own.project = Some("github.com/fork/repo".into());
+        let scope = ClosingScope::new(&note, &[own], None);
+        let mut related = mr(1, "same", "Own fork PR", "opened");
+        related.mr.github = true;
+        related.mr.head_repo = Some("github.com/fork/repo".into());
+        related.project = "github.com/upstream/repo".into();
+        let mut unrelated = mr(
+            2,
+            "other",
+            "Unrelated PR with missing review permissions",
+            "opened",
+        );
+        unrelated.mr.github = true;
+        unrelated.mr.head_repo = Some("github.com/other/repo".into());
+        unrelated.project = "github.com/upstream/repo".into();
+        let selected = scope.select(vec![related, unrelated]);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].mr.iid(), 1);
+        let empty = ClosingScope::new(&note, &[], None);
+        assert!(
+            empty.select(selected).is_empty(),
+            "a local task must trigger no unrelated PR review requests"
+        );
+    }
+
+    #[test]
     fn closing_scope_uses_repository_branches_and_discovers_mr_ticket_branches() {
         let task = task_note(
             "demo-0",
@@ -894,5 +1098,101 @@ mod closing_scope_tests {
             selected.iter().map(|m| m.mr.iid()).collect::<Vec<_>>(),
             [1, 3, 4]
         );
+    }
+}
+
+#[cfg(test)]
+mod github_reference_tests {
+    use super::*;
+    use crate::table::Category;
+    use crate::table::fixtures::{mr, task_note, ticket, tree};
+    #[test]
+    fn a_jira_ticket_first_discovered_in_github_pr_keeps_its_owner_when_closing() {
+        let issue = serde_json::json!({"key":"DEMO-42","fields":{"summary":"Synthetic issue","created":"2026-11-01T00:00:00Z", "status":{"name":"Open","statusCategory":{"key":"new"}}}});
+        let page = serde_json::json!({"startAt":0,"total":1,"issues":[issue]});
+        for ownership_status in [200, 403] {
+            let (base, server) = crate::client::test_http::serve(vec![
+                (200, "", page.clone()),
+                (ownership_status, "", page.clone()),
+            ]);
+            let client = JiraClient::fixture(base);
+            let result = fetch_new_jira_tickets(&client, &["DEMO-42".into()], true);
+            if ownership_status == 200 {
+                assert!(result.unwrap()["DEMO-42"].mine);
+            } else {
+                assert!(
+                    result.is_err(),
+                    "unknown ownership must block closing, not leave the ticket open silently"
+                );
+            }
+            let requests = server.join().unwrap();
+            let jql = |request: &str| {
+                let target = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                reqwest::Url::parse(&format!("http://fixture{target}"))
+                    .unwrap()
+                    .query_pairs()
+                    .find(|(key, _)| key == "jql")
+                    .unwrap()
+                    .1
+                    .into_owned()
+            };
+            assert!(!jql(&requests[0]).contains("assignee"));
+            assert!(jql(&requests[1]).contains("assignee = currentUser()"));
+            assert!(jql(&requests[1]).contains("DEMO-42"));
+        }
+    }
+
+    #[test]
+    fn github_branches_retain_jira_keys_without_guessing_github_issue_repository() {
+        assert_eq!(
+            branch_keys(Some("github.com/demo/repo"), Some("DEMO-42-fix")),
+            ["DEMO-42"]
+        );
+        assert!(branch_keys(Some("github.com/fork/repo"), Some("issue-42-fix")).is_empty());
+    }
+
+    #[test]
+    fn pr_and_unconfigured_upstream_references_do_not_become_required_task_issues_on_refresh() {
+        let issue = "github.com/demo/repo#1";
+        let pull = "github.com/demo/repo#2";
+        let mut pr = mr(3, "same", "See #1 and #2", "opened");
+        pr.keys = vec![
+            issue.into(),
+            pull.into(),
+            "github.com/upstream/repo#1".into(),
+            "DEMO-42".into(),
+        ];
+        let mut mrs = vec![pr];
+        let tickets = HashMap::from([(issue.into(), ticket(issue, Category::New, false))]);
+        confirmed_issue_references(&mut mrs, &tickets);
+        assert_eq!(mrs[0].keys, [issue, "DEMO-42"]);
+        mrs[0].mr.github = true;
+        mrs[0].mr.head_repo = Some("github.com/demo/repo".into());
+        mrs[0].project = "github.com/demo/repo".into();
+        let note = task_note(
+            "owner",
+            "worktrees: [/r/.claude/worktrees/own]",
+            "2026-11-01",
+        );
+        let path = note.note.path.clone();
+        let mut checkout = tree("own", "same");
+        checkout.project = Some("github.com/demo/repo".into());
+        let mut table = crate::table::fixtures::table(
+            vec![note],
+            tickets.into_values().collect(),
+            mrs,
+            vec![checkout],
+        );
+        assert_eq!(table.tasks[0].found_tickets, [issue, "DEMO-42"]);
+        crate::table::write_back(&mut table);
+        assert!(table.warnings.is_empty());
+        let saved = Task::from_note(crate::vault::note::Note::read(&path).unwrap());
+        assert_eq!(known_keys(&[], &[saved]), [issue, "DEMO-42"]);
     }
 }

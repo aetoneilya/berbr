@@ -244,6 +244,14 @@ impl MrState {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct MergeRequest {
+    /// Absent in legacy GitLab caches. GitHub uses the same internal change model.
+    #[serde(default)]
+    pub github: bool,
+    /// Qualified source repository, distinct from the target for fork PRs.
+    #[serde(default)]
+    pub head_repo: Option<String>,
+    #[serde(default)]
+    pub review_decision: Option<String>,
     iid: u64,
     title: String,
     state: MrState,
@@ -265,6 +273,17 @@ pub struct MergeRequest {
 }
 
 impl MergeRequest {
+    pub fn number_label(&self) -> String {
+        format!("{}{}", if self.github { "#" } else { "!" }, self.iid)
+    }
+
+    pub fn kind(&self) -> &'static str {
+        if self.github { "PR" } else { "MR" }
+    }
+
+    pub fn provider(&self) -> &'static str {
+        if self.github { "github" } else { "gitlab" }
+    }
     pub fn iid(&self) -> u64 {
         self.iid
     }

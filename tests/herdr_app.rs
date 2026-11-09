@@ -1856,3 +1856,124 @@ fn migrate_copies_tasks_out_of_the_vault_and_berbr_then_reads_its_own_folder() {
     let out = fixture.command().arg("migrate").output().unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("Copied 0 task(s)"));
 }
+
+#[test]
+fn github_only_cached_board_needs_no_auth_and_missing_auth_keeps_local_tasks_visible() {
+    let f = Fixture::new();
+    let path = f.root.join("config.toml");
+    let config = fs::read_to_string(&path).unwrap().replace(
+        "task_dirs =",
+        "github = { repo = \"demo/repo\" }\ntask_dirs =",
+    );
+    fs::write(&path, config).unwrap();
+    let gh = f.root.join("bin/gh");
+    fs::write(&gh, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let before = fs::read(f.root.join("vault/tasks/test-0.md")).unwrap();
+    let snapshot = success(
+        f.command()
+            .args(["app-snapshot", "--cached"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        snapshot["projects"][0]["integrations"],
+        serde_json::json!({"jira":false,"github":true})
+    );
+    assert_eq!(snapshot["sources"]["github"], "Missing");
+    assert!(
+        snapshot["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["task"] == "test-0")
+    );
+    assert!(
+        !snapshot["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().starts_with("GitHub:"))
+    );
+    let online = success(
+        f.command()
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .arg("app-snapshot")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(online["sources"]["github"], "Missing");
+    assert!(online["warnings"].as_array().unwrap().iter().any(|w| {
+        w.as_str()
+            .unwrap()
+            .contains("GitHub authentication missing")
+    }));
+    assert!(
+        online["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["task"] == "test-0")
+    );
+    assert_eq!(
+        fs::read(f.root.join("vault/tasks/test-0.md")).unwrap(),
+        before
+    );
+    let out = f
+        .command()
+        .args(["start", "Local GitHub task", "--no-agent", "--no-worktree"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn github_ticket_arguments_are_validated_before_creating_a_note_without_worktree_or_agent() {
+    let f = Fixture::new();
+    let path = f.root.join("config.toml");
+    let config = fs::read_to_string(&path).unwrap().replace(
+        "task_dirs =",
+        "github = { repo = \"demo/repo\" }\ntask_dirs =",
+    );
+    fs::write(&path, config).unwrap();
+    let gh = f.root.join("bin/gh");
+    fs::write(&gh, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let notes = || {
+        fs::read_dir(f.root.join("vault/tasks"))
+            .unwrap()
+            .map(|p| p.unwrap().path())
+            .collect::<Vec<_>>()
+    };
+    let before = notes();
+    for first in ["demo/repo#1", "DEMO-1"] {
+        let out = f
+            .command()
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .args([
+                "start",
+                "Unvalidated links",
+                "--ticket",
+                first,
+                "--ticket",
+                "demo/repo#2",
+                "--no-agent",
+                "--no-worktree",
+            ])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("GitHub authentication missing"));
+        assert_eq!(
+            notes(),
+            before,
+            "failed validation must create no task note"
+        );
+    }
+}

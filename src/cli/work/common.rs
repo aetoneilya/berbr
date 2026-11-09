@@ -1,7 +1,7 @@
 //! Helpers shared by the work commands: errors, names, repo, task and worktree
 //! lookup, pickers.
 
-use crate::client::jira::JiraIssue;
+use crate::client::issue::Issue;
 use crate::client::worktree;
 use crate::config::Config;
 use crate::table::{self, Table, TaskRow};
@@ -59,31 +59,39 @@ pub(super) fn err(e: impl std::fmt::Display) -> String {
 }
 
 pub(crate) fn is_ticket_key(text: &str) -> bool {
-    ticket_keys(text).first().is_some_and(|k| k == text)
+    text.strip_prefix('#')
+        .is_some_and(|n| n.parse::<u64>().is_ok_and(|n| n > 0))
+        || crate::client::issue::github_key(text).is_some()
+        || ticket_keys(text).first().is_some_and(|k| k == text)
 }
 
 pub(super) use crate::vault::task::same_name;
 
-pub(super) fn work_name(
-    task: &Task,
-    explicit: Option<String>,
-    issue: Option<&JiraIssue>,
-) -> String {
+pub(super) fn work_name(task: &Task, explicit: Option<String>, issue: Option<&Issue>) -> String {
     explicit
         .or_else(|| issue.map(name_from_issue))
         .or_else(|| task.title().as_deref().and_then(name_from_text))
         .unwrap_or_else(|| task.name.clone())
 }
 
-pub(super) fn fetch_issue(config: &Config, key: &str) -> Result<JiraIssue, String> {
+pub(crate) fn fetch_issue(config: &Config, key: &str) -> Result<Issue, String> {
+    if crate::client::issue::github_parts(key).is_some() {
+        config.issue_key(key)?;
+        return crate::client::github::GitHub::from_env()?.issue(key);
+    }
     config
         .jira_client()?
         .get_issue_by_key(key)
+        .map(Into::into)
         .map_err(|e| format!("{key}: {e}"))
 }
 
-pub(super) fn name_from_issue(issue: &JiraIssue) -> String {
-    name_from_text(&issue.fields.summary).unwrap_or_else(|| issue.key.to_lowercase())
+pub(super) fn name_from_issue(issue: &Issue) -> String {
+    name_from_text(&issue.summary).unwrap_or_else(|| {
+        crate::client::issue::github_parts(&issue.key)
+            .map(|(_, n)| format!("issue-{n}"))
+            .unwrap_or_else(|| issue.key.to_lowercase())
+    })
 }
 
 /// The first four latin words, slugified.
@@ -113,20 +121,56 @@ fn slugify(text: &str) -> String {
 pub(super) fn branch_name(config: &Config, key: Option<&String>, name: &str) -> String {
     let prefix = &config.workflow.branch_prefix;
     match key {
-        Some(key) => format!("{prefix}{key}-{name}"),
+        Some(key) => {
+            let key = crate::client::issue::github_parts(key)
+                .map(|(_, n)| format!("issue-{n}"))
+                .unwrap_or_else(|| key.clone());
+            format!("{prefix}{key}-{name}")
+        }
         None => format!("{prefix}{name}"),
     }
 }
 
 /// The main checkout new work goes into: the only configured repo, the one the
 /// cwd is in, else the one picked; the first when nobody can be asked.
-pub(super) fn choose_repo(config: &Config, ui: &mut dyn Ui) -> Result<PathBuf, String> {
+pub(super) fn choose_repo(
+    config: &Config,
+    key: Option<&str>,
+    ui: &mut dyn Ui,
+) -> Result<PathBuf, String> {
     let mains: Vec<PathBuf> = config
         .repos
         .iter()
         .filter_map(|r| worktree::main_checkout(&r.path).ok())
         .collect();
-    choose_discovered_repo(&mains, ui)
+    choose_issue_repo(config, key, &mains, ui)
+}
+
+pub(super) fn choose_issue_repo(
+    config: &Config,
+    key: Option<&str>,
+    mains: &[PathBuf],
+    ui: &mut dyn Ui,
+) -> Result<PathBuf, String> {
+    if let Some((repo, _)) = key.and_then(crate::client::issue::github_parts) {
+        let matches: Vec<_> = config
+            .repos
+            .iter()
+            .filter(|r| {
+                r.gitlab_project.is_none()
+                    && r.github_repo
+                        .as_deref()
+                        .or_else(|| config.github.as_ref().map(|g| g.repo.as_str()))
+                        == Some(repo)
+            })
+            .filter_map(|r| worktree::main_checkout(&r.path).ok())
+            .filter(|p| mains.contains(p))
+            .collect();
+        if !matches.is_empty() {
+            return choose_discovered_repo(&matches, ui);
+        }
+    }
+    choose_discovered_repo(mains, ui)
 }
 
 pub(super) fn choose_discovered_repo(
@@ -422,10 +466,10 @@ mod naming_tests {
             "2026-11-01",
         );
         assert_eq!(work_name(&task, None, None), "parser-repeated-calls-with");
-        let issue: JiraIssue = serde_json::from_value(serde_json::json!({
+        let issue = Issue::from(serde_json::from_value::<crate::client::jira::JiraIssue>(serde_json::json!({
             "key":"DEMO-42", "fields":{"summary":"Ticket summary", "created":"2026-11-01T00:00:00Z"}
         }))
-        .unwrap();
+        .unwrap());
         assert_eq!(work_name(&task, None, Some(&issue)), "ticket-summary");
         assert_eq!(
             work_name(&task, Some("chosen".into()), Some(&issue)),
@@ -435,9 +479,9 @@ mod naming_tests {
             .set("title", Value::String("Только кириллица".into()));
         assert_eq!(work_name(&task, None, None), "demo-0");
         assert_eq!(work_name(&task, Some("chosen".into()), None), "chosen");
-        let issue: JiraIssue = serde_json::from_value(serde_json::json!({
+        let issue = Issue::from(serde_json::from_value::<crate::client::jira::JiraIssue>(serde_json::json!({
             "key":"DEMO-42", "fields":{"summary":"Только кириллица", "created":"2026-11-01T00:00:00Z"}
-        })).unwrap();
+        })).unwrap());
         assert_eq!(work_name(&task, None, Some(&issue)), "demo-42");
         let legacy = task_note("Legacy title", "", "2026-11-01");
         assert_eq!(work_name(&legacy, None, None), "legacy-title");
