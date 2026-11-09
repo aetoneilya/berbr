@@ -495,6 +495,44 @@ pub fn reserve_name(
     unreachable!()
 }
 
+/// Claim an explicitly requested name using the same create-new reservation
+/// files as asynchronous start/select. Add must not steal a pending checkout.
+pub fn reserve_exact_name(main: &Path, directory: &Path, name: &str, task: &str) -> Result<()> {
+    validate_name(name)?;
+    validate_directory(directory)?;
+    ensure_excluded(main, directory)?;
+    if worktree_roots(main, directory).iter().any(|root| {
+        root.join(name).symlink_metadata().is_ok()
+            || root
+                .join(".berbr-reservations")
+                .join(name)
+                .symlink_metadata()
+                .is_ok()
+    }) {
+        return Err(GitError::NonZeroExit(format!(
+            "worktree name {name} already exists or is reserved; choose another --name"
+        )));
+    }
+    let reservations = main.join(directory).join(".berbr-reservations");
+    std::fs::create_dir_all(&reservations)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(reservations.join(name))
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                GitError::NonZeroExit(format!(
+                    "worktree name {name} is reserved; choose another --name"
+                ))
+            } else {
+                e.into()
+            }
+        })?;
+    use std::io::Write;
+    file.write_all(task.as_bytes())?;
+    Ok(())
+}
+
 /// How to create a checkout under the configured directory on `branch`: an
 /// existing local or remote branch is checked out, otherwise the branch is
 /// created from a freshly fetched origin/HEAD.

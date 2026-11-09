@@ -176,12 +176,19 @@ export default class Berbr extends View {
         result = await exec("zsh", command, retried.to ? {cwd:retried.to} : {});
       }
     } catch (error) {
-      logRun(args, {cwd, ms:Date.now() - started, error:String(error?.message ?? error), retried});
+      await logRun(args, {cwd, ms:Date.now() - started, error:String(error?.message ?? error), retried});
       throw error;
     }
-    logRun(args, {cwd, ms:Date.now() - started, code:result.code, retried});
-    if (result.code !== 0) log(`berbr ${args[0]}: ${cleanCliText(result.stderr) || cleanCliText(result.stdout)}`);
-    if (result.code !== 0) throw new Error(cleanCliText(result.stderr) || cleanCliText(result.stdout) || `berbr exited ${result.code}`);
+    const logged = logRun(args, {cwd, ms:Date.now() - started, code:result.code, retried});
+    if (result.code !== 0) {
+      const fallback = result.code < 0
+        ? `berbr ended without an exit status (code ${result.code}); no diagnostic output was captured`
+        : `berbr exited ${result.code}`;
+      const message = cleanCliText(result.stderr) || cleanCliText(result.stdout) || fallback;
+      await logged;
+      await log(`berbr ${args[0]}: ${message}`);
+      throw new Error(message);
+    }
     return result.stdout;
   }
 

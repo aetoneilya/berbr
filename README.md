@@ -14,6 +14,36 @@ model and the decisions.
 cargo install --path . --locked
 ```
 
+### Agent skill
+
+The portable [Berbr skill](skills/berbr/SKILL.md) ships in this repository, with
+focused [recovery guidance](skills/berbr/references/recovery.md). It works with
+the installed `berbr` and `hc` commands; it does not require personal memory files.
+Install the whole `skills/berbr` directory so relative reference links keep working.
+
+Link or copy it into your agent's skill directory. For example, from this checkout,
+with no existing skill named `berbr` at the destination:
+
+```sh
+# Codex
+mkdir -p ~/.agents/skills
+ln -s "$PWD/skills/berbr" ~/.agents/skills/berbr
+
+# Claude Code
+mkdir -p ~/.claude/skills
+ln -s "$PWD/skills/berbr" ~/.claude/skills/berbr
+```
+
+Choose the command for your agent. If a `berbr` skill already exists, compare it
+before replacing it and preserve local instructions. A symlink follows updates
+to this checkout; a copied skill needs the whole directory refreshed after updates.
+Use a durable checkout for a symlink, not a temporary task worktree. Reload skills
+or start a fresh agent session after installation. CLI/mod installation does not
+automatically install the skill or change existing agent permissions.
+
+The [agent workflow investigation](docs/agent-workflows.md) maps the instructions
+and CLI fixes to observed failures and records remaining limitations.
+
 ## Where things live
 
 Like `~/.claude`, berbr keeps its own folder, `~/.berbr` (`BERBR_HOME` overrides):
@@ -102,8 +132,10 @@ resumes and launches after worktree preparation, so each pane owns its runtime.
 
 ```
 berbr                         the TUI (also `berbr tui`)
+berbr context [--json] [--task <id>]   local project/task/checkout context, with candidates
+berbr task list [--json] [--all]      local IDs/titles; includes closed tasks with --all
 berbr start [<task|KEY>]      new task: note, herdr workspace, worktree tab with claude
-berbr add [<task>] [<KEY>]    new agent tab; KEY is optional only with --in <tree>
+berbr add [<task>] [<KEY>]    new agent tab; omit KEY with --name <name> or --in <tree>
 berbr attach <KEY> [<task>]   put a ticket into a task without a worktree
 berbr select [<task|KEY>]     go back to a task: its agent, or claude resuming its session; a task with nothing yet gets its first worktree
 berbr note "<text>"           (for agents) append a finding to the note's "Agent notes"
@@ -149,6 +181,30 @@ and Herdr space open for retry; successful prior steps remain completed.
 Unknown inspection counts are JSON `null`.
 
 `berbr <command> --help` lists the options.
+
+### Local commands for agents
+
+`berbr context --json` reports the current project, repository, checkout, branch,
+task, brief path and resolution source. It uses local Git and saved task
+references, without querying Jira, GitLab or live Herdr or writing caches/notes.
+It recognizes linked checkouts outside the main repository folder. Ambiguity is
+an inspection result (exit 0), with `task: null` and candidates; inspect `status`
+before using the result. Unlike commands with a default project, it does not
+silently choose the first project when the directory is unrelated.
+
+```sh
+berbr context --json
+berbr -p demo task list --json
+berbr -p demo context --task demo-0 --json
+berbr -p demo add demo-0 --name parser-followup --description 'Inspect parser ordering' --bg
+```
+
+`task list` is also local and read-only, and returns stable IDs directly. New
+ticketless checkouts created by `add --name` are saved in the task's `worktrees`
+bindings; later context lookups do not need a ticket or an active agent. On a
+partial failure after checkout creation, `add` reports the path that remains;
+inspect it before retrying. JSON fields and resolution limits are described in
+[the agent CLI contract](docs/agent-cli.md).
 
 ## TUI
 

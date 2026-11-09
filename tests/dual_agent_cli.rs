@@ -118,6 +118,7 @@ print(json.dumps({'result': result}))
             .env("BERBR_CONFIG", &self.config)
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("CODEX_HOME", self.root.join("codex"))
+            .env_remove("BERBR_BACKEND")
             .env("HERDR_ENV", "1")
             .env("HERDR_WORKSPACE_ID", "test-space")
             .env("BERBR_TEST_CAPTURE", &self.capture)
@@ -751,8 +752,14 @@ prompt = sys.stdin.read()
 root = Path(os.environ['BERBR_TEST_CAPTURE']).parent
 (root / 'naming.json').write_text(json.dumps({'kind': Path(sys.argv[0]).name, 'args': args, 'input': prompt, 'cwd': os.getcwd()}))
 if os.environ.get('BERBR_TEST_NAMING_FAIL'):
-    print('generation failed', file=sys.stderr)
-    sys.exit(1)
+    failure = os.environ['BERBR_TEST_NAMING_FAIL']
+    if failure == 'json' or failure == 'success-error':
+        print(json.dumps({'is_error': True, 'result': 'naming account is unavailable'}))
+    elif failure == 'stdout':
+        print('naming account is unavailable')
+    elif failure != 'silent':
+        print('generation failed', file=sys.stderr)
+    sys.exit(0 if failure == 'success-error' else 1)
 result = {'title': 'Generated task', 'worktree': 'generated-task'}
 if Path(sys.argv[0]).name == 'claude':
     print(json.dumps({'structured_output': result}))
@@ -764,6 +771,46 @@ else:
     let path = fixture.root.join("bin").join(kind);
     fs::write(&path, script).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn naming_failures_report_the_agent_status_and_stdout_without_creating_work() {
+    for kind in ["claude", "codex"] {
+        let fixture = Fixture::new(&format!("generation_agent = \"{kind}\""));
+        fake_naming_cli(&fixture, kind);
+        for mode in ["json", "stdout", "silent", "success-error"] {
+            if kind == "codex" && mode == "success-error" {
+                continue;
+            }
+            let out = fixture
+                .command(env!("CARGO_BIN_EXE_berbr"))
+                .env("BERBR_TEST_NAMING_FAIL", mode)
+                .args(["start", "--description", "Work on this", "--bg"])
+                .output()
+                .unwrap();
+            assert!(!out.status.success());
+            let error = String::from_utf8_lossy(&out.stderr);
+            if mode != "success-error" {
+                assert!(
+                    error.contains(kind) && error.contains("exit status: 1"),
+                    "{error}"
+                );
+            }
+            let detail = if mode == "silent" {
+                "no diagnostic output"
+            } else {
+                "naming account is unavailable"
+            };
+            assert!(error.contains(detail), "{error}");
+            assert_eq!(
+                fs::read_dir(fixture.root.join("vault/tasks"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+            assert!(!fixture.repo.join(".herdr/worktrees").exists());
+        }
+    }
 }
 
 #[test]

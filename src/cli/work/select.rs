@@ -52,6 +52,7 @@ fn first_worktree(
     let branch = branch_name(config, key, &name);
     let tree = worktree::worktree_dir(&main, &config.workflow.worktree_dir, &name);
     let brief = brief_text(
+        &config.name,
         &tree,
         &branch,
         Some(task),

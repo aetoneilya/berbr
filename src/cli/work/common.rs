@@ -330,7 +330,10 @@ pub(super) fn resolve_task_table(
         return Ok((table, i));
     }
     if !ui.can_ask() {
-        return Err("no task here; pass its ID explicitly: berbr add <task> <KEY>".into());
+        return Err(
+            "no task here; pass its ID explicitly: berbr add <task> --name <name> (or --in <tree>)"
+                .into(),
+        );
     }
     let open: Vec<usize> = (0..table.tasks.len())
         .filter(|&i| !table.tasks[i].task.done)

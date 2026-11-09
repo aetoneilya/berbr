@@ -243,11 +243,16 @@ pub(super) fn open_added_work(
     let (tab, pane) = open_tab(Space::Task(task), dir, name, ui)?;
     let agent = free_agent_name(name);
     let prompt_args: Vec<&str> = prompt.as_deref().into_iter().collect();
-    let args = task_agent_args(open.kind, Some(&task.note.path), &prompt_args)?;
+    let partial = |e: String| {
+        format!("tab: {tab}; terminal: {pane}; agent: {agent}; launch may be partial: {e}")
+    };
+    let args = task_agent_args(open.kind, Some(&task.note.path), &prompt_args).map_err(&partial)?;
     let args: Vec<_> = args.iter().map(String::as_str).collect();
-    herdr::start_agent_with_label(open.kind, &agent, &pane, name, &args).map_err(err)?;
+    herdr::start_agent_with_label(open.kind, &agent, &pane, name, &args)
+        .map_err(err)
+        .map_err(&partial)?;
     if open.focus {
-        herdr::focus_tab(&tab).map_err(err)?;
+        herdr::focus_tab(&tab).map_err(err).map_err(partial)?;
     }
     ui.say(format!(
         "worktree: {}; tab: {tab}; terminal: {pane}; agent: {agent}",
@@ -583,7 +588,9 @@ fn open_tab(
                 ui.say(format!("  ! no project space: {e}"));
             }
             let (tab, pane) = herdr::create_workspace(&space.to_string(), cwd).map_err(err)?;
-            herdr::rename_tab(&tab, label).map_err(err)?;
+            herdr::rename_tab(&tab, label).map_err(|e| {
+                format!("tab: {tab}; terminal: {pane}; could not label new tab: {e}")
+            })?;
             Ok((tab, pane))
         }
     }

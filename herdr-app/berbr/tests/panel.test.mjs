@@ -2946,6 +2946,20 @@ test("a failed berbr run from the panel lands in the mod log with its stderr", a
   assert.match(text, /berbr done: Error: "demo" is not finished/);
 });
 
+test("a snapshot terminated without output has a useful error in the completed log", async () => {
+  const {logPath} = await import("../log.js");
+  state.fsFiles = new Map();
+  const {view} = setup({props:{opening:{cwd:"/home/dev/demo"}}});
+  state.execHandler = async () => ({code:-1, stdout:"", stderr:""});
+  await assert.rejects(view.cli(["app-snapshot"]), /without an exit status.*-1.*no diagnostic output/);
+  const text = state.fsFiles.get(logPath());
+  assert.match(text, /app-snapshot.*exited -1/);
+  assert.match(text, /berbr app-snapshot: .*no diagnostic output/);
+  state.execHandler = async () => { throw new Error("could not start process"); };
+  await assert.rejects(view.cli(["app-snapshot"]), /could not start process/);
+  assert.match(state.fsFiles.get(logPath()), /could not run: could not start process/);
+});
+
 test("a note from berbr's own folder opens in the default editor, not Obsidian", async () => {
   state.readResult = "Body";
   const {view, cx, jobs} = setup({props:{form:"note", path:"/home/dev/.berbr/projects/demo/tasks/demo-1.md", title:"Demo", vault:false}});

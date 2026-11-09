@@ -29,6 +29,15 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum CliCommands {
+    /// Resolve local project/task/worktree context without network or cache writes.
+    /// Unresolved or ambiguous context is reported with candidates, never guessed.
+    Context {
+        #[arg(long)]
+        json: bool,
+        /// Explicit task ID or title within the selected project
+        #[arg(long)]
+        task: Option<String>,
+    },
     /// Read-only JSON board for the native Herdr App mod.
     AppSnapshot {
         /// Read cached Jira/GitLab data without network calls.
@@ -68,7 +77,7 @@ enum CliCommands {
     Start(StartArgs),
     /// Open a worktree tab and a new agent in the task's Herdr space. Use --name
     /// for another branch of a ticket already in the task, or --in for a fresh
-    /// agent in an existing worktree (KEY is optional with --in). Without a TTY, never
+    /// agent in an existing worktree. KEY is optional with --name or --in. Without a TTY, never
     /// prompts or focuses the new tab; success prints its path, tab and terminal.
     Add(AddArgs),
     /// Put a ticket into a task without starting work on it (no worktree)
@@ -198,6 +207,14 @@ pub(crate) struct StartArgs {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum TaskCommand {
+    /// List local task IDs/titles without network, cache or task-note writes
+    List {
+        #[arg(long)]
+        json: bool,
+        /// Include closed tasks
+        #[arg(long, short = 'a')]
+        all: bool,
+    },
     /// Show the task as JSON; accepts its stable ID or title
     Show { task: Option<String> },
     /// Update only the supplied fields, preserving the rest of the note
@@ -218,10 +235,10 @@ pub(crate) enum TaskCommand {
 
 #[derive(Args, Debug, Default)]
 pub(crate) struct AddArgs {
-    /// [<task>] [<KEY>]; task defaults to the current worktree/space; KEY is optional only with --in
+    /// [<task>] [<KEY>]; task defaults to the current worktree/space; omit KEY with --name or --in
     #[arg(num_args = 0..=2)]
     pub(crate) args: Vec<String>,
-    /// Run the agent in this existing worktree of the task (stacked MRs)
+    /// Run another agent on the same branch in this existing task worktree
     #[arg(long = "in", conflicts_with = "name")]
     pub(crate) in_tree: Option<String>,
     /// New worktree, branch suffix, tab and agent name; required for an existing key
@@ -374,6 +391,9 @@ pub fn run() -> Result<(), String> {
         }
         Some(command) => command,
     };
+    if let CliCommands::Context { json, task } = command {
+        return work::cli_context(&projects, cli.project.as_deref(), task.as_deref(), json);
+    }
     let chosen = choose_project(&projects, cli.project.as_deref(), cwd.as_deref())?;
     if let CliCommands::AppSnapshot { cached } = command {
         let _operation = crate::client::herdr::operation();
@@ -382,6 +402,7 @@ pub fn run() -> Result<(), String> {
     let config = projects.swap_remove(chosen);
     let _operation = crate::client::herdr::operation();
     match command {
+        CliCommands::Context { .. } => unreachable!(),
         CliCommands::AppSnapshot { .. } => unreachable!(),
         CliCommands::Settings { .. } => unreachable!(),
         CliCommands::Status(args) => table::cli_status(&config, args),
@@ -424,12 +445,13 @@ fn changes(command: &CliCommands) -> bool {
         | CliCommands::Prepare { .. }
         | CliCommands::Note { .. }
         | CliCommands::Rename { .. }
-        | CliCommands::Task { .. }
         | CliCommands::Review { .. }
         | CliCommands::Open { .. } => true,
         CliCommands::Done(args) => !args.dry_run,
+        CliCommands::Task { command } => matches!(command, TaskCommand::Update { .. }),
         CliCommands::Migrate { dry_run } => !dry_run,
-        CliCommands::AppSnapshot { .. }
+        CliCommands::Context { .. }
+        | CliCommands::AppSnapshot { .. }
         | CliCommands::PluginOpen
         | CliCommands::PluginMetadataStart
         | CliCommands::PluginMetadata { .. }

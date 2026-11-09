@@ -170,6 +170,7 @@ fn start_with(
         let label = work_name(&task, tree_name, issue.as_ref());
         let branch = worktree::current_branch(&main).unwrap_or_default();
         let text = brief_text(
+            &config.name,
             &main,
             &branch,
             Some(&task),
@@ -216,6 +217,7 @@ fn start_with(
     let branch = branch.unwrap_or_else(|| branch_name(config, keys.first(), &wt_name));
     let tree = worktree::worktree_dir(&main, &config.workflow.worktree_dir, &wt_name);
     let brief = brief_text(
+        &config.name,
         &tree,
         &branch,
         Some(&task),
@@ -247,7 +249,7 @@ fn create_ticket(config: &Config, title: &str) -> Result<String, String> {
 }
 
 /// `berbr add [<task>] [<KEY>]`: a new agent tab in the task's herdr workspace,
-/// in a new worktree or `--in` one the task has. KEY is optional only with `--in`.
+/// in a new worktree or `--in` one the task has. KEY is optional with --name/--in.
 pub(in crate::cli) fn cli_add(config: &Config, args: AddArgs) -> Result<(), String> {
     add(config, args, &mut Terminal).map_err(|e| e.lines().collect::<Vec<_>>().join(" "))
 }
@@ -272,17 +274,24 @@ fn add_with(
         bg,
     } = args;
     let (task_arg, key) = match args.as_slice() {
-        [] if in_tree.is_some() => (None, None),
-        [task] if in_tree.is_some() && !is_ticket_key(task) => (Some(task.clone()), None),
+        [] if in_tree.is_some() || name.is_some() => (None, None),
+        [task] if (in_tree.is_some() || name.is_some()) && !is_ticket_key(task) => {
+            (Some(task.clone()), None)
+        }
         [key] => (None, Some(key.clone())),
         [task, key] => (Some(task.clone()), Some(key.clone())),
-        _ => return Err("berbr add [<task>] <KEY>".to_string()),
+        _ => {
+            return Err(
+                "berbr add [<task>] [<KEY>] --name <name>, or berbr add [<task>] --in <tree>"
+                    .to_string(),
+            );
+        }
     };
     if let Some(key) = &key
         && !is_ticket_key(key)
     {
         return Err(format!(
-            "\"{key}\" is not a ticket key: berbr add [<task>] <KEY>"
+            "\"{key}\" is not a ticket key: berbr add [<task>] [<KEY>] --name <name>, or use --in <tree>"
         ));
     }
     let (mut table, row) = resolve_task_table(config, tasks, task_arg.as_deref(), ui)?;
@@ -373,22 +382,40 @@ fn add_with(
         return Err("berbr add needs Herdr to open the worktree tab and agent".into());
     }
     if !existing {
+        worktree::reserve_exact_name(&main, &config.workflow.worktree_dir, &wt_name, &task.name)
+            .map_err(err)?;
         worktree::create_new_worktree(&main, &config.workflow.worktree_dir, &wt_name, &branch)
             .map_err(err)?;
     }
-    if let Some(key) = &key
-        && !task.tickets.contains(key)
-    {
-        let _lock = crate::vault::lock().map_err(err)?;
-        task.note.reload().map_err(err)?;
+    let bind_tree = !existing && key.is_none();
+    if bind_tree || key.as_ref().is_some_and(|key| !task.tickets.contains(key)) {
+        let record_error = |e: String| {
+            format!(
+                "worktree {} exists; could not update task note: {e}",
+                tree.display()
+            )
+        };
+        let _lock = crate::vault::lock().map_err(err).map_err(&record_error)?;
+        task.note.reload().map_err(err).map_err(&record_error)?;
         task = Task::from_note(task.note);
-        if !task.tickets.contains(key) {
+        if let Some(key) = &key
+            && !task.tickets.contains(key)
+        {
             task.tickets.push(key.clone());
             task.note.set("tickets", list(&task.tickets));
-            task.note.save().map_err(err)?;
         }
+        if bind_tree {
+            let mut trees = task.note.strings("worktrees");
+            let path = tree.to_string_lossy().into_owned();
+            if !trees.contains(&path) {
+                trees.push(path);
+            }
+            task.note.set("worktrees", list(&trees));
+        }
+        task.note.save().map_err(err).map_err(record_error)?;
     }
     let brief = brief_text(
+        &config.name,
         &tree,
         &branch,
         Some(&task),
@@ -403,7 +430,12 @@ fn add_with(
         focus: !bg && ui.can_ask(),
         description,
     };
-    open_added_work(&task, &tree, &wt_name, brief, open, ui)
+    open_added_work(&task, &tree, &wt_name, brief, open, ui).map_err(|e| {
+        format!(
+            "worktree {} exists; could not launch agent: {e}",
+            tree.display()
+        )
+    })
 }
 
 /// My open Jira tickets that belong to no task, plus "new task…".

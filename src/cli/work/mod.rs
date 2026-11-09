@@ -2,6 +2,7 @@
 
 mod brief;
 mod common;
+mod context;
 pub(crate) mod done;
 mod launch;
 mod naming;
@@ -11,6 +12,7 @@ mod start;
 mod task;
 
 pub(crate) use common::{Ui, is_ticket_key};
+pub(super) use context::cli_context;
 pub(super) use done::{cli_attach, cli_done};
 pub(super) use launch::{cli_open, cli_prepare};
 pub(super) use review::cli_review;
