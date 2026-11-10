@@ -1,10 +1,34 @@
 # Berbr for Herdr App
 
 Native GPUI mod in the right panel, alongside Files and Changes. The panel
-shows tasks only: project, search, creation, task status and agents needing
+has one search row with a **Filters** button. Its popover chooses **Tasks / MR**,
+one or more projects, and whether completed work is shown. The selected project
+scope is saved. Project snapshots load independently, at most two at a time;
+failures retain cached rows and identify the affected project. Rows are labelled
+with their project, and actions keep the source project's context even when task
+IDs coincide. New task stays below the list; its form selects the creation project.
+Refresh and Settings are in the footer.
+Tasks shows task status and agents needing
 attention. Click a task to select its Herdr space; the separate `⋯` button
 opens its note and related tickets, merge requests, worktrees and agents.
 Tasks without a live space open details with an explicit Start work action.
+
+MR shows a flat list of your GitLab merge requests across the project's configured
+repositories, including MRs without a task or local checkout. Each MR appears once,
+with its repository, associated tasks, CI, approvals, unresolved discussions,
+draft/conflict and merge readiness. Click or press Enter to open it in the browser;
+right-click offers the usual link/branch actions. Search matches titles, branches,
+repositories and task names. The last Tasks / MR choice is saved for each project;
+switching views keeps their searches and selections separate.
+
+Only open MRs appear initially. **Show completed** in Filters (or `d`) includes merged and closed
+MRs already present in the current snapshot, rather than loading a full history.
+The additive `merge_requests` snapshot field contains every fetched MR with its
+full title, repository, ticket keys and task associations, independently of tree
+presentation. Older backends fall back to the MRs present in the task tree.
+Unavailable CI is shown as unknown. Cached results and source warnings follow the
+same refresh behavior as Tasks. `berbr.tasks` and `berbr.mrs` can also be bound as
+Herdr commands. GitHub PRs depend on the separate GitHub integration.
 
 The existing Rust model owns Jira, GitLab, notes, worktrees and Claude/Codex
 history. The mod consumes `berbr app-snapshot` JSON. It launches the backend through

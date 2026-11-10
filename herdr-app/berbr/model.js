@@ -1,3 +1,5 @@
+import {spaceBindingBlocker} from "./scope.js";
+
 export function taskSpaceMatches(row, label) {
   const key = String(label ?? "").trim().toLowerCase();
   return Boolean(key) && [row?.task, row?.title].some(value =>
@@ -5,6 +7,10 @@ export function taskSpaceMatches(row, label) {
 }
 
 export function taskSpace(row, liveSpaces = []) {
+  // Scoped rows already have a backend binding. Name-only matching across
+  // projects could focus another project's identically named task.
+  if (row?.scope_space_ambiguous) return undefined;
+  if (row?.project) return liveSpaces.find(space => row.space && space.id === row.space);
   return liveSpaces.find(space => row?.space && space.id === row.space)
     ?? liveSpaces.find(space => taskSpaceMatches(row, space.name));
 }
@@ -17,21 +23,21 @@ export function rowMenu(row, ctx = {}) {
   const add = (id, label, extra = {}) => items.push({id, label, ...extra});
   if (row.kind === "task") {
     if (taskSpace(row, ctx.spaces)) add("space", "Go to space");
-    else if (row.task && !row.done && !walk(row.children).some(child => child.kind === "tree"))
+    else if (!row.scope_space_ambiguous && row.task && !row.done && !walk(row.children).some(child => child.kind === "tree"))
       add("start", "Start work");
-    if (row.task) add("rename", "Rename…");
+    if (row.task && !row.scope_space_ambiguous) add("rename", "Rename…");
     if (row.note) add("note", "Open note");
     if (row.title || row.label || row.task) add("copy-title", "Copy title");
-    if (row.task && !row.done) add("done", "Close task…", {danger:true, separatorBefore:items.length > 0});
+    if (row.task && !row.done && !row.scope_space_ambiguous) add("done", "Close task…", {danger:true, separatorBefore:items.length > 0});
   } else if (row.kind === "tree") {
-    if (row.task) add("resume", "Resume agent");
-    if (row.task && row.tree) add("new-agent", "New agent");
+    if (row.task && !row.scope_space_ambiguous) add("resume", "Resume agent");
+    if (row.task && row.tree && !row.scope_space_ambiguous) add("new-agent", "New agent");
     const path = row.cwd || treeMarks(row).path;
-    if (!row.task && path) {
+    if (!row.task && path && !row.scope_space_ambiguous) {
       add("open-agent", "New agent");
       add("open-shell", "New terminal");
     }
-    if (row.task && row.tree) add("review", "Review");
+    if (row.task && row.tree && !row.scope_space_ambiguous) add("review", "Review");
     const mr = ctx.mr ?? row.children?.find(child => child.kind === "mr");
     if (mr?.url) add("mr", "Open MR");
     if (row.cwd || treeMarks(row).path) add("copy-path", "Copy path");
@@ -55,6 +61,47 @@ export function rowMenu(row, ctx = {}) {
 
 export function walk(rows = []) {
   return (rows ?? []).flatMap(row => [row, ...walk(row.children)]);
+}
+
+// A MR can appear below several tickets, worktrees, or tasks. Keep its identity
+// separate from those tree positions, while retaining all task associations.
+export function mergeRequests(rows = [], catalog = []) {
+  const entries = new Map();
+  const visit = (rows, task = null, repo = null, ticket = null) => {
+    for (const row of rows ?? []) {
+      const owner = row.kind === "task" ? row : task;
+      const repository = row.repo || repo;
+      if (row.kind === "mr") {
+        const key = row.url?.replace(/\/+$/, "") || row.id;
+        if (key) {
+          let entry = entries.get(key);
+          if (!entry) {
+            // URL paths also identify repositories for MRs without a checkout.
+            const path = row.url?.match(/^https?:\/\/[^/]+\/(.+?)\/(?:-\/merge_requests|pull)\/\d+(?:[/?#]|$)/)?.[1];
+            entry = {...row, id:`mr-list:${key}`, repository:row.repository || path || repository || "",
+              tasks:[...(row.tasks ?? [])], tickets:[...(row.tickets ?? [])], children:[]};
+            entries.set(key, entry);
+          }
+          for (const task of [...(row.tasks ?? []), ...(owner ? [owner] : [])])
+            if (!entry.tasks.some(existing => existing.id === task.id)) entry.tasks.push(task);
+          for (const key of [...(row.tickets ?? []), ...(ticket ? [ticket] : [])])
+            if (!entry.tickets.includes(key)) entry.tickets.push(key);
+        }
+      }
+      visit(row.children, owner, repository, row.kind === "ticket" ? row.target : ticket);
+    }
+  };
+  // New snapshots provide the complete catalog. The tree still supplies task
+  // and ticket associations and remains a fallback for older backends.
+  visit(catalog);
+  visit(rows);
+  return [...entries.values()].map(entry => ({...entry,
+    completed:["merged", "closed"].includes(entry.state?.toLowerCase()),
+    searchText:[entry.label, entry.title, entry.branch, entry.url, entry.repository, entry.project, entry.task, ...entry.tickets,
+      ...entry.tasks.flatMap(task => [task.task, task.title, task.label])].filter(Boolean).join(" ").toLowerCase(),
+  })).sort((a, b) => a.repository.localeCompare(b.repository) ||
+    Number(b.label?.match(/[!#](\d+)/)?.[1] ?? 0) - Number(a.label?.match(/[!#](\d+)/)?.[1] ?? 0) ||
+    a.id.localeCompare(b.id));
 }
 
 export function worktreeNameCollision(rows, name) {
@@ -142,6 +189,7 @@ export function closePlan(row, liveSpaces = [], related = walk(row?.children)) {
     ...parseTreeMarks(tree.body, tree.state)}));
   const blockers = mrs.filter(mr => ["opened", "open"].includes(mr.state?.toLowerCase()))
     .map(mr => `MR ${mr.label?.match(/!\d+/)?.[0] ?? `!${mr.url?.match(/\/(\d+)\/?$/)?.[1] ?? mr.target ?? "?"}`} is open`);
+  if (row?.scope_space_ambiguous) blockers.push(spaceBindingBlocker);
   blockers.push(...removals.filter(tree => tree.unpushed).map(tree => `${tree.name}: ↑${tree.unpushed} unpushed`));
   // Snapshot tickets have no assignee; the CLI re-checks ownership before closing.
   const jira = [...new Set(related.filter(item => item.kind === "ticket" && !isClosedTicket(item))
@@ -211,6 +259,19 @@ export function mrPills(mr, {historical = false, state = mr?.state?.toLowerCase(
       : spec(flags.worst, flags.worst === "draft" ? "dim" : "blocked") : null;
   // "ready to merge" already means CI passed: one pill, not two.
   return [worst, flags.ready && flags.ci === "passed" ? null : ci].filter(Boolean).map(pill => historical ? {...pill, tone:"dim"} : pill);
+}
+
+export function mrListPills(mr) {
+  if (["merged", "closed"].includes(mr.state?.toLowerCase())) return mrPills(mr);
+  const flags = mrFlags(mr);
+  const ci = mrPills({...mr, ready:false}).find(spec => spec.label.startsWith("CI "));
+  const pills = [ci ?? {label:`CI ${flags.ci || "unknown"}`, tone:"dim"}];
+  if (flags.draft) pills.push({label:"draft", tone:"dim"});
+  if (flags.conflict) pills.push({label:"conflict", tone:"blocked"});
+  if (mr.approvals != null) pills.push({label:`${mr.approvals} ${mr.approvals === 1 ? "approval" : "approvals"}`, tone:"dim"});
+  if (flags.unresolved) pills.push({label:`${flags.unresolved} ${flags.unresolved === 1 ? "thread" : "threads"}`, tone:"blocked"});
+  if (flags.ready) pills.push({label:"ready to merge", tone:"accent", glyph:"check"});
+  return pills;
 }
 
 export function focusedTask(rows, focus, liveSpaces = [], liveAgents = []) {
@@ -574,7 +635,7 @@ export class PanelModel {
       this.trees = []; const treeKeys = new Set();
       const visit = row => {
         const children = [];
-        let search = [row.title, row.label, row.task, row.target, row.branch, ...(row.tags ?? []),
+        let search = [row.title, row.label, row.task, row.target, row.branch, row.project, ...(row.tags ?? []),
           row.kind === "task" ? beforeMachineSection(row.body) : null].filter(Boolean).join(" ").toLowerCase();
         for (const child of row.children ?? []) {
           visit(child); children.push(child, ...this.related.get(child));
@@ -591,6 +652,7 @@ export class PanelModel {
         }
       };
       for (const row of data?.rows ?? []) visit(row);
+      this.mrEntries = null;
       this.key = null;
       this.signals = new Map(); this.details = new Map(); this.reasons = new Map(); this.whys = new Map(); this.plans = new Map();
       this.mergedTrees = this.trees.filter(isMergedTree);
@@ -629,6 +691,7 @@ export class PanelModel {
     }
     return this;
   }
+  get mrs() { return this.mrEntries ??= mergeRequests(this.data?.rows, this.data?.merge_requests); }
   signal(row) {
     if (!this.signals.has(row)) this.signals.set(row, taskSignals(row, this.agents, this.spaces, this.related.get(row) ?? walk(row.children), this.live, item => this.related.get(item) ?? walk(item.children)));
     return this.signals.get(row);

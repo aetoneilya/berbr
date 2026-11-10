@@ -28,7 +28,8 @@ pub(super) fn snapshot(projects: &[Config], chosen: usize, cached: bool) -> Resu
         json!({
             "version": 3, "project": config.name,
             "projects": projects.iter().map(|c| json!({"name":c.name,"cwd":c.repos.first().map(|r|&r.path),"agent":c.workflow.agent})).collect::<Vec<_>>(),
-            "rows": rows, "warnings": table.warnings, "debug": crate::log::debug_enabled(),
+            "rows": rows, "merge_requests": merge_request_rows(&table),
+            "warnings": table.warnings, "debug": crate::log::debug_enabled(),
             "settings": {"agent":config.workflow.agent, "generation_agent":config.workflow.generation_agent,
                 "generation_model":config.workflow.generation_model},
             "store": if config.vault.own { "berbr" } else { "vault" },
@@ -36,6 +37,35 @@ pub(super) fn snapshot(projects: &[Config], chosen: usize, cached: bool) -> Resu
         })
     );
     Ok(())
+}
+
+// The task tree is a presentation: a loose worktree contains only its latest
+// MR. The flat MR view needs every fetched MR, including other target branches
+// and completed MRs which have no task or checkout.
+fn merge_request_rows(table: &Table) -> Vec<Value> {
+    table
+        .mrs
+        .iter()
+        .enumerate()
+        .map(|(i, mr)| {
+            let node = Node {
+                id: format!("mr:{i}"),
+                kind: Kind::Mr(i),
+                children: vec![],
+            };
+            let mut value = row(table, &node, None);
+            value["title"] = json!(look::clean(mr.mr.title()));
+            value["label"] = json!(format!("!{}  {}", mr.mr.iid(), look::clean(mr.mr.title())));
+            value["repository"] = json!(mr.project);
+            value["tickets"] = json!(mr.keys);
+            value["tasks"] =
+                json!(table.tasks.iter().filter(|task| task.mrs.contains(&i)).map(|task|
+            json!({"id":format!("task:{}",task.task.name), "task":task.task.name,
+                "title":task.task.title().unwrap_or_else(|| "Untitled task".into())})
+        ).collect::<Vec<_>>());
+            value
+        })
+        .collect()
 }
 
 fn row(table: &Table, node: &Node, owner: Option<&str>) -> Value {
@@ -158,6 +188,70 @@ mod tests {
     use super::*;
     use crate::client::gitlab::MrReview;
     use crate::table::fixtures::{mr, table, task, tree};
+
+    #[test]
+    fn mr_catalog_keeps_multiple_targets_and_completed_mrs_without_a_task() {
+        let table = table(
+            vec![],
+            vec![],
+            vec![
+                mr(1, "shared-branch", "First target", "opened"),
+                mr(2, "shared-branch", "Second target", "opened"),
+                mr(3, "old-branch", "Completed without a checkout", "merged"),
+            ],
+            vec![tree("loose-tree", "shared-branch")],
+        );
+        let roots = view::build(
+            &table,
+            &view::Options {
+                all: true,
+                active_loose: true,
+                ..Default::default()
+            },
+        );
+        fn contains(nodes: &[Node], index: usize) -> bool {
+            nodes.iter().any(|node| {
+                matches!(node.kind, Kind::Mr(i) if i == index) || contains(&node.children, index)
+            })
+        }
+        assert!(
+            !contains(&roots, table.mr_index(1)),
+            "the tree intentionally shows only the latest MR"
+        );
+        let catalog = merge_request_rows(&table);
+        assert_eq!(catalog.len(), 3);
+        for iid in 1..=3 {
+            let value = catalog
+                .iter()
+                .find(|row| row["url"] == format!("https://gitlab/mr/{iid}"))
+                .unwrap();
+            assert_eq!(value["repository"], "demo/service");
+            assert_eq!(value["tasks"], json!([]));
+        }
+        assert_eq!(
+            catalog
+                .iter()
+                .filter(|row| row["state"] == "opened")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn mr_catalog_preserves_full_title_ticket_keys_and_task_associations() {
+        let table = table(
+            vec![task("demo", &["DEMO-123"])],
+            vec![],
+            vec![mr(7, "fix-parser", "DEMO-123 Fix parser", "opened")],
+            vec![],
+        );
+        let catalog = merge_request_rows(&table);
+        assert_eq!(catalog[0]["title"], "DEMO-123 Fix parser");
+        assert_eq!(catalog[0]["label"], "!7  DEMO-123 Fix parser");
+        assert_eq!(catalog[0]["tickets"], json!(["DEMO-123"]));
+        assert_eq!(catalog[0]["tasks"][0]["task"], "demo");
+        assert_eq!(catalog[0]["tasks"][0]["id"], "task:demo");
+    }
 
     #[test]
     fn preview_write_back_preserves_full_body_and_bounded_snapshot_json() {

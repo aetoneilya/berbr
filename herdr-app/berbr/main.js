@@ -5,10 +5,12 @@ import { appHome, exec, focused, spaces, agents, panes, theme, run, props,
 import { walk, sectionLabels, taskSpace, rowMenu,
   normalizeTicketState, ticketTitle,
   cleanCliText, isClosedTicket, newTaskArgs, freeTickets,
-  agentActivity, formatElapsed, blockedPrompt, mrPills, focusedTask, focusedTree, treeFocusTarget, jumpItems, matchJump, closePlan, PanelModel, treeMarks, isMergedTree, mergedPlan, backendClosePlan } from "./model.js";
+  agentActivity, formatElapsed, blockedPrompt, mrPills, mrListPills, focusedTask, focusedTree, treeFocusTarget, jumpItems, matchJump, closePlan, PanelModel, treeMarks, isMergedTree, mergedPlan, backendClosePlan } from "./model.js";
 import { icon, iconButton, button, chip, sectionHeader, statusMark, kbd, pill, keyboardControl } from "./ui.js";
 import { formView, initNote, noteKey } from "./forms.js";
 import { log, logRun, setDebug } from "./log.js";
+import {combineProjects, protectSpaceBindings, scopeSummary, ProjectLoader, spaceBindingBlocker} from "./scope.js";
+import {boardFilters} from "./filters.js";
 
 export default class Berbr extends View {
   init(_props, cx) {
@@ -16,6 +18,24 @@ export default class Berbr extends View {
     this.binary = p.binary ?? `${appHome()}/mods/berbr/berbr`;
     this.form = p.form ?? null;
     this.project = p.project ?? shared("berbr.project") ?? null;
+    this.view = this.form ? "tasks" : this.savedView(this.project);
+    this.viewQueries = {tasks:"", mrs:""}; this.viewSelections = {};
+    this.mrAll = false;
+    this.scopeProjects = null; this.scopeErrors = new Map(); this.scopeEpoch = 0; this.scopeBindings = new Map();
+    this.snapshotLoader = new ProjectLoader(async (project, cached) => {
+      const data = JSON.parse(await this.cli(["app-snapshot", ...(cached ? ["--cached"] : [])], project));
+      if (project && data.project !== project) throw new Error("Snapshot belongs to another project");
+      return data;
+    }, (project, epoch) => epoch === this.scopeEpoch && (!this.data || (this.scopeProjects === null ? project === this.project : this.scopeProjects.includes(project))));
+    this.filtersOpen = false; this.filtersSection = null; this.filtersTriggerHovered = false;
+    if (!this.form) try {
+      const saved = JSON.parse(localStorage.getItem("berbr.projects"));
+      if (Array.isArray(saved) && saved.every(name => typeof name === "string")) this.scopeProjects = [...new Set(saved)];
+      const bindings = JSON.parse(localStorage.getItem("berbr.spaceBindings"));
+      if (Array.isArray(bindings)) this.scopeBindings = new Map(bindings.filter(entry => Array.isArray(entry) && typeof entry[0] === "string" &&
+        typeof entry[1]?.space === "string" && Array.isArray(entry[1]?.peers) && entry[1].peers.every(key => typeof key === "string")));
+    } catch (_) { /* Storage is optional. */ }
+    if (this.scopeProjects?.length === 1) this.view = this.savedView(this.scopeProjects[0]);
     this.pendingProject = null;
     this.snapshots = new Map(); // the last one of every project shown, for instant switching
     this.data = null; this.error = null; this.busy = false; this.loading = false;
@@ -48,6 +68,7 @@ export default class Berbr extends View {
     this.currentFocus = focused();
     this.cwd = p.cwd ?? this.opening?.cwd ?? null;
     this.handle = cx.focus_handle();
+    this.filtersFocus = cx.focus_handle();
     this.handle.focus();
     if (this.form === "note") { initNote(this, cx); return; }
     this.inputs = {}; this.values = {}; this.searchFocused = false;
@@ -85,6 +106,12 @@ export default class Berbr extends View {
       }
       this.inputs[key] = input;
     }
+    if (!this.form) {
+      const input = this.inputs.mrSearch = InputState.new({value:"", placeholder:"Filter MRs"});
+      input.on("change", (_event, cx) => {this.filter = input.value(); cx.notify();});
+      input.on("focus", (_event, cx) => {this.searchFocused = true; cx.notify();});
+      input.on("blur", (_event, cx) => {this.searchFocused = false; cx.notify();});
+    }
     this.agent = p.agent ?? "codex"; this.worktree = true;
     // "smart" is the internal key for the description-only Generate tab.
     this.source = p.prefill?.ticket ? "jira" : "smart";
@@ -116,6 +143,8 @@ export default class Berbr extends View {
           const command = await nextCommand();
           if (command === "refresh") this.refresh(cx, true);
           if (command === "new") this.formOverlay("new");
+          if (command === "tasks" || command === "mrs") this.switchView(command, cx);
+          if (command === "filters") {this.filtersOpen = true; this.filtersFocus.focus();}
           if (command === "details") this.withLive(() => { const row = this.chosen(); if (row) this.showDetails(row, cx); });
           if (command === "focus") { this.handle.focus(); this.receiveJump(cx); }
           if (command === "jump") this.openJump();
@@ -133,10 +162,10 @@ export default class Berbr extends View {
     if (["done", "remove-merged"].includes(this.form)) this.loadClosePlan(cx);
   }
 
-  actionContext() {
+  actionContext(project = this.project) {
     const opening = this.fixedContext ? this.opening : focused();
-    const projectCwd = this.data?.projects?.find(project => project.name === this.project)?.cwd;
-    return {opening, cwd:this.fixedContext ? this.cwd : opening?.cwd ?? projectCwd ?? this.cwd};
+    const projectCwd = this.data?.projects?.find(item => item.name === project)?.cwd;
+    return {opening, cwd:project !== this.project ? projectCwd ?? this.cwd : this.fixedContext ? this.cwd : opening?.cwd ?? projectCwd ?? this.cwd};
   }
 
   syncFocus(cx) {
@@ -145,15 +174,15 @@ export default class Berbr extends View {
     this.currentFocus = next;
     if (!this.panelFocused() && ["space", "terminal"].some(key => next?.[key] !== previous?.[key])) {
       const task = focusedTask(this.data?.rows, next, spaces(), agents());
-      if (task) this.selected = this.followedSelection = task.id;
+      if (task && this.view === "tasks") this.selected = this.followedSelection = task.id;
       // Plain overflow containers expose no programmatic scroll handle in this API.
     }
     cx.notify();
   }
 
-  async cli(args) {
+  async cli(args, project = this.project) {
     const env = ["-u", "HERDR_PLUGIN_CONTEXT_JSON", "-u", "HERDR_PLUGIN_ROOT", "-u", "HERDR_ENV", "-u", "HERDR_WORKSPACE_ID", "-u", "HERDR_TAB_ID", "-u", "HERDR_PANE_ID", "-u", "HC_TERMINAL_ID", "BERBR_BACKEND=herdr-app", "NO_COLOR=1"];
-    const {opening, cwd} = this.actionContext();
+    const {opening, cwd} = this.actionContext(project);
     // Clear inherited caller ids too: a mod pane can have no terminal.
     if (opening?.space) env.push(`HERDR_WORKSPACE_ID=${opening.space}`);
     if (opening?.tab) env.push(`HERDR_TAB_ID=${opening.tab}`);
@@ -161,7 +190,7 @@ export default class Berbr extends View {
     // Load the same login/interactive environment as the existing terminal TUI.
     // All user values stay argv entries; the shell only forwards "$@".
     const command = ["-lic", 'exec "$@"', "berbr-env", "env", ...env, this.binary,
-      ...(this.project ? ["--project", this.project] : []), ...args];
+      ...(project ? ["--project", project] : []), ...args];
     const started = Date.now();
     let result, retried = null;
     try {
@@ -171,7 +200,7 @@ export default class Berbr extends View {
         // The focused terminal can sit in a folder that is gone (a removed worktree):
         // nothing starts there, so run from the project instead.
         if (!cwd || !/os error 2\b/.test(String(error?.message ?? error))) throw error;
-        const fallback = this.data?.projects?.find(project => project.name === this.project)?.cwd;
+        const fallback = this.data?.projects?.find(item => item.name === project)?.cwd;
         retried = {to:fallback && fallback !== cwd ? fallback : null};
         result = await exec("zsh", command, retried.to ? {cwd:retried.to} : {});
       }
@@ -187,6 +216,7 @@ export default class Berbr extends View {
 
   refresh(cx, cached = false, forcePrompts = false) {
     if (this.loading || this.busy) return;
+    if (this.scopeProjects !== null && this.data) {this.refreshScope(cx, cached); return;}
     const desired = shared("berbr.project");
     if (desired && desired !== this.project) { this.switchProject(desired, cx); return; }
     this.loading = true;
@@ -196,21 +226,23 @@ export default class Berbr extends View {
     const load = this.load = (this.load ?? 0) + 1;
     cx.spawn(async cx => {
       try {
-        const data = JSON.parse(await this.cli(["app-snapshot", ...(cached ? ["--cached"] : [])]));
+        const data = await this.snapshotLoader.request(this.project, cached, this.scopeEpoch);
         if (load !== this.load) return; // another project was chosen meanwhile
         const desired = shared("berbr.project");
         if (desired && desired !== requestedProject && desired !== data.project) {
           this.loading = false; this.switchProject(desired, cx); return;
         }
+        if (this.project !== data.project) this.view = this.savedView(this.scopeProjects?.length === 1 ? this.scopeProjects[0] : data.project);
         this.project = data.project;
         this.agent = data.projects?.find(project => project.name === data.project)?.agent ?? "codex";
         if (data.settings) setShared("berbr.settings", data.settings);
         setShared("berbr.project", this.project);
         const firstData = !this.data;
-        this.data = data; this.contextRow = null; this.error = null;
+        this.data = data; this.scopeBase = data; this.contextRow = null; this.error = null;
         this.snapshots.set(data.project, data);
+        this.composeScope();
         setDebug(data.debug);
-        if (firstData) this.focusInitial(data, cx);
+        if (firstData) this.focusInitial(this.data, cx);
       } catch (error) {
         if (load !== this.load) return;
         this.error = String(error.message ?? error);
@@ -218,7 +250,8 @@ export default class Berbr extends View {
       this.loading = false;
       const live = this.liveState();
       this.syncBlocked(live.rows, cx, false, live); cx.notify();
-      if (cached && !this.didOnline) { this.didOnline = true; this.refresh(cx); }
+      if (cached && this.scopeProjects !== null) {this.didOnline = false; this.refreshScope(cx, true);}
+      else if (cached && !this.didOnline) { this.didOnline = true; this.refresh(cx); }
     });
   }
 
@@ -227,17 +260,81 @@ export default class Berbr extends View {
   switchProject(name, cx) {
     if (this.busy || name === this.project) return;
     this.loading = false;
+    this.scopeEpoch++;
+    this.scopeProjects = null; this.scopeErrors.clear();
+    try {localStorage.setItem("berbr.projects", "null");} catch (_) { /* Storage is optional. */ }
     this.project = name; this.selected = null; this.didOnline = false;
+    this.view = this.savedView(name); this.viewSelections = {};
+    this.viewQueries = {tasks:"", mrs:""}; this.clearSearch();
+    this.inputs.mrSearch.set_value(""); this.mrAll = false;
     this.contextRow = null;
     this.setExpanded(null, cx);
     this.cwd = this.data?.projects?.find(project => project.name === name)?.cwd ?? null;
     this.data = this.snapshots.get(name) ?? null;
-    if (this.data) this.focusInitial(this.data, cx);
+    if (this.data) {this.composeScope(); this.focusInitial(this.data, cx);}
     this.refresh(cx, true);
+  }
+
+  composeScope() {
+    const selected = this.scopeProjects ?? [this.project];
+    const data = selected.map(name => this.snapshots.get(name)).filter(Boolean);
+    const errors = new Map([...this.scopeErrors].filter(([name]) => selected.includes(name)));
+    const known = [...this.snapshots.values()];
+    this.data = this.scopeProjects === null && data.length
+      ? protectSpaceBindings(data[0], known, this.scopeBindings)
+      : combineProjects(data, this.scopeBase ?? this.data, errors, known, this.scopeBindings);
+    try {localStorage.setItem("berbr.spaceBindings", JSON.stringify([...this.scopeBindings]));} catch (_) { /* Storage is optional. */ }
+  }
+
+  setProjectFilter(names, cx) {
+    if (this.busy) return;
+    if (this.data && !this.data.scope_projects) {
+      this.scopeBase = this.data;
+      this.snapshots.set(this.data.project ?? this.project, this.data);
+    }
+    const previousProject = this.viewProject();
+    const known = new Set((this.data?.projects ?? []).map(project => project.name));
+    this.scopeProjects = [...new Set(names)].filter(name => known.has(name));
+    this.scopeEpoch++;
+    if (this.scopeProjects.length === 1 && this.viewProject() !== previousProject) {
+      this.viewQueries[this.view] = this.filter;
+      this.view = this.savedView(this.viewProject());
+      this.filter = this.viewQueries[this.view]; this.searchInput().set_value(this.filter);
+    }
+    try {localStorage.setItem("berbr.projects", JSON.stringify(this.scopeProjects));} catch (_) { /* Storage is optional. */ }
+    this.load = (this.load ?? 0) + 1; this.loading = false; this.didOnline = false;
+    this.selected = null; this.contextRow = null; this.viewSelections = {};
+    this.setExpanded(null, cx); this.composeScope(); cx.notify();
+    this.refreshScope(cx, true);
+  }
+
+  refreshScope(cx, cached) {
+    if (this.loading || this.busy || this.scopeProjects === null) return;
+    const selected = [...this.scopeProjects], epoch = this.scopeEpoch, load = this.load = (this.load ?? 0) + 1;
+    this.loading = selected.length > 0;
+    if (!selected.length) {this.composeScope(); cx.notify(); return;}
+    cx.spawn(async cx => {
+      // The shared loader bounds all epochs to two backends. Every result and
+      // reused request belongs to the current selection epoch.
+      for (let start = 0; start < selected.length; start += 2) {
+        const results = await Promise.allSettled(selected.slice(start, start + 2).map(project => this.snapshotLoader.request(project, cached, epoch)));
+        if (load !== this.load) return;
+        results.forEach((result, index) => {
+          const project = selected[start + index];
+          if (result.status === "fulfilled") {this.snapshots.set(project, result.value); this.scopeErrors.delete(project);}
+          else this.scopeErrors.set(project, String(result.reason?.message ?? result.reason));
+        });
+        this.composeScope(); cx.notify();
+      }
+      if (load !== this.load) return;
+      this.loading = false; cx.notify();
+      if (cached && !this.didOnline) {this.didOnline = true; this.refreshScope(cx, false);}
+    });
   }
 
   /** What a project shows first: the task of the focused terminal, else the last expanded one. */
   focusInitial(data, cx) {
+    if (this.view === "mrs") return;
     const flat = walk(data.rows);
     const task = focusedTask(data.rows, this.actionContext().opening, spaces(), agents());
     this.selected = task?.id ?? this.expanded;
@@ -431,7 +528,42 @@ export default class Berbr extends View {
     return this.liveState().visible;
   }
 
-  rows(sections = null) { return this.withLive(() => this.rowItems(sections ?? this.sections())); }
+  viewProject() { return this.scopeProjects?.length === 1 ? this.scopeProjects[0] : this.project; }
+
+  savedView(project) {
+    try { return localStorage.getItem(`berbr.view.${project}`) === "mrs" ? "mrs" : "tasks"; }
+    catch (_) { return "tasks"; }
+  }
+
+  searchInput() { return this.view === "mrs" && !this.form ? this.inputs.mrSearch : this.inputs.search; }
+
+  clearSearch() {
+    this.filter = ""; this.values.search = ""; this.searchInput().set_value("");
+  }
+
+  switchView(view, cx) {
+    if (this.busy || this.view === view || !["tasks", "mrs"].includes(view)) return;
+    this.viewQueries[this.view] = this.filter;
+    this.viewSelections[this.view] = this.selected;
+    this.view = view; this.contextRow = null;
+    this.filter = this.viewQueries[view]; this.searchInput().set_value(this.filter);
+    this.selected = this.viewSelections[view] ?? null;
+    try { if (this.viewProject()) localStorage.setItem(`berbr.view.${this.viewProject()}`, view); } catch (_) { /* Storage is optional. */ }
+    this.handle.focus(); cx.notify();
+  }
+
+  mrRows() {
+    const query = this.filter.trim().toLowerCase();
+    return this.liveState().mrs.filter(mr => (this.mrAll || !mr.completed) && (!query || mr.searchText.includes(query)));
+  }
+
+  toggleCompleted(cx) {
+    if (this.view === "mrs") this.mrAll = !this.mrAll;
+    else this.all = !this.all;
+    cx.notify();
+  }
+
+  rows(sections = null) { return this.withLive(() => this.view === "mrs" ? this.mrRows() : this.rowItems(sections ?? this.sections())); }
 
   rowItems(sections) {
     return sections.flatMap(section => [
@@ -479,7 +611,7 @@ export default class Berbr extends View {
     else if (item.kind === "agent") run("agent.focus", {terminal:item.live?.address ?? item.row.terminal});
     else if (["ticket", "mr"].includes(item.kind) && !item.task) this.openUrl(item.row.url, cx);
     else {
-      setShared("berbr.jumpTarget", {project:this.project, task:item.task?.id, row:item.row.id,
+      setShared("berbr.jumpTarget", {project:item.row.project ?? this.project, task:item.task?.id, row:item.row.id,
         parent:item.parent?.id, kind:item.kind});
       run("berbr.navigate");
     }
@@ -488,12 +620,13 @@ export default class Berbr extends View {
 
   receiveJump(cx) {
     const target = shared("berbr.jumpTarget");
-    if (!target || target.project !== this.project || !this.data) return;
+    if (!target || (target.project !== this.project && !this.scopeProjects?.includes(target.project)) || !this.data) return;
     setShared("berbr.jumpTarget", null);
     const flat = walk(this.data.rows);
     const parent = flat.find(row => row.id === (target.task ?? target.parent ?? target.row));
     if (!parent) return;
-    this.filter = ""; this.inputs.search.set_value(""); this.values.search = "";
+    this.switchView("tasks", cx);
+    this.clearSearch();
     if (parent.done) this.all = true;
     this.setExpanded(parent.id, cx);
     for (const section of this.liveState().sections) if (section.rows.some(row => row.id === parent.id)) this.collapsed.delete(section.id);
@@ -523,14 +656,19 @@ export default class Berbr extends View {
     if (next !== this.hovered) { this.hovered = next; cx.notify(); }
   }
 
-  perform(cx, args, {close = false, action = args[0], before = null, after = null} = {}) {
+  perform(cx, args, {close = false, action = args[0], before = null, after = null, project = this.project} = {}) {
     if (this.busy || this.loading) return;
+    const contextual = props()?.row ?? props()?.tree;
+    const taskOperation = ["select", "add", "rename", "review", "open"].includes(args[0]) || (args[0] === "done" && !args.includes("--tree"));
+    const conflict = contextual?.scope_space_ambiguous || walk(this.data?.rows).some(row => row.scope_space_ambiguous &&
+      (row.project ?? this.project) === project && [row.task, row.tree, row.cwd].includes(args[1]));
+    if (taskOperation && conflict) {this.error = spaceBindingBlocker; cx.notify(); return;}
     this.busy = true; this.busyAction = action; this.error = null;
     cx.notify();
     cx.spawn(async cx => {
       try {
         if (before) await before();
-        const result = await this.cli(args);
+        const result = await this.cli(args, project);
         this.busy = false;
         run("berbr.refresh");
         if (close && props()?.overlay) closeOverlay(props().overlay);
@@ -544,9 +682,10 @@ export default class Berbr extends View {
 
   /** A worktree with no task: a new agent or shell in a space of its own (`berbr open`). */
   openLoose(tree, shell, cx, {close = false, action} = {}) {
+    if (tree.scope_space_ambiguous) {this.error = spaceBindingBlocker; cx.notify(); return;}
     const path = tree.cwd || treeMarks(tree).path;
     if (!path) return;
-    this.perform(cx, ["open", path, ...(shell ? ["--shell"] : [])], {close, action});
+    this.perform(cx, ["open", path, ...(shell ? ["--shell"] : [])], {close, action, project:tree.project ?? this.project});
   }
 
   openUrl(url, cx, action = url, {close = false} = {}) {
@@ -566,12 +705,16 @@ export default class Berbr extends View {
   openNote(row) {
     if (!row.note || this.busy) return;
     openOverlay({mod:"berbr", kind:"window", key:"berbr-note", width:720, height:0.75,
-      props:{form:"note", path:row.note, title:row.title ?? row.label ?? row.task ?? "Note", vault:this.data?.store === "vault",
+      props:{form:"note", path:row.note, title:row.title ?? row.label ?? row.task ?? "Note", vault:(this.data?.project_stores?.[row.project] ?? this.data?.store) === "vault",
         tickets:walk(row.children).filter(child => child.kind === "ticket").map(ticket => ({key:ticket.target, url:ticket.url}))}});
   }
 
   open(row, cx, action = row?.id) {
     if (!row || this.busy) return;
+    if (row.scope_space_ambiguous && (["task", "tree"].includes(row.kind) || (row.kind === "agent" &&
+        !agents().some(agent => [agent.address, agent.pane].includes(row.terminal))))) {
+      this.error = spaceBindingBlocker; cx.notify(); return;
+    }
     if (row.kind === "agent") {
       run("agent.focus", {terminal:row.terminal});
       if (props()?.overlay) closeOverlay(props().overlay);
@@ -586,20 +729,22 @@ export default class Berbr extends View {
       const args = ["select", row.task];
       const tree = row.tree ?? trees[0]?.tree;
       if (tree) args.push("--tree", tree);
-      this.perform(cx, args, {close:true, action});
+      this.perform(cx, args, {close:true, action, project:row.project ?? this.project});
     }
   }
 
   formOverlay(form, extra = {}) {
     if (this.busy) return;
+    const project = extra.project ?? extra.row?.project ?? extra.tree?.project ??
+      (form === "new" && this.scopeProjects?.length && !this.scopeProjects.includes(this.project) ? this.scopeProjects[0] : this.project);
     const popup = ["projects", "attach-task", "menu"].includes(form);
     openOverlay({ mod:"berbr", kind: popup ? "popup" : "dialog",
       width: ["done", "remove-merged"].includes(form) ? 520 : ["projects", "menu"].includes(form) ? 220 : form === "attach-task" ? 300 : form === "jump" ? 560 : form === "remove-tree" ? 440 : 480,
       height: ["projects", "attach-task"].includes(form) ? 0.6 : popup ? undefined : form === "jump" ? 0.6 : ["done", "remove-merged"].includes(form) ? 0.75 : form === "new" ? 480 : form === "settings" ? 240 : form === "ticket" ? 420 : form === "remove-tree" ? 360 : 240,
       modal: ["new", "settings", "rename", "stop-agent", "remove-tree", "done", "remove-merged"].includes(form),
       ...(popup ? {at:"pointer"} : {}),
-      props:{ form, project:this.project, binary:this.binary, agent:shared("berbr.settings")?.agent ?? this.agent,
-        ...(form === "new" ? this.newTaskProps() : {}), ...this.actionContext(), ...extra } });
+      props:{ form, project, binary:this.binary, agent:shared("berbr.settings")?.agent ?? this.agent,
+        ...(form === "new" ? this.newTaskProps() : {}), ...this.actionContext(project), ...extra } });
   }
 
   /** What the New task form picks from: the projects, and each one's open tickets with no task. */
@@ -699,6 +844,10 @@ export default class Berbr extends View {
   }
 
   loadClosePlan(cx) {
+    if (props()?.row?.scope_space_ambiguous) {
+      this.closePlan = {...this.closePlan, blockers:[...new Set([...(this.closePlan?.blockers ?? []), spaceBindingBlocker])]};
+      this.planLoading = false; cx.notify(); return;
+    }
     this.planLoading = true;
     cx.spawn(async cx => {
       try {
@@ -859,6 +1008,7 @@ export default class Berbr extends View {
     if (this.busy) return;
     this.selected = row.id; this.handle.focus();
     if (row.kind === "waiting") { cx.notify(); return; }
+    if (this.view === "mrs" && row.kind === "mr") { this.openUrl(row.url, cx, row.id); return; }
     if (row.kind === "section") this.toggleSection(row.section, cx);
     else if (row.kind === "detail") row.action?.(cx);
     else if (row.kind === "tree") this.navigateTree(row, cx);
@@ -868,6 +1018,7 @@ export default class Berbr extends View {
 
   showDetails(row, cx) {
     if (this.busy) return;
+    if (this.view === "mrs" && row.kind === "mr") return;
     if (row.kind === "section") { this.toggleSection(row.section, cx, true); return; }
     const task = row.kind === "detail" ? row.parent : row;
     this.setExpanded(task.id, cx);
@@ -887,6 +1038,9 @@ export default class Berbr extends View {
 
   keyEvent(event, cx) {
     if (this.form === "note" && noteKey(this, event, cx)) return;
+    if (this.filtersOpen && event.key === "escape") {
+      this.filtersOpen = false; this.handle.focus(); cx.stop_propagation(); cx.notify(); return;
+    }
     if (this.form === "new" && event.key === "enter" && event.modifiers?.platform) {
       this.submitNew(cx); cx.stop_propagation(); return;
     }
@@ -926,7 +1080,7 @@ export default class Berbr extends View {
     }
     if (event.key === "escape") {
       if (!this.form && this.searchFocused) {
-        this.filter = ""; this.values.search = ""; this.inputs.search.set_value("");
+        this.clearSearch();
         this.handle.focus(); cx.stop_propagation(); cx.notify(); return;
       }
       if (props()?.overlay) {
@@ -951,10 +1105,10 @@ export default class Berbr extends View {
       else if (row.kind === "detail") this.selected = row.parent.id;
       else if (row.id === this.expanded) this.setExpanded(null, cx);
     } else if (["right", "space", " "].includes(event.key) && this.chosen()) this.showDetails(this.chosen(), cx);
-    else if (event.key === "/") this.inputs.search.focus();
+    else if (event.key === "/") this.searchInput().focus();
     else if (event.key === "n") this.formOverlay("new");
     else if (event.key === "r") this.refresh(cx, false, true);
-    else if (event.key === "d") this.all = !this.all;
+    else if (event.key === "d") this.toggleCompleted(cx);
     else return;
     cx.stop_propagation(); cx.notify();
   }
@@ -1019,6 +1173,8 @@ export default class Berbr extends View {
       .child(div().pt(2).child(statusMark(t, signal.status)))
       .child(v_flex().flex_1().min_w(0).gap(2)
         .child(h_flex().gap(6).items_center().min_w(0)
+          .when(this.scopeProjects?.length > 1 && Boolean(row.project), el => el.child(div().max_w("30%").min_w(0).truncate()
+            .text_size(11).text_color(t.dim).tooltip(row.project).child(row.project)))
           .child(div().flex_1().min_w(0).text_size(13).truncate().child(row.title ?? row.label ?? row.task ?? "Untitled task"))
           .when(Boolean(signal.liveSpace), el => el.child(iconButton(t, `task-space-${row.id}`, "monitor", "Go to space",
             () => run("space.select", {id:signal.liveSpace.id}), {size:20, disabled:this.busy}))))
@@ -1061,10 +1217,10 @@ export default class Berbr extends View {
           (cx, id) => key === "history" ? this.openUrl(row.url, cx, id) : this.openNote(row));
       }
     }
-    if (!detail.trees.length && !taskSpace(task, this.liveState().spaces))
+    if (!task.scope_space_ambiguous && !detail.trees.length && !taskSpace(task, this.liveState().spaces))
       add("action", "start", {label:"Start work", accent:true}, (cx, id) => this.open(task, cx, id));
     if (task.note) add("action", "note", {label:"Note"}, () => this.openNote(task));
-    if (!task.done) add("action", "close", {label:"Close task", close:true}, () => this.formOverlay("done", {
+    if (!task.done && !task.scope_space_ambiguous) add("action", "close", {label:"Close task", close:true}, () => this.formOverlay("done", {
       task:task.task, label:task.title ?? task.label, row:task, plan:this.liveState().plan(task),
     }));
     return items;
@@ -1089,9 +1245,9 @@ export default class Berbr extends View {
       (cx, id) => this.openUrl(mr.url, cx, id));
     if (ticket && !isClosedTicket(ticket)) add("action", "make-task", {label:"Make task"}, () => this.makeTask(ticket));
     if (ticket) add("action", "attach", {label:"Attach to task…"}, () => {
-      const tasks = [...new Map(walk(this.data?.rows).filter(task => task.kind === "task" && !task.done && task.task)
+      const tasks = [...new Map(walk(this.data?.rows).filter(task => task.kind === "task" && !task.done && task.task && task.project === ticket.project)
         .map(task => [task.task, task])).values()];
-      this.formOverlay("attach-task", {ticket:ticket.target, tasks});
+      this.formOverlay("attach-task", {ticket:ticket.target, tasks, project:ticket.project ?? this.project});
     });
     if (["ticket", "mr"].includes(row.kind)) add("action", "url", {
       label:ticket ? "Open in Jira" : "Open in GitLab", link:true,
@@ -1100,7 +1256,7 @@ export default class Berbr extends View {
   }
 
   makeTask(ticket) {
-    this.formOverlay("new", {prefill:{title:ticketTitle(ticket), ticket:ticket.target ?? ""}});
+    this.formOverlay("new", {project:ticket.project ?? this.project, prefill:{title:ticketTitle(ticket), ticket:ticket.target ?? ""}});
   }
 
   treeState(t, row, {compact = false, hideMerged = false, hideChanges = false} = {}) {
@@ -1156,7 +1312,7 @@ export default class Berbr extends View {
         buttons.push(iconButton(t, `${id}/${kind}`, icon, label, cx => this.openLoose(tree, shell, cx, {action:`${id}/${kind}`}),
           {size:20, disabled:this.busy, spinning:this.busy && this.busyAction === `${id}/${kind}`}));
       if (ticket && !isClosedTicket(ticket) && ticket.target) buttons.push(iconButton(t, `${id}/resume`, "terminal", "Resume agent",
-        cx => this.perform(cx, ["select", ticket.target], {close:true, action:`${id}/resume`}),
+        cx => this.perform(cx, ["select", ticket.target], {close:true, action:`${id}/resume`, project:ticket.project ?? this.project}),
         {size:20, disabled:this.busy, spinning:this.busy && this.busyAction === `${id}/resume`}));
       return group(buttons);
     }
@@ -1295,7 +1451,7 @@ export default class Berbr extends View {
       if (this.closedTickets.has(task.id)) line.children(detail.tickets.closed.map(row => ticket(row, true)));
     }
     return line.child(iconButton(t, `${task.id}/add-ticket`, "plus", "Add ticket", () => this.formOverlay("ticket", {
-      task:task.task, title:task.title ?? task.label,
+      task:task.task, title:task.title ?? task.label, project:task.project ?? this.project, row:task,
       tickets:[...detail.tickets.open, ...detail.tickets.closed].map(ticket => ticket.target),
       trees:detail.trees.map(tree => tree.row),
     }), {size:20, disabled:this.busy}));
@@ -1369,7 +1525,8 @@ export default class Berbr extends View {
   looseRow(t, row, section) {
     const selected = this.panelFocused() && row.id === this.selected;
     const expanded = row.id === this.expanded;
-    const reason = section === "todo" ? "Assigned in Jira" : this.liveState().reason(row);
+    const detail = section === "todo" ? "Assigned in Jira" : this.liveState().reason(row);
+    const reason = this.scopeProjects?.length > 1 && row.project ? `${row.project} · ${detail}` : detail;
     const kindIcon = { ticket:"file-text", tree:"git-branch", mr:"git-compare" }[row.kind] ?? "file-text";
     const line = h_flex().id(`loose-${row.id}`).h(44).flex_none().px(8).gap(8).items_center().rounded(6)
       .when(selected, el => el.bg(t.selected)).hover(el => el.bg(selected ? t.selected : t.hover)).cursor_pointer()
@@ -1405,6 +1562,28 @@ export default class Berbr extends View {
     return this.expandedBlock(t, header, body);
   }
 
+  mrListRow(t, row) {
+    const selected = this.panelFocused() && this.selected === row.id;
+    const pending = this.busy && this.busyAction === row.id;
+    const context = [this.scopeProjects?.length > 1 ? row.project : null, row.repository,
+      ...row.tasks.map(task => task.title ?? task.label ?? task.task)];
+    if (!row.tasks.length && row.task) context.push(row.task);
+    return v_flex().id(row.id).flex_none().min_w(0).px(8).py(8).gap(5).rounded(6)
+      .when(selected, el => el.bg(t.selected)).hover(el => el.bg(selected ? t.selected : t.hover))
+      .cursor_pointer().opacity(this.busy ? 0.4 : 1)
+      .tooltip([row.label, row.branch, row.url].filter(Boolean).join("\n"))
+      .accessibility_label(`Open ${row.label ?? "MR"}`)
+      .on_click((_event, cx) => this.taskClick(row, cx))
+      .on_mouse_down("right", (_event, cx) => {cx.stop_propagation(); this.openRowMenu(row, cx);})
+      .child(h_flex().min_w(0).gap(6).items_center()
+        .child(icon(pending ? "spinner" : "git-compare", 13).text_color(t.dim).when(pending, el => el.spin(900)))
+        .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(row.completed ? t.dim : t.foreground)
+          .child(row.label ?? row.title ?? "MR")))
+      .when(context.some(Boolean), el => el.child(div().min_w(0).truncate().text_size(11).text_color(t.dim)
+        .tooltip(context.filter(Boolean).join(" · ")).child(context.filter(Boolean).join(" · "))))
+      .child(h_flex().min_w(0).gap(4).flex_wrap().children(mrListPills(row).map(spec => pill(t, spec))));
+  }
+
   banner(t, id, message, dismiss) {
     const text = String(message).replace(/&/g, "&amp;").replace(/</g, "&lt;")
       .replace(/>/g, "&gt;").replace(/\n/g, "<br>");
@@ -1431,10 +1610,11 @@ export default class Berbr extends View {
     if (this.form) return v_flex().size_full().min_h(0).track_focus(this.handle)
       .on_key_down((event, cx) => this.key(event, cx)).child(formView(this, t));
     const panelFocused = this.panelFocused();
+    const mrView = this.view === "mrs";
     const sections = this.sections();
     const rows = this.rows(sections);
     if (!rows.some(row => row.id === this.selected) && this.contextRow?.id !== this.selected &&
-        (panelFocused || this.followedSelection !== this.selected ||
+        (mrView || panelFocused || this.followedSelection !== this.selected ||
           !walk(this.data?.rows).some(row => row.kind === "task" && row.id === this.selected)))
       this.selected = rows.find(row => row.id === this.expanded)?.id ?? rows[0]?.id ?? null;
     const allSections = this.liveState().sections;
@@ -1442,24 +1622,28 @@ export default class Berbr extends View {
     const open = allSections.filter(section => ["needs", "running", "progress", "todo"].includes(section.id))
       .reduce((count, section) => count + section.rows.filter(row => row.kind === "task").length, 0);
     const disabled = this.loading || this.busy;
-    const list = v_flex().id("berbr-tasks").flex_1().min_h(0).overflow_y_scrollbar().px(6).py(4);
+    const list = v_flex().id(mrView ? "berbr-mrs" : "berbr-tasks").flex_1().min_h(0).overflow_y_scrollbar().px(6).py(4);
     if (!this.data && this.loading) {
       for (let index = 0; index < 5; index++) list.child(v_flex().h(44).flex_none().px(8).py(6).gap(6)
         .loop("opacity", {from:0.4, to:1, period:1200})
         .child(div().h(10).w("60%").rounded(4).bg(t.raised))
         .child(div().h(8).w("35%").rounded(4).bg(t.raised)));
+    } else if (mrView) {
+      if (this.data && !rows.length) list.child(div().p(16).text_size(12).text_color(t.dim)
+        .child(this.scopeProjects?.length === 0 ? "Select projects in Filters" : this.filter.trim() ? `Nothing matches “${this.filter.trim()}”` : this.mrAll ? "No MRs available" : "No open MRs"));
+      list.children(rows.map(row => this.mrListRow(t, row)));
     } else {
       if (this.filter.trim() && !sections.length) list.child(div().p(16).text_size(12).text_color(t.dim)
         .child(`Nothing matches “${this.filter.trim()}”`));
       if (this.data && !open && !this.filter.trim()) list.child(v_flex().p(16).gap(8).items_center()
-        .child(div().text_size(13).text_color(t.muted).child("No open tasks"))
+        .child(div().text_size(13).text_color(t.muted).child(this.scopeProjects?.length === 0 ? "Select projects in Filters" : "No open tasks"))
         .child(button(t, "empty-new", "New task", () => this.formOverlay("new"))));
       for (const section of sections) {
         const header = sectionHeader(t, section.id, section.label, section.rows.length, section.expanded,
           cx => this.toggleSection(section.id, cx), {selected:panelFocused && this.selected === `section-${section.id}`});
-        if (section.id === "cleanup" && this.liveState().mergedTrees.length)
+        if (section.id === "cleanup" && this.liveState().mergedTrees.length && (this.scopeProjects === null || this.scopeProjects.length === 1))
           header.child(button(t, "remove-merged", "Remove merged", () => this.formOverlay("remove-merged", {
-            trees:this.liveState().trees,
+            trees:this.liveState().trees, project:this.scopeProjects?.[0] ?? this.project,
           }), "ghost", disabled));
         list.child(header);
         if (section.expanded) for (const row of section.rows) list.child(row.kind === "task"
@@ -1468,31 +1652,39 @@ export default class Berbr extends View {
     }
     return v_flex().id("berbr").track_focus(this.handle).on_key_down((event, cx) => this.key(event, cx))
       .size_full().min_h(0).min_w(0).bg(t.surface).text_color(t.foreground)
-      .child(h_flex().h(40).flex_none().px(12).gap(4).items_center().bg(t.chrome).border_b_1().border_color(t.border)
-        .child(h_flex().id("project").h(26).min_w(0).gap(6).items_center().rounded(6).cursor_pointer()
-          .hover(el => el.bg(t.hover)).on_click(() => this.formOverlay("projects", {projects:this.data?.projects ?? []}))
-          .child(div().min_w(0).truncate().text_size(13).font_semibold().child(this.project ?? "Project"))
-          .child(icon("chevron-down", 12).text_color(t.dim)))
-        .child(div().flex_1())
-        .child(iconButton(t, "refresh", "refresh", "Refresh (r)", cx => this.refresh(cx, false, true), {disabled, spinning:this.loading}))
-        .child(iconButton(t, "new", "plus", "New task (n)", () => this.formOverlay("new"), {disabled})))
-      .child(div().px(10).pt(8).pb(4).child(h_flex().h(30).px(8).gap(6).items_center()
+      .child(h_flex().id("berbr-search-toolbar").flex_none().px(10).pt(8).pb(4).gap(6).items_center()
+        .child(h_flex().h(30).flex_1().min_w(0).px(8).gap(6).items_center()
         .rounded(6).bg(t.background).border_1().border_color(this.searchFocused ? t.accent : t.border)
         .child(icon("search").text_color(t.dim))
-        .child(Input.new(this.inputs.search).flex_1().min_w(0).h(28).border_0().bg(t.background)
+        .child(Input.new(this.searchInput()).flex_1().min_w(0).h(28).border_0().bg(t.background)
           .text_color(t.foreground).text_size(13))
         .when(!this.filter, el => el.child(kbd(t, "/")))
         .when(Boolean(this.filter), el => el.child(iconButton(t, "clear-search", "x", "Clear filter", cx => {
-          this.filter = ""; this.values.search = ""; this.inputs.search.set_value(""); cx.notify();
-        }, {size:22})))))
+          this.clearSearch(); cx.notify();
+        }, {size:22}))))
+        .child(boardFilters(this, t)))
       .when(Boolean(this.error), el => el.child(this.banner(t, "dismiss-error", this.error, cx => {this.error = null; cx.notify();})))
       .when(Boolean(this.data?.warnings?.length), el => el.child(this.banner(t, "warnings", this.data.warnings.join("\n"))))
       .child(list)
-      .child(h_flex().id("berbr-footer").h(30).flex_none().px(12).gap(8).items_center().border_t_1().border_color(t.border)
-        .child(div().id("toggle-done").text_size(11).text_color(this.all ? t.foreground : t.dim).cursor_pointer()
-          .tooltip("Show completed tasks (d)").on_click((_event, cx) => {this.all = !this.all; cx.notify();}).child(`Done ${done}`))
+      .child(h_flex().id("berbr-project-bar").h(36).flex_none().px(10).gap(6).items_center().border_t_1().border_color(t.border)
+        .child(div().id("project-scope").min_w(0).truncate().text_size(11).text_color(t.dim)
+          .tooltip((this.scopeProjects ?? [this.project]).filter(Boolean).join(", "))
+          .child(scopeSummary(this.scopeProjects, this.data?.projects ?? [], this.project)))
         .child(div().flex_1())
-        .when(panelFocused, el => el.child(kbd(t, "⌘K jump · ↑↓ move · → expand · ⏎ open").min_w(0).truncate()))
+        .child(keyboardControl(h_flex().id("new"), () => this.formOverlay("new"), disabled)
+          .h(26).px(6).gap(4).items_center().rounded(4).cursor_pointer().opacity(disabled ? 0.4 : 1)
+          .text_size(11).text_color(t.muted).tooltip("New task (n)").hover(el => el.bg(t.hover).text_color(t.foreground))
+          .on_click((_event, cx) => {cx.stop_propagation(); if (!disabled) this.formOverlay("new");})
+          .child(icon("plus", 12)).child("New task")))
+      .child(h_flex().id("berbr-footer").h(30).flex_none().px(12).gap(8).items_center().border_t_1().border_color(t.border)
+        .child(keyboardControl(h_flex().id("refresh"), cx => this.refresh(cx, false, true), disabled)
+          .h(24).gap(5).items_center().text_size(11).text_color(t.dim).cursor_pointer()
+          .opacity(disabled && !this.loading ? 0.4 : 1).tooltip("Refresh (r)").hover(el => el.text_color(t.foreground))
+          .on_click((_event, cx) => {cx.stop_propagation(); if (!disabled) this.refresh(cx, false, true);})
+          .child(icon(this.loading ? "spinner" : "refresh", 12).when(this.loading, el => el.spin(900)))
+          .child("Refresh"))
+        .child(div().flex_1())
+        .when(panelFocused, el => el.child(kbd(t, mrView ? "↑↓ move · ⏎ open · d completed" : "⌘K jump · ↑↓ move · → expand · ⏎ open").min_w(0).truncate()))
         .child(keyboardControl(iconButton(t, "settings", "settings", "Settings", () => this.formOverlay("settings"), {disabled, size:22}),
           () => this.formOverlay("settings"), disabled)));
   }

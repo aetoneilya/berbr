@@ -11,12 +11,15 @@ registerHooks({resolve(specifier, context, next) {
 }});
 const {default:Berbr} = await import("../main.js");
 const {pill, button} = await import("../ui.js");
+const {combineProjects} = await import("../scope.js");
 const snapshot = JSON.parse(await readFile(new URL("../fixtures/sample-snapshot.json", import.meta.url)));
 const storage = new Map();
 globalThis.localStorage = {getItem:key => storage.get(key) ?? null, setItem:(key, value) => storage.set(key, value)};
 
-function setup({data = snapshot, props = {}, saved = null, collapsed = null, liveSpaces = [], focus = null, keepJobs = false} = {}) {
+function setup({data = snapshot, props = {}, saved = null, collapsed = null, views = {}, scope = null, liveSpaces = [], focus = null, keepJobs = false} = {}) {
   storage.clear();
+  if (scope !== null) storage.set("berbr.projects", JSON.stringify(scope));
+  for (const [project, view] of Object.entries(views)) storage.set(`berbr.view.${project}`, view);
   if (saved) storage.set("berbr.expanded", JSON.stringify(saved));
   if (collapsed) storage.set("berbr.collapsed", JSON.stringify(collapsed));
   Object.assign(state, {focused:focus, props, spaces:liveSpaces, agents:[], panes:[], shared:new Map(), calls:[], overlays:[], notices:[], execs:[], execResult:null,
@@ -40,6 +43,309 @@ function nodes(root) {
 const byId = (root, id) => nodes(root).find(node => node.attributes.id?.[0] === id);
 const text = root => root && typeof root === "object" ? root.nodes.map(text).join(" ") : String(root ?? "");
 const click = (node, cx) => node.attributes.on_click[0]({}, cx);
+function openFilters(view, cx, section = null) {
+  if (!view.filtersOpen) click(byId(view.render(cx), "filters"), cx);
+  if (section && view.filtersSection !== section) click(byId(view.render(cx), `filter-${section}`), cx);
+}
+function selectView(view, cx, value) {
+  openFilters(view, cx, "view");
+  click(byId(view.render(cx), `view-${value}`), cx);
+  view.filtersOpen = false;
+}
+
+const mrSnapshot = () => ({project:"demo", projects:[{name:"demo"}, {name:"other"}], rows:[
+  {kind:"task", id:"task", task:"task-id", title:"Searchable owner", children:[
+    {kind:"tree", id:"tree", children:[{kind:"mr", id:"mr-one", label:"!1 First MR", branch:"feature-one",
+      state:"opened", url:"https://gitlab.example/group/repo/-/merge_requests/1", ci:"failed", approvals:2, unresolved:1}]}]},
+  {kind:"header", children:[{kind:"mr", id:"mr-two", label:"!2 Loose MR", state:"opened",
+    url:"https://gitlab.example/group/repo/-/merge_requests/2"},
+    {kind:"mr", id:"mr-old", label:"!3 Old MR", state:"merged", url:"https://gitlab.example/group/repo/-/merge_requests/3"}]}]});
+
+const scopedSnapshot = name => ({project:name, store:name === "demo" ? "vault" : "berbr",
+  projects:[{name:"demo", cwd:"/projects/demo"}, {name:"other", cwd:"/projects/other"}],
+  rows:[{kind:"task", id:"task:same", task:"same", title:`${name} task`, note:`/${name}/note.md`, children:[
+    {kind:"tree", id:"tree:same", tree:"same", task:"same", cwd:`/${name}/checkout`, children:[]}]}],
+  merge_requests:[{kind:"mr", id:"mr:1", label:`!1 ${name} MR`, state:"opened",
+    url:`https://gitlab.example/${name}/-/merge_requests/1`, tasks:[{id:"task:same", task:"same", title:`${name} task`}]}]});
+
+test("search toolbar opens a native filter menu with View, multi-select Projects and completed switch", async () => {
+  const {view, cx, jobs, key} = setup({data:scopedSnapshot("demo"), props:{project:"demo"}});
+  assert.equal(byId(view.render(cx), "berbr-filters"), undefined);
+  assert.ok(byId(view.render(cx), "berbr-search-toolbar"));
+  assert.equal(byId(view.render(cx), "board-filters"), undefined);
+  openFilters(view, cx, "view");
+  let root = view.render(cx);
+  assert.match(text(byId(root, "board-filters")), /View options.*Show.*Projects.*Show completed/);
+  click(byId(root, "view-mrs"), cx);
+  assert.equal(view.view, "mrs"); assert.equal(view.filtersOpen, true);
+  openFilters(view, cx, "projects");
+  view.cli = async (_args, project) => JSON.stringify(scopedSnapshot(project));
+  click(byId(view.render(cx), "filter-project-other"), cx);
+  assert.deepEqual(view.scopeProjects, ["demo", "other"]);
+  view.didOnline = true; await jobs.shift()(cx);
+  assert.equal(view.liveState().mrs.length, 2);
+  key("escape"); assert.equal(view.filtersOpen, false);
+  assert.equal(byId(view.render(cx), "board-filters"), undefined);
+  assert.equal(storage.get("berbr.projects"), '["demo","other"]');
+});
+
+test("multi-project task actions, menus and notes retain source-project context for identical task IDs", async () => {
+  const {view, cx, jobs} = setup({data:scopedSnapshot("demo"), props:{project:"demo"}});
+  const calls=[];
+  view.cli = async (args, project) => {calls.push({args,project});return args[0] === "app-snapshot" ? JSON.stringify(scopedSnapshot(project)) : "Done";};
+  view.setProjectFilter(["demo", "other"], cx); view.didOnline = true;
+  await jobs.shift()(cx);
+  assert.equal(view.data.rows.length, 2);
+  const other = view.data.rows.find(row => row.project === "other");
+  assert.notEqual(other.id, view.data.rows[0].id);
+  view.open(other, cx); await jobs.shift()(cx);
+  assert.deepEqual(calls.find(call => call.args[0] === "select"), {args:["select", "same", "--tree", "same"], project:"other"});
+  view.loading=false;
+  view.formOverlay("done", {row:other, task:other.task});
+  assert.equal(state.overlays.at(-1).props.project, "other");
+  view.formOverlay("ticket", {project:other.project, task:other.task});
+  assert.equal(state.overlays.at(-1).props.project, "other");
+  view.openNote(other); assert.equal(state.overlays.at(-1).props.vault, false);
+  view.formOverlay("new"); assert.equal(state.overlays.at(-1).props.project, "demo");
+});
+
+test("project filter changes drop stale responses, permit empty scope and preserve cached data on failure", async () => {
+  const {view, cx, jobs} = setup({data:scopedSnapshot("demo"), props:{project:"demo"}});
+  let resolveOther;
+  view.cli = async (_args, project) => project === "other" ? new Promise(resolve => {resolveOther=resolve;}) : JSON.stringify(scopedSnapshot(project));
+  view.setProjectFilter(["other"], cx); view.didOnline = true;
+  const old=jobs.shift()(cx);
+  view.setProjectFilter(["demo"], cx); view.didOnline = true;
+  await jobs.shift()(cx);
+  resolveOther(JSON.stringify(scopedSnapshot("other"))); await old;
+  assert.deepEqual(view.data.scope_projects, ["demo"]);
+  view.snapshots.set("other", scopedSnapshot("other"));
+  view.cli = async (_args, project) => {if (project === "other") throw new Error("Offline");return JSON.stringify(scopedSnapshot(project));};
+  view.setProjectFilter(["demo", "other"], cx); view.didOnline=true;
+  await jobs.shift()(cx);
+  assert.equal(view.data.rows.length, 2);
+  assert.match(view.data.warnings.join(" "), /other: Offline/);
+  view.setProjectFilter([], cx);
+  assert.equal(view.data.rows.length, 0); assert.equal(view.loading, false);
+  assert.match(text(view.render(cx)), /Select projects in Filters/);
+  openFilters(view, cx, "projects");
+  assert.ok(byId(view.render(cx), "filter-project-demo"));
+});
+
+test("project scope restores from storage and explicit CLI projects use their own cwd and argv", async () => {
+  const {view} = setup({data:scopedSnapshot("demo"), props:{project:"demo"}, scope:["other"]});
+  assert.deepEqual(view.scopeProjects, ["other"]);
+  state.execResult={code:0,stdout:"{}",stderr:""};
+  await view.cli(["app-snapshot", "--cached"], "other");
+  const call=state.execs.at(-1);
+  assert.equal(call[2].cwd, "/projects/other");
+  assert.deepEqual(call[1].slice(-4), ["--project", "other", "app-snapshot", "--cached"]);
+});
+
+test("single-project filters restore and save that project's view rather than the board's original project", () => {
+  const {view,cx}=setup({data:scopedSnapshot("demo"),props:{project:"demo"},views:{demo:"tasks",other:"mrs"}});
+  view.setProjectFilter(["other"],cx);
+  assert.equal(view.view,"mrs");
+  view.switchView("tasks",cx);
+  assert.equal(storage.get("berbr.view.other"),"tasks");
+  assert.equal(storage.get("berbr.view.demo"),"tasks");
+  view.switchView("mrs",cx);
+  assert.equal(storage.get("berbr.view.other"),"mrs");
+  assert.equal(storage.get("berbr.view.demo"),"tasks");
+});
+
+test("reopening with a saved scope excluding the current project bootstraps choices then loads the selected cache", async () => {
+  const {view,cx,jobs}=setup({data:null,props:{project:"demo"},scope:["other"],views:{other:"mrs"},keepJobs:true});
+  const calls=[];
+  view.cli=async(args,project)=>{calls.push([project,args.includes("--cached")]);return JSON.stringify(scopedSnapshot(project));};
+  await jobs.shift()(cx);
+  view.didOnline=true;
+  await jobs.pop()(cx);
+  assert.deepEqual(view.data.scope_projects,["other"]);
+  assert.equal(view.view,"mrs");
+  assert.deepEqual(calls,[["demo",true],["other",true]]);
+});
+
+test("a previous online request cannot replace newer data after deselecting and reselecting a project", async () => {
+  const {view,cx,jobs}=setup({data:scopedSnapshot("demo"),props:{project:"demo"}});
+  let oldResolve,online=0;
+  const revision=number=>({...scopedSnapshot("demo"),rows:[{kind:"task",task:"same",id:"same",title:`Revision ${number}`}]});
+  view.cli=async args=>args.includes("--cached")?JSON.stringify(revision(2)):++online===1
+    ?new Promise(resolve=>{oldResolve=resolve;}):JSON.stringify(revision(3));
+  view.setProjectFilter(["demo"],cx);await jobs.shift()(cx);
+  const old=jobs.shift()(cx);
+  view.setProjectFilter([],cx);view.setProjectFilter(["demo"],cx);
+  await jobs.shift()(cx);assert.equal(view.data.rows[0].title,"Revision 2");
+  await jobs.shift()(cx);assert.equal(view.data.rows[0].title,"Revision 3");
+  oldResolve(JSON.stringify(revision(1)));await old;
+  assert.equal(view.data.rows[0].title,"Revision 3");
+});
+
+test("clicking Filters again closes it despite outside-dismiss capture; ordinary outside click and Escape dismiss it", () => {
+  const {view,cx,key}=setup({data:scopedSnapshot("demo"),props:{project:"demo"}});
+  openFilters(view,cx);
+  let root=view.render(cx),trigger=byId(root,"filters"),menu=byId(root,"board-filters");
+  trigger.attributes.on_hover[0](true,cx);
+  menu.attributes.on_mouse_down_out[0]({},cx);
+  assert.equal(view.filtersOpen,true);
+  click(trigger,cx);assert.equal(view.filtersOpen,false);
+  openFilters(view,cx);root=view.render(cx);
+  byId(root,"filters").attributes.on_hover[0](false,cx);
+  byId(root,"board-filters").attributes.on_mouse_down_out[0]({},cx);
+  assert.equal(view.filtersOpen,false);
+  openFilters(view,cx);key("escape");assert.equal(view.filtersOpen,false);
+});
+
+test("ambiguous cross-project spaces block Start work, task closing and backend close-plan replacement", () => {
+  const data=combineProjects(["demo","other"].map(project=>({...scopedSnapshot(project),rows:[{
+    kind:"task",id:"same",task:"same",title:"Shared",space:"one-space",note:`/${project}/note.md`,children:[]}]})));
+  const {view,cx,jobs}=setup({data,props:{project:"demo"},liveSpaces:[{id:"one-space",name:"Shared"}]});
+  view.scopeProjects=["demo","other"];
+  const other=data.rows[1];
+  const actions=view.detailItems(other).map(item=>item.label);
+  assert.ok(!actions.includes("Start work"));assert.ok(!actions.includes("Close task"));
+  view.open(other,cx);view.perform(cx,["done","same"],{project:"other"});
+  assert.equal(jobs.length,0);assert.match(view.error,/shared by tasks/);
+  const dialog=setup({props:{form:"done",project:"other",task:"same",row:other}});
+  assert.equal(dialog.jobs.length,0);
+  assert.ok(dialog.view.closePlan.blockers.some(text=>text.includes("shared by tasks")));
+  dialog.view.perform(dialog.cx,["done","same"]);
+  assert.equal(dialog.jobs.length,0);assert.match(dialog.view.error,/shared by tasks/);
+});
+
+test("conflicting tasks remain blocked after A+B to B, ordinary project switch, refresh and restart", async () => {
+  const source=project=>({...scopedSnapshot(project),rows:[{kind:"task", id:"task:same", task:"same", title:"Shared",
+    space:"shared", note:`/${project}/note.md`, children:[]}]});
+  const {view,cx,jobs}=setup({data:source("demo"),props:{project:"demo"}});
+  view.snapshots.set("other",source("other"));
+  view.setProjectFilter(["demo","other"],cx); jobs.length=0; view.loading=false;
+  assert.ok(view.data.rows.every(row=>row.scope_space_ambiguous));
+  view.setProjectFilter(["other"],cx); jobs.length=0; view.loading=false;
+  assert.equal(view.data.rows[0].scope_space_ambiguous,true);
+  const remembered=storage.get("berbr.spaceBindings");
+  view.switchProject("other",cx);
+  assert.equal(view.scopeProjects,null);
+  assert.equal(view.data.rows[0].id,"task:same");
+  assert.equal(view.data.rows[0].scope_space_ambiguous,true);
+  view.cli=async()=>JSON.stringify(source("other")); view.didOnline=true;
+  await jobs.shift()(cx);
+  assert.equal(view.data.rows[0].scope_space_ambiguous,true);
+  view.perform(cx,["done","same"]);
+  assert.equal(jobs.length,0);
+  assert.match(view.error,/shared by tasks/);
+  const restarted=setup({data:null,props:{project:"other"}});
+  storage.set("berbr.spaceBindings",remembered);
+  restarted.view.init({},restarted.cx);
+  restarted.jobs.length=0; restarted.view.loading=false; restarted.view.didOnline=true;
+  restarted.view.cli=async()=>JSON.stringify(source("other"));
+  restarted.view.refresh(restarted.cx,true);
+  await restarted.jobs.shift()(restarted.cx);
+  assert.equal(restarted.view.data.rows[0].scope_space_ambiguous,true);
+});
+
+test("Tasks / MR switches between the task tree and a searchable flat MR list, retaining each query and task expansion", () => {
+  const {view, cx} = setup({data:mrSnapshot(), props:{project:"demo"}});
+  view.showDetails(view.data.rows[0], cx);
+  view.inputs.search.set_value("Searchable"); view.inputs.search.emit("change", cx);
+  view.selected = "task";
+  selectView(view, cx, "mrs");
+  let root = view.render(cx);
+  assert.ok(byId(root, "berbr-mrs")); assert.equal(byId(root, "berbr-tasks"), undefined);
+  assert.equal(view.rows().length, 2);
+  assert.match(text(root), /group\/repo/); assert.match(text(root), /2 approvals/);
+  assert.match(text(root), /1 thread/); assert.match(text(root), /CI failed/);
+  assert.doesNotMatch(text(byId(root, "berbr-mrs")), /Old MR/);
+  assert.equal(storage.get("berbr.view.demo"), "mrs");
+  for (const query of ["feature-one", "Searchable", "task-id", "First MR"]) {
+    view.inputs.mrSearch.set_value(query); view.inputs.mrSearch.emit("change", cx);
+    assert.equal(view.rows().length, 1, query);
+  }
+  const selected = view.selected = view.rows()[0].id;
+  selectView(view, cx, "tasks");
+  assert.equal(view.filter, "Searchable"); assert.equal(view.selected, "task"); assert.equal(view.expanded, "task");
+  selectView(view, cx, "mrs");
+  assert.equal(view.filter, "First MR"); assert.equal(view.selected, selected);
+  click(byId(view.render(cx), "clear-search"), cx);
+  assert.equal(view.inputs.mrSearch.value(), ""); assert.equal(view.rows().length, 2);
+  view.inputs.mrSearch.set_value("no such MR"); view.inputs.mrSearch.emit("change", cx);
+  assert.match(text(view.render(cx)), /Nothing matches/);
+});
+
+test("MR mouse and keyboard open the URL, context menu stays available and completed filtering is independent of tasks", async () => {
+  const {view, cx, jobs, key} = setup({data:mrSnapshot(), props:{project:"demo"}, views:{demo:"mrs"}});
+  let root = view.render(cx);
+  const first = view.rows()[0];
+  const opened = [];
+  view.openUrl = (url, _cx, action) => opened.push({url, action});
+  click(byId(root, first.id), cx); key("enter");
+  assert.deepEqual(opened, [{url:first.url, action:first.id}, {url:first.url, action:first.id}]);
+  assert.equal(view.expanded, null);
+  byId(root, first.id).handlers["on_mouse_down:right"]({}, cx);
+  assert.equal(state.overlays.at(-1).props.row.url, first.url);
+  key("right"); assert.equal(view.expanded, null);
+  key("d"); assert.equal(view.rows().length, 3); assert.equal(view.all, false);
+  openFilters(view, cx);
+  root = view.render(cx); assert.match(text(byId(root, "toggle-done")), /Show completed 1/);
+  byId(root, "filter-completed").attributes.on_change[0](false, cx); assert.equal(view.rows().length, 2);
+  assert.equal(jobs.length, 0);
+});
+
+test("MR view preference survives reopening per project and MR focus is not replaced by terminal task following", () => {
+  const data = mrSnapshot();
+  const {view, cx} = setup({data, props:{project:"demo"}, views:{demo:"mrs", other:"tasks"},
+    liveSpaces:[{id:"task-space", name:"Searchable owner"}]});
+  assert.equal(view.view, "mrs");
+  view.render(cx); const selection = view.selected;
+  view.handle.focused = false;
+  state.focused = {space:"task-space", terminal:"another"}; view.syncFocus(cx);
+  assert.equal(view.selected, selection);
+  view.snapshots.set("demo", data);
+  view.snapshots.set("other", {...data, project:"other"});
+  view.switchProject("other", cx); assert.equal(view.view, "tasks");
+  view.loading = false; view.switchProject("demo", cx); assert.equal(view.view, "mrs");
+  assert.equal(view.filter, ""); assert.equal(view.rows().length, 2);
+});
+
+test("jumping from MR view reveals a task, and empty MR projects remain usable", () => {
+  const {view, cx} = setup({data:mrSnapshot(), props:{project:"demo"}, views:{demo:"mrs"}});
+  state.shared.set("berbr.jumpTarget", {project:"demo", task:"task", row:"mr-one", kind:"mr"});
+  view.receiveJump(cx);
+  assert.equal(view.view, "tasks"); assert.equal(view.expanded, "task");
+  view.data = {rows:[]}; view.switchView("mrs", cx);
+  assert.match(text(view.render(cx)), /No open MRs/);
+  assert.ok(byId(view.render(cx), "filters"));
+});
+
+test("opening MR links uses the browser command once, keeps errors visible and allows retry", async () => {
+  const {view, cx, jobs, key} = setup({data:mrSnapshot(), props:{project:"demo"}, views:{demo:"mrs"}});
+  view.render(cx);
+  const row = view.rows()[0];
+  state.execResult = {code:1, stdout:"", stderr:"Browser unavailable"};
+  click(byId(view.render(cx), row.id), cx); key("enter");
+  assert.equal(jobs.length, 1);
+  await jobs.shift()(cx);
+  assert.deepEqual(state.execs[0], ["open", [row.url]]);
+  assert.equal(view.busy, false);
+  assert.match(text(view.render(cx)), /Browser unavailable/);
+  state.execResult = {code:0, stdout:"", stderr:""};
+  key("enter"); await jobs.shift()(cx);
+  assert.equal(view.error, null); assert.equal(view.view, "mrs");
+});
+
+test("MR view works without storage and the search shortcut targets only the active view", () => {
+  const {view, cx, key} = setup({data:mrSnapshot(), props:{project:"demo"}});
+  const savedStorage = globalThis.localStorage;
+  globalThis.localStorage = {getItem() {throw new Error("Unavailable");}, setItem() {throw new Error("Unavailable");}};
+  try {
+    assert.equal(view.savedView("demo"), "tasks");
+    view.switchView("mrs", cx);
+    let focuses = 0; view.inputs.mrSearch.focus = () => focuses++;
+    key("/"); assert.equal(focuses, 1);
+    view.inputs.mrSearch.set_value("feature-one"); view.inputs.mrSearch.emit("change", cx);
+    view.searchFocused = true; key("escape");
+    assert.equal(view.filter, ""); assert.equal(view.inputs.mrSearch.value(), "");
+  } finally { globalThis.localStorage = savedStorage; }
+});
 
 test("click and Enter on empty, stale, merged, closed and unowned worktrees never launch or remove", () => {
   for (const fields of [{task:"Demo"}, {task:"Demo", merged:true}, {task:"Demo", mr_state:"closed"}, {}]) {
@@ -1821,13 +2127,14 @@ test("open count includes ideas and excludes assigned tickets regardless of coll
   const done = {id:"done", kind:"task", title:"Demo done", done:true};
   for (const collapsed of [[], ["todo"]]) {
     const {view, cx} = setup({data:{rows:[idea, assigned, done]}, collapsed});
+    openFilters(view, cx);
     assert.ok(!text(view.render(cx)).includes("No open tasks"));
-    assert.equal(text(byId(view.render(cx), "toggle-done")), "Done 1");
+    assert.equal(text(byId(view.render(cx), "toggle-done")).trim(), "Show completed 1");
     view.data = {rows:[assigned, done]};
     assert.ok(text(view.render(cx)).includes("No open tasks"));
     view.filter = "Demo";
     assert.ok(!text(view.render(cx)).includes("No open tasks"));
-    assert.equal(text(byId(view.render(cx), "toggle-done")), "Done 1");
+    assert.equal(text(byId(view.render(cx), "toggle-done")).trim(), "Show completed 1");
   }
 });
 
