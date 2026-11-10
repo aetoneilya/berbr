@@ -27,7 +27,7 @@ pub(in crate::cli) fn cli_done(config: &Config, args: DoneArgs) -> Result<(), St
             )
         })?;
         if tasks[i].done {
-            return Err(format!("task \"{name}\" is already done"));
+            return cleanup_closed_task(&tasks[i], args);
         }
         let plan = plan_task_with(config, tasks, name, args.force, args.dry_run)?;
         if args.dry_run {
@@ -48,6 +48,72 @@ pub(in crate::cli) fn cli_done(config: &Config, args: DoneArgs) -> Result<(), St
     done_trees(config, args)
 }
 
+/// Recover only the UI tail of a completed task. Never replay worktree,
+/// ticket, or note mutations after completion, even if new work exists there.
+fn cleanup_closed_task(task: &Task, args: DoneArgs) -> Result<(), String> {
+    let mut plan = DonePlan {
+        kind: "task",
+        name: Some(task.name.clone()),
+        note_done: true,
+        cleanup_only: true,
+        ..Default::default()
+    };
+    if !herdr::available() {
+        plan.blockers
+            .push("Herdr unavailable; cannot inspect remaining task panes".into());
+    } else {
+        match herdr::list_agents_fresh() {
+            Ok(agents) => {
+                plan.close_panes = agents
+                    .iter()
+                    .filter(|a| a.task_label() == Some(task.name.as_str()) && a.occupies_pane())
+                    .map(|a| a.pane_id.clone())
+                    .collect();
+                plan.close_panes.sort();
+                plan.close_panes.dedup();
+                if plan.close_panes.iter().any(String::is_empty) {
+                    plan.blockers
+                        .push("a remaining task agent has no pane ID".into());
+                }
+            }
+            Err(error) => plan
+                .blockers
+                .push(format!("cannot inspect remaining task panes: {error}")),
+        }
+    }
+    plan.steps = plan
+        .close_panes
+        .iter()
+        .map(|pane| format!("close remaining task pane {pane}"))
+        .collect();
+    if args.dry_run {
+        return plan.print(args.json);
+    }
+    if !plan.blockers.is_empty() {
+        return Err(not_finished(&task.name, &plan.blockers));
+    }
+    if !plan.close_panes.is_empty() && !args.yes && !confirm("Close remaining task panes?")? {
+        return Ok(());
+    }
+    for pane in &plan.close_panes {
+        // Labels may have changed while the person reviewed the confirmation.
+        // An absent pane is already cleaned up; a reassigned one is not ours.
+        let agents = herdr::list_agents_fresh().map_err(err)?;
+        let Some(agent) = agents.iter().find(|a| a.pane_id == *pane) else {
+            continue;
+        };
+        if agent.task_label() != Some(task.name.as_str()) || !agent.occupies_pane() {
+            return Err(format!("task pane {pane} was reassigned; cleanup stopped"));
+        }
+        herdr::close_pane(pane).map_err(err)?;
+    }
+    println!(
+        "\"{}\" is already done; remaining tagged panes closed",
+        task.name
+    );
+    Ok(())
+}
+
 fn print(line: String) {
     println!("{line}");
 }
@@ -66,6 +132,8 @@ struct DonePlan {
     leave_tickets: Vec<String>,
     note_done: bool,
     close_space: bool,
+    cleanup_only: bool,
+    close_panes: Vec<String>,
     steps: Vec<String>,
     #[serde(skip)]
     trees: Vec<usize>,

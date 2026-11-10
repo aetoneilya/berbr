@@ -43,7 +43,7 @@ pub(crate) fn inherit<R: Send>(f: impl FnOnce() -> R + Send) -> impl FnOnce() ->
     }
 }
 
-fn invalidate() {
+pub(super) fn invalidate() {
     CURRENT.with(|slot| {
         if let Some(cache) = slot.borrow().as_ref() {
             *cache.lock().unwrap_or_else(|e| e.into_inner()) = Inventory::default();

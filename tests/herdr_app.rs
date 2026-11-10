@@ -3051,7 +3051,9 @@ r=Path(os.environ['BERBR_TEST_ROOT']); a=sys.argv[1:]
 with (r/'calls.jsonl').open('a') as f: f.write(json.dumps(['herdr-app',a])+'\n')
 s=json.loads((r/'close-scenario.json').read_text())
 if a==['ls']:
+ if s.get('inventory_error'): print(json.dumps({'error':s['inventory_error']}));sys.exit(1)
  terms=[] if (r/'stopped-terminal').exists() else [{'terminal':'t1','pane':'p1','app':'codex','status':'idle'}]
+ if s.get('extra_agent'): terms.append({'terminal':'other','pane':'other-pane','app':'codex','status':'working'})
  tabs=[{'id':'tb-project','terminals':terms}]
  if (r/'close-failed').exists():
   if s.get('grow')=='pane': terms.append({'terminal':'other','pane':'other-pane'})
@@ -3079,7 +3081,13 @@ elif a[:1]==['kill']:
  if s.get('kill_error'):
   print(json.dumps({'error':{'message':s['kill_error']}}),file=sys.stderr);sys.exit(1)
  (r/'stopped-terminal').write_text(a[1]);out={'address':a[1],'state':'finished'}
-else: out={'address':a[1],'cwd':str(r/'repo'),'foreground':{'name':'codex','cwd':str(r/'repo')},'labels':{'berbr.task':'test-0','berbr.name':'task-agent'}}
+else:
+ s=json.loads((r/'close-scenario.json').read_text())
+ label=s.get('task_label','test-0') if a[1]=='t1' else 'other-task'
+ if a[:1]==['get'] and a[1]=='t1' and s.get('reassign'):
+  count=r/'agent-reads'; n=int(count.read_text()) if count.exists() else 0;count.write_text(str(n+1))
+  if n>0: label='reassigned-task'
+ out={'address':a[1],'cwd':str(r/'repo'),'foreground':{'name':'codex','cwd':str(r/'repo')},'labels':{'berbr.task':label,'berbr.name':'task-agent'}}
 print(json.dumps(out))
 "#).unwrap();
     f
@@ -3264,4 +3272,169 @@ fn done_reports_failed_terminal_stop_without_retrying_or_closing_the_space() {
         vec![("pane.close".into(), serde_json::json!({"pane":"p1"})),]
     );
     assert_eq!(pane_close_stops(&f), ["t1"]);
+}
+
+fn closed_pane_fixture(scenario: Value) -> (Fixture, String) {
+    let f = pane_close_fixture(scenario);
+    let note = "---\nid: test-0\ntitle: Finished task\ndone: true\nclosed: '2026-01-01'\ntickets: [DEMO-42]\ncustom: preserve\n---\nOriginal findings.\n".to_string();
+    fs::write(f.root.join("vault/tasks/test-0.md"), &note).unwrap();
+    (f, note)
+}
+
+#[test]
+fn closed_task_done_dry_run_lists_only_explicitly_tagged_panes_without_mutations() {
+    let (f, note) = closed_pane_fixture(serde_json::json!({"extra_agent":true}));
+    let plan = success(
+        f.command()
+            .args(["done", "test-0", "--dry-run", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(plan["name"], "test-0");
+    assert_eq!(plan["cleanup_only"], true);
+    assert_eq!(plan["close_panes"], serde_json::json!(["t1"]));
+    for key in [
+        "remove",
+        "dirty",
+        "keep",
+        "close_tickets",
+        "leave_tickets",
+        "blockers",
+    ] {
+        assert_eq!(plan[key], serde_json::json!([]), "{key}");
+    }
+    assert_eq!(plan["close_space"], false);
+    assert!(pane_close_actions(&f).is_empty());
+    assert!(pane_close_stops(&f).is_empty());
+    assert_eq!(
+        fs::read_to_string(f.root.join("vault/tasks/test-0.md")).unwrap(),
+        note
+    );
+}
+
+#[test]
+fn closed_task_done_recovers_ui_once_and_preserves_note_tickets_and_worktrees() {
+    let (f, note) = closed_pane_fixture(serde_json::json!({
+        "fail":true,"error":LAST_PANE_CONFIRMATION,"extra_agent":true,
+    }));
+    let tree = f.root.join("repo/.herdr/worktrees/unfinished");
+    f.git(
+        &f.root.join("repo"),
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "unfinished",
+            tree.to_str().unwrap(),
+        ],
+    );
+    fs::write(tree.join("uncommitted.txt"), "Unrelated unfinished work").unwrap();
+    for _ in 0..2 {
+        let out = f
+            .command()
+            .args(["done", "test-0", "--yes"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("vault/tasks/test-0.md")).unwrap(),
+            note
+        );
+        assert_eq!(
+            fs::read_to_string(tree.join("uncommitted.txt")).unwrap(),
+            "Unrelated unfinished work"
+        );
+    }
+    assert_eq!(pane_close_stops(&f), ["t1"]);
+    assert_eq!(pane_close_survivors(&f), ["other"]);
+    assert_eq!(
+        pane_close_actions(&f),
+        vec![("pane.close".into(), serde_json::json!({"pane":"p1"}))]
+    );
+}
+
+#[test]
+fn closed_task_done_never_closes_an_agent_with_another_task_label() {
+    let (f, note) = closed_pane_fixture(serde_json::json!({"task_label":"other-task"}));
+    let out = f
+        .command()
+        .args(["done", "test-0", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(pane_close_actions(&f).is_empty());
+    assert!(pane_close_stops(&f).is_empty());
+    assert_eq!(
+        fs::read_to_string(f.root.join("vault/tasks/test-0.md")).unwrap(),
+        note
+    );
+}
+
+#[test]
+fn closed_task_done_reports_incomplete_inventory_and_keeps_the_note_unchanged() {
+    let (f, note) =
+        closed_pane_fixture(serde_json::json!({"inventory_error":"inventory unavailable"}));
+    let plan = success(
+        f.command()
+            .args(["done", "test-0", "--dry-run", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert!(!plan["blockers"].as_array().unwrap().is_empty());
+    let out = f
+        .command()
+        .args(["done", "test-0", "--yes"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("inventory unavailable"));
+    assert!(pane_close_actions(&f).is_empty());
+    assert_eq!(
+        fs::read_to_string(f.root.join("vault/tasks/test-0.md")).unwrap(),
+        note
+    );
+}
+
+#[test]
+fn closed_task_done_surfaces_failed_remaining_pane_cleanup() {
+    let (f, note) = closed_pane_fixture(serde_json::json!({"fail":true,"error":"close denied"}));
+    let out = f
+        .command()
+        .args(["done", "test-0", "--yes"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("close denied"));
+    assert!(pane_close_stops(&f).is_empty());
+    assert_eq!(
+        fs::read_to_string(f.root.join("vault/tasks/test-0.md")).unwrap(),
+        note
+    );
+}
+
+#[test]
+fn closed_task_done_refreshes_labels_before_closing_the_first_pane() {
+    let (f, note) = closed_pane_fixture(serde_json::json!({"reassign":true}));
+    let out = f
+        .command()
+        .args(["done", "test-0", "--yes"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("was reassigned"));
+    assert!(pane_close_actions(&f).is_empty());
+    assert!(pane_close_stops(&f).is_empty());
+    assert_eq!(
+        fs::read_to_string(f.root.join("vault/tasks/test-0.md")).unwrap(),
+        note
+    );
+    assert_eq!(fs::read_to_string(f.root.join("agent-reads")).unwrap(), "2");
 }

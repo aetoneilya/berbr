@@ -225,6 +225,14 @@ pub fn list_agents() -> Result<Vec<Agent>> {
     result_field(run_herdr(&["agent", "list"])?, "/result/agents")
 }
 
+/// Cleanup guards must observe labels changed since the operation was planned.
+pub(crate) fn list_agents_fresh() -> Result<Vec<Agent>> {
+    if app::enabled() {
+        app::invalidate();
+    }
+    list_agents()
+}
+
 pub fn list_workspaces() -> Result<Vec<Workspace>> {
     result_field(run_herdr(&["workspace", "list"])?, "/result/workspaces")
 }
