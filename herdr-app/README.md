@@ -138,8 +138,8 @@ without a `layouts/` folder. This source-only folder still needs a compiled
 backend. The portable `skills/berbr` and `skills/done` skills are included in the package.
 
 The **macOS preview** workflow builds both architectures on manual dispatch.
-Cold-model performance budgets for 400 tasks are 15 ms on Apple Silicon and
-50 ms on Intel (the native CI baseline is 41 ms); idle updates retain a 25 ms
+Cold-model performance budgets for 400 tasks are 30 ms on Apple Silicon and
+60 ms on Intel (native CI measured 19–24 ms and 41 ms respectively); idle updates retain a 25 ms
 budget on both. CI logs report the measured times.
 Publishing a GitHub Release triggers builds and attaches archives/checksums.
 Adding the workflow alone publishes nothing.
