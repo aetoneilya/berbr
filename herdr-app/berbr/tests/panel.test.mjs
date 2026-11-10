@@ -4150,3 +4150,59 @@ test("switching Jira and GitHub clears the previous provider selection before ty
   view.submitNew(cx);
   assert.deepEqual(args,["start","DEMO-2","--bg","--agent","codex"]);
 });
+
+test("first-run setup connects the chosen repository and preserves the form on errors", async () => {
+  const {view, cx, jobs} = setup({data:{setup_required:true, rows:[]}});
+  const root = view.render(cx);
+  assert.match(text(root), /Welcome to Berbr/);
+  view.values.repo = '/home/demo/repo with spaces';
+  view.values.projectName = 'demo';
+  view.setupAgent = 'claude';
+  state.execHandler = async (_program, argv) => {
+    assert.deepEqual(argv.slice(argv.indexOf('init')), ['init','--repo','/home/demo/repo with spaces','--agent','claude','--name','demo']);
+    return {code:1, stdout:'', stderr:'Repository unavailable'};
+  };
+  click(byId(root,'setup-connect'), cx);
+  assert.equal(view.busy,true);
+  await jobs.shift()(cx);
+  assert.equal(view.busy,false);
+  assert.match(view.error,/Repository unavailable/);
+  assert.equal(view.values.repo,'/home/demo/repo with spaces');
+  assert.equal(view.data.setup_required,true);
+});
+
+test("connecting while a cached refresh is pending starts a fresh snapshot", async () => {
+  const {view, cx, jobs} = setup({data:{setup_required:true, rows:[]}});
+  view.values.repo = '/home/demo/repo';
+  view.loading = true; view.load = 5;
+  state.execHandler = async (_program, args) => ({code:0,stderr:'',stdout:JSON.stringify(args.includes('init')
+    ? {project:'demo',cwd:'/home/demo/repo'} : {project:'demo',projects:[{name:'demo',agent:'codex'}],rows:[],warnings:[]})});
+  view.submitSetup(cx);
+  await jobs.shift()(cx);
+  assert.ok(view.load > 5);
+  assert.equal(jobs.length,1);
+  await jobs.shift()(cx);
+  assert.equal(view.loading,false);
+  assert.equal(view.project,'demo');
+  assert.equal(view.data.setup_required,undefined);
+  assert.equal(state.execs.length,2);
+});
+
+test("a fresh panel without a saved project loads its setup snapshot", async () => {
+  const {view,cx,jobs} = setup({data:null,keepJobs:true});
+  state.execHandler = async () => ({code:0,stderr:'',stdout:JSON.stringify({setup_required:true,project:null,projects:[],rows:[],warnings:[]})});
+  await jobs.shift()(cx);
+  assert.equal(view.error,null);
+  assert.equal(view.data.setup_required,true);
+  assert.match(text(view.render(cx)),/Welcome to Berbr/);
+});
+
+test("setup replaces a previously selected project when its config was removed", async () => {
+  const {view,cx,jobs} = setup({data:null,props:{project:'old-project'},keepJobs:true});
+  state.shared.set('berbr.project','old-project');
+  state.execHandler = async () => ({code:0,stderr:'',stdout:JSON.stringify({setup_required:true,project:null,projects:[],rows:[],warnings:[]})});
+  await jobs.shift()(cx);
+  assert.equal(view.error,null);
+  assert.equal(view.project,null);
+  assert.equal(view.data.setup_required,true);
+});

@@ -785,6 +785,26 @@ fn app_launch_restores_caller_and_keeps_codex_arguments() {
         .find(|c| c[0] == "hc" && c[1][0] == "send")
         .unwrap();
     assert_eq!(send[1][1], "t7");
+    let launch_command = send[1][2].as_str().unwrap();
+    let prefix = launch_command
+        .split("; ")
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let discover = Command::new("/bin/sh")
+        .env("PATH", "/usr/bin:/bin")
+        .args(["-c", &format!("{prefix}; command -v berbr")])
+        .output()
+        .unwrap();
+    assert!(
+        discover.status.success(),
+        "bundle CLI must be available to launched agents"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&discover.stdout).trim(),
+        env!("CARGO_BIN_EXE_berbr")
+    );
+
     assert!(send[1][2].as_str().unwrap().contains("codex --no-daemon"));
     assert!(
         send[1][2]

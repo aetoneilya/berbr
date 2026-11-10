@@ -18,6 +18,7 @@ export default class Berbr extends View {
     const p = props() ?? {};
     this.binary = p.binary ?? `${appHome()}/mods/berbr/berbr`;
     this.form = p.form ?? null;
+    this.setupAgent = "codex"; this.setupGithub = false;
     this.project = p.project ?? shared("berbr.project") ?? null;
     this.view = this.form ? "tasks" : this.savedView(this.project);
     this.viewQueries = {tasks:"", mrs:""}; this.viewSelections = {};
@@ -25,7 +26,7 @@ export default class Berbr extends View {
     this.scopeProjects = null; this.scopeErrors = new Map(); this.scopeEpoch = 0; this.scopeBindings = new Map();
     this.snapshotLoader = new ProjectLoader(async (project, cached) => {
       const data = JSON.parse(await this.cli(["app-snapshot", ...(cached ? ["--cached"] : [])], project));
-      if (project && data.project !== project) throw new Error("Snapshot belongs to another project");
+      if (project && data.project !== project && !data.setup_required) throw new Error("Snapshot belongs to another project");
       return data;
     }, (project, epoch) => epoch === this.scopeEpoch && (!this.data || (this.scopeProjects === null ? project === this.project : this.scopeProjects.includes(project))));
     this.filtersOpen = false; this.filtersSection = null; this.filtersTriggerHovered = false;
@@ -74,7 +75,7 @@ export default class Berbr extends View {
     initArtifacts(this, cx);
     if (this.form === "note") { initNote(this, cx); return; }
     this.inputs = {}; this.values = {}; this.searchFocused = false;
-    const placeholders = { search: {jump:"Jump to…", projects:"Filter projects"}[this.form] ?? "Filter tasks", title: this.form === "new" ? "Type a name, a branch, or a Jira key or link" : "What are you working on?",
+    const placeholders = {repo:"/path/to/local/repository", projectName:"Project name (optional)", search: {jump:"Jump to…", projects:"Filter projects"}[this.form] ?? "Filter tasks", title: this.form === "new" ? "Type a name, a branch, or a Jira key or link" : "What are you working on?",
       ticket: "DEMO-123", ...(this.form === "new"
         ? {description:"Describe the task: context, goal, links. Berbr names the task and its branch from it."}
         : {name:"Automatic"}) };
@@ -95,6 +96,7 @@ export default class Berbr extends View {
         cx.notify();
       });
       input.on("submit", (event, cx) => {
+        if (this.data?.setup_required && ["repo", "projectName"].includes(key)) this.submitSetup(cx);
         if (this.form === "jump" && key === "search") this.chooseJump(cx);
         if (["projects", "attach-task"].includes(this.form) && key === "search") this.choosePicker(cx);
         // A textarea can consume Cmd-Enter and emit a secondary submit instead.
@@ -164,6 +166,26 @@ export default class Berbr extends View {
     if (["done", "remove-merged"].includes(this.form)) this.loadClosePlan(cx);
   }
 
+  submitSetup(cx) {
+    const repo = this.values.repo?.trim();
+    if (!repo || this.busy) { if (!repo) this.error = "Choose a local Git repository."; cx.notify(); return; }
+    this.busy = true; this.error = null;
+    cx.spawn(async cx => {
+      try {
+        const result = JSON.parse(await this.cli(["init", "--repo", repo, "--agent", this.setupAgent,
+          ...(this.values.projectName?.trim() ? ["--name", this.values.projectName.trim()] : []), ...(this.setupGithub ? ["--github"] : [])]));
+        this.project = result.project; setShared("berbr.project", result.project);
+        this.data = null; this.scopeBase = null; this.cwd = result.cwd;
+        this.scopeProjects = null; this.scopeEpoch++; this.scopeErrors.clear(); this.snapshots.clear();
+        try {localStorage.setItem("berbr.projects", "null");} catch (_) { /* Storage is optional. */ }
+        // An older cached snapshot must not win over the completed connection.
+        this.load = (this.load ?? 0) + 1; this.loading = false; this.didOnline = false;
+        this.busy = false; this.refresh(cx);
+      } catch (error) { this.error = String(error.message ?? error); this.busy = false; }
+      cx.notify();
+    });
+  }
+
   actionContext(project = this.project) {
     const opening = this.fixedContext ? this.opening : focused();
     const projectCwd = this.data?.projects?.find(item => item.name === project)?.cwd;
@@ -183,6 +205,7 @@ export default class Berbr extends View {
   }
 
   async cli(args, options = {}) {
+    options ??= {};
     const project = typeof options === "string" ? options : options.project ?? this.project;
     const context = typeof options === "string" ? this.actionContext(project) : options.context ?? this.actionContext(project);
     const env = ["-u", "HERDR_PLUGIN_CONTEXT_JSON", "-u", "HERDR_PLUGIN_ROOT", "-u", "HERDR_ENV", "-u", "HERDR_WORKSPACE_ID", "-u", "HERDR_TAB_ID", "-u", "HERDR_PANE_ID", "-u", "HC_TERMINAL_ID", "BERBR_BACKEND=herdr-app", "NO_COLOR=1"];
@@ -1734,6 +1757,7 @@ export default class Berbr extends View {
 
   renderPanel(cx) {
     const t = theme();
+    if (this.data?.setup_required) return formView(this,t);
     if (this.form) return v_flex().size_full().min_h(0).track_focus(this.handle)
       .on_key_down((event, cx) => this.key(event, cx)).child(formView(this, t));
     const panelFocused = this.panelFocused();

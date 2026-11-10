@@ -25,6 +25,9 @@ pub(crate) fn serve(
                     Err(e) => panic!("mock GitHub accept: {e}"),
                 }
             };
+            // macOS can inherit O_NONBLOCK from the listener. Reads must wait
+            // for request bytes, including clients that connect before writing.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();

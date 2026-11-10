@@ -525,8 +525,11 @@ pub(super) fn output(args: &[&str]) -> Result<Vec<u8>> {
                     t["status"]
                 )));
             }
+            let executable = std::env::current_exe()?;
+            let bin = executable.parent().unwrap_or(std::path::Path::new("."));
             let command = format!(
-                "export BERBR_BACKEND=herdr-app BERBR_CONFIG={}; {command}",
+                "export PATH={}:\"$PATH\"; export BERBR_BACKEND=herdr-app BERBR_CONFIG={}; {command}",
+                super::shell_quote(&bin.to_string_lossy()),
                 super::shell_quote(&crate::config::config_path().to_string_lossy())
             );
             let sent = output_of("hc", &["send", address, &command]);

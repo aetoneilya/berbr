@@ -1,0 +1,74 @@
+name: macOS preview
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version (defaults to Cargo package version)
+        required: false
+        type: string
+  release:
+    types: [published]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test
+        run: |
+          env -u BERBR_BACKEND cargo test --locked
+          node --test --test-concurrency=1 herdr-app/berbr/tests/*.test.mjs
+          python3 -m unittest discover -s scripts/tests
+          python3 -m unittest discover -s tests -p 'test*.py'
+      - name: Build and package
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.version }}
+        run: |
+          cargo build --release --locked --target '${{ matrix.target }}'
+          package_version="$(python3 -c 'import tomllib; print("v" + tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          version="${RELEASE_TAG:-$package_version}"
+          python3 scripts/package-herdr-app.py --binary 'target/${{ matrix.target }}/release/berbr' --target '${{ matrix.target }}' --version "$version"
+          python3 scripts/package-herdr-app.py --gallery --version "$version"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: berbr-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/berbr-gallery/
+  attach:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Attach macOS archives and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$RELEASE_TAG" artifacts/*/*.tar.gz artifacts/*/*.sha256

@@ -1,5 +1,6 @@
 use crate::client::agent::AgentKind;
 mod app;
+mod doctor;
 mod migrate;
 mod progress;
 mod table;
@@ -29,6 +30,18 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum CliCommands {
+    /// Connect a local Git repository; creates config safely on first run.
+    Init {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        /// Connect GitHub.com using this checkout's origin remote (authenticate with gh).
+        #[arg(long)]
+        github: bool,
+    },
+    /// Check setup and installed dependencies without changing anything.
+    Doctor {},
     /// Resolve local project/task/worktree context without network or cache writes.
     /// Unresolved or ambiguous context is reported with candidates, never guessed.
     Context {
@@ -354,7 +367,45 @@ pub fn run() -> Result<(), String> {
         std::env::set_current_dir(&dir)
             .map_err(|e| format!("can't enter {}: {e}", dir.display()))?;
     }
-    let mut projects = load_projects().map_err(|err| err.to_string())?;
+    if let Some(CliCommands::Init {
+        repo,
+        ref name,
+        github,
+    }) = cli.command
+    {
+        let project = crate::config::initialize(
+            &repo,
+            name.as_deref(),
+            cli.agent.unwrap_or(AgentKind::Codex),
+            github,
+        )?;
+        println!(
+            "{}",
+            serde_json::json!({"project":project.name,"cwd":project.repos.first().map(|r|&r.path)})
+        );
+        return Ok(());
+    }
+    if matches!(cli.command, Some(CliCommands::Doctor {})) {
+        return doctor::run();
+    }
+    let mut projects = match load_projects() {
+        Ok(projects) => projects,
+        Err(crate::config::ConfigError::Read(_, ref error))
+            if error.kind() == std::io::ErrorKind::NotFound
+                && matches!(cli.command, Some(CliCommands::AppSnapshot { .. })) =>
+        {
+            println!(
+                "{}",
+                serde_json::json!({"version":3,"setup_required":true,"project":null,"projects":[],"rows":[],"warnings":[]})
+            );
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(format!(
+                "{err}\nFirst run: berbr init --repo <local-repository> --agent codex."
+            ));
+        }
+    };
     if let Some(CliCommands::Settings {
         default_agent,
         generation_agent,
@@ -419,6 +470,7 @@ pub fn run() -> Result<(), String> {
     let config = projects.swap_remove(chosen);
     let _operation = crate::client::herdr::operation();
     match command {
+        CliCommands::Init { .. } | CliCommands::Doctor {} => unreachable!(),
         CliCommands::Context { .. } => unreachable!(),
         CliCommands::AppSnapshot { .. } => unreachable!(),
         CliCommands::Settings { .. } => unreachable!(),
@@ -460,6 +512,8 @@ pub fn run() -> Result<(), String> {
 /// are always logged.
 fn changes(command: &CliCommands) -> bool {
     match command {
+        CliCommands::Init { .. } => true,
+        CliCommands::Doctor {} => false,
         CliCommands::Settings {
             default_agent,
             generation_agent,
