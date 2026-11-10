@@ -1,17 +1,24 @@
 # berbr
 
-berbr joins Jira tickets, GitLab merge requests, git worktrees,
-[herdr](https://herdr.dev) agents and task notes into one table. A task is a markdown note; its tickets, MRs, worktrees, agents and claude
-sessions are found from branch names, herdr workspaces and transcripts. `berbr`
-shows the table as a TUI or as plain text and runs the daily workflow: start a
-task, add a ticket to it, go back to it, review, close. `DESIGN.md` has the
-model and the decisions.
+**Tasks, agents, and reviews in one place.**
+
+Berbr helps developers keep track of parallel coding work in
+[Herdr](https://herdr.dev). Each task holds its notes, tickets, worktrees,
+Claude Code or Codex sessions and merge requests. See which agents need you and
+pick up where you left off.
+
+Use it as a native Herdr panel, a TUI or a CLI. Local tasks work without an
+issue tracker; Jira and GitLab integrations add tickets and review state.
+See [the macOS preview, installation and gallery preparation](herdr-app/README.md).
+`DESIGN.md` describes the model and decisions.
 
 ## Install
 
 
 ```
 cargo install --path . --locked
+berbr init --repo /path/to/repository --agent codex
+berbr doctor
 ```
 
 ## Where things live
@@ -252,3 +259,7 @@ configured root; existing checkouts are never moved. Names and pending name
 reservations in either root prevent a conflicting checkout in the other.
 The first checkout appends `/.herdr/worktrees/` (or the configured root) once to
 that repository's `.git/info/exclude`; `.gitignore` is unchanged.
+
+## License
+
+[MIT](LICENSE).

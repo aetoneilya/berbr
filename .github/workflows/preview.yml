@@ -1,0 +1,58 @@
+name: macOS preview
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-14
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test
+        run: |
+          env -u BERBR_BACKEND cargo test --locked
+          node --test --test-concurrency=1 herdr-app/berbr/tests/*.test.mjs
+          python3 -m unittest discover -s scripts/tests
+      - name: Build and package
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          cargo build --release --locked --target '${{ matrix.target }}'
+          version="${RELEASE_TAG:-preview-${GITHUB_SHA::8}}"
+          python3 scripts/package-herdr-app.py --binary 'target/${{ matrix.target }}/release/berbr' --target '${{ matrix.target }}' --version "$version"
+          python3 scripts/package-herdr-app.py --gallery --version "$version"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: berbr-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/berbr-gallery/
+  attach:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Attach macOS archives and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$RELEASE_TAG" artifacts/*/*.tar.gz artifacts/*/*.sha256

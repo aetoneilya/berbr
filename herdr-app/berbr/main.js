@@ -15,6 +15,7 @@ export default class Berbr extends View {
     const p = props() ?? {};
     this.binary = p.binary ?? `${appHome()}/mods/berbr/berbr`;
     this.form = p.form ?? null;
+    this.setupAgent = "codex";
     this.project = p.project ?? shared("berbr.project") ?? null;
     this.pendingProject = null;
     this.snapshots = new Map(); // the last one of every project shown, for instant switching
@@ -51,7 +52,7 @@ export default class Berbr extends View {
     this.handle.focus();
     if (this.form === "note") { initNote(this, cx); return; }
     this.inputs = {}; this.values = {}; this.searchFocused = false;
-    const placeholders = { search: {jump:"Jump to…", projects:"Filter projects"}[this.form] ?? "Filter tasks", title: this.form === "new" ? "Type a name, a branch, or a Jira key or link" : "What are you working on?",
+    const placeholders = { repo:"/path/to/local/repository", projectName:"Project name (optional)", search: {jump:"Jump to…", projects:"Filter projects"}[this.form] ?? "Filter tasks", title: this.form === "new" ? "Type a name, a branch, or a Jira key or link" : "What are you working on?",
       ticket: "DEMO-123", ...(this.form === "new"
         ? {description:"Describe the task: context, goal, links. Berbr names the task and its branch from it."}
         : {name:"Automatic"}) };
@@ -72,6 +73,7 @@ export default class Berbr extends View {
         cx.notify();
       });
       input.on("submit", (event, cx) => {
+        if (this.data?.setup_required && ["repo", "projectName"].includes(key)) this.submitSetup(cx);
         if (this.form === "jump" && key === "search") this.chooseJump(cx);
         if (["projects", "attach-task"].includes(this.form) && key === "search") this.choosePicker(cx);
         // A textarea can consume Cmd-Enter and emit a secondary submit instead.
@@ -131,6 +133,24 @@ export default class Berbr extends View {
     else if (this.form === "rename") this.inputs.title.focus();
     else if (this.form === "ticket") this.inputs.ticket.focus();
     if (["done", "remove-merged"].includes(this.form)) this.loadClosePlan(cx);
+  }
+
+  submitSetup(cx) {
+    const repo = this.values.repo?.trim();
+    if (!repo || this.busy) { if (!repo) this.error = "Choose a local Git repository."; cx.notify(); return; }
+    this.busy = true; this.error = null;
+    cx.spawn(async cx => {
+      try {
+        const result = JSON.parse(await this.cli(["init", "--repo", repo, "--agent", this.setupAgent,
+          ...(this.values.projectName?.trim() ? ["--name", this.values.projectName.trim()] : [])]));
+        this.project = result.project; setShared("berbr.project", result.project);
+        this.data = null; this.cwd = result.cwd;
+        // An older cached snapshot must not win over the completed connection.
+        this.load = (this.load ?? 0) + 1; this.loading = false; this.didOnline = false;
+        this.busy = false; this.refresh(cx);
+      } catch (error) { this.error = String(error.message ?? error); this.busy = false; }
+      cx.notify();
+    });
   }
 
   actionContext() {
@@ -1428,6 +1448,7 @@ export default class Berbr extends View {
 
   renderPanel(cx) {
     const t = theme();
+    if (this.data?.setup_required) return formView(this, t);
     if (this.form) return v_flex().size_full().min_h(0).track_focus(this.handle)
       .on_key_down((event, cx) => this.key(event, cx)).child(formView(this, t));
     const panelFocused = this.panelFocused();

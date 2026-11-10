@@ -340,6 +340,100 @@ pub fn add_project(name: &str, task_dir: &str, repo: Option<&str>) -> Result<Con
     Ok(config)
 }
 
+/// First-run configuration, or append a new project without overwriting existing data.
+pub fn initialize(repo: &Path, name: Option<&str>, agent: AgentKind) -> Result<Config, String> {
+    use std::io::Write;
+    let local = crate::client::worktree::worktree_root(&expand_home(repo))
+        .map_err(|e| format!("Choose a local Git working directory: {e}"))?;
+    let repo = crate::client::worktree::main_checkout(&local)
+        .map_err(|e| format!("Choose a local Git repository: {e}"))?;
+    let repo = fs::canonicalize(&repo).map_err(|e| e.to_string())?;
+    let name = name
+        .filter(|s| !s.trim().is_empty())
+        .map(str::trim)
+        .or_else(|| repo.file_name().and_then(|s| s.to_str()))
+        .ok_or("Enter a project name")?;
+    let path = if config_path().exists()
+        || std::env::var_os("BERBR_CONFIG").is_some()
+        || std::env::var_os("WORKTABLE_CONFIG").is_some()
+    {
+        config_path()
+    } else {
+        berbr_home().join("config.toml")
+    };
+    // Preserve symlinked configurations instead of replacing the link itself.
+    let path = if path.exists() {
+        fs::canonicalize(&path).map_err(|e| e.to_string())?
+    } else {
+        path
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let original = match fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("Cannot read {}: {e}", path.display())),
+    };
+    let mut text = original.clone().unwrap_or_default();
+    if let Some(original) = &original {
+        let file: FileConfig = toml::from_str(original).map_err(|e| e.to_string())?;
+        if file.vault.is_some() {
+            return Err(
+                "This config uses a vault. Add the project in the TUI or config file.".into(),
+            );
+        }
+        for project in file.projects()? {
+            if project.name.eq_ignore_ascii_case(name)
+                || project
+                    .repos
+                    .iter()
+                    .any(|r| fs::canonicalize(&r.path).ok().as_ref() == Some(&repo))
+            {
+                return Err(format!(
+                    "Project or repository already connected as {}",
+                    project.name
+                ));
+            }
+        }
+    } else {
+        text.push_str(&format!(
+            "[workflow]\nagent = \"{0}\"\ngeneration_agent = \"{0}\"\ngeneration_model = \"\"\n\n",
+            agent.binary()
+        ));
+    }
+    text.push_str(&project_block(name, "tasks", Some(&repo.to_string_lossy())));
+    let parsed: FileConfig = toml::from_str(&text).map_err(|e| e.to_string())?;
+    let project = parsed.projects()?.pop().ok_or("No project was added")?;
+    let mut pending =
+        tempfile::NamedTempFile::new_in(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    if original.is_some() {
+        pending
+            .as_file()
+            .set_permissions(
+                fs::metadata(&path)
+                    .map_err(|e| e.to_string())?
+                    .permissions(),
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    pending
+        .write_all(text.as_bytes())
+        .map_err(|e| e.to_string())?;
+    pending.as_file().sync_all().map_err(|e| e.to_string())?;
+    if let Some(original) = original {
+        if fs::read_to_string(&path).map_err(|e| e.to_string())? != original {
+            return Err("Config changed; retry connecting the project".into());
+        }
+        pending.persist(&path).map_err(|e| e.to_string())?;
+    } else {
+        pending
+            .persist_noclobber(&path)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(project)
+}
+
 /// Save universal defaults in [workflow]; retain project data and comments.
 pub fn update_settings(
     agent: Option<AgentKind>,

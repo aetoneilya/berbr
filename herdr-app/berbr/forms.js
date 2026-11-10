@@ -635,7 +635,22 @@ function attachTaskForm(view, t, p) {
     .child(kbd(t, "↑↓ move · ⏎ attach · esc close"));
 }
 
+function setupForm(view, t) {
+  return v_flex().size_full().min_h(0).p(20).gap(14).bg(t.surface).text_color(t.foreground).overflow_y_scrollbar()
+    .child(div().text_size(20).font_semibold().child("Welcome to Berbr"))
+    .child(div().text_size(13).text_color(t.muted).whitespace_normal().child("Keep each coding task together: agents, worktrees, notes and pull requests. Connect a repository to start."))
+    .child(field(t, "Local Git repository", view.input("repo")))
+    .child(field(t, "Project name", view.input("projectName")))
+    .child(div().text_size(12).text_color(t.dim).child("New tasks use"))
+    .child(h_flex().gap(6).children([["codex","Codex"],["claude","Claude Code"]].map(([id,label]) => button(t, `setup-agent-${id}`, label,
+      cx => {view.setupAgent = id; cx.notify();}, view.setupAgent === id ? "primary" : "ghost", view.busy))))
+    .child(div().text_size(12).text_color(t.dim).whitespace_normal().child("Requires Git, Herdr and your chosen agent CLI. Setup writes a project config and leaves your repository files alone."))
+    .when(Boolean(view.error), el => el.child(div().text_size(12).text_color(t.blocked).whitespace_normal().child(view.error)))
+    .child(button(t, "setup-connect", view.busy ? "Connecting…" : "Connect repository", cx => view.submitSetup(cx), "primary", view.busy));
+}
+
 export function formView(view, t) {
+  if (view.data?.setup_required) return setupForm(view,t);
   const p = props() ?? {};
   if (view.form === "menu") return menuForm(view, t);
   if (view.form === "rename") return renameForm(view, t);
