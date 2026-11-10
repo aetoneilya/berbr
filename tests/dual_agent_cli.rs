@@ -29,6 +29,26 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 impl Fixture {
+    fn artifact_directory(&self) -> PathBuf {
+        let directory = fs::read_dir(self.root.join("berbr/projects/test/artifacts"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .canonicalize()
+            .unwrap();
+        directory
+    }
+
+    fn artifact_arg(&self) -> String {
+        format!("'--add-dir' '{}'", self.artifact_directory().display())
+    }
+
+    fn claude_artifact_arg(&self) -> String {
+        format!("'--add-dir={}'", self.artifact_directory().display())
+    }
+
     fn codex_prefix(&self) -> String {
         let tasks = self.root.join("vault/tasks").canonicalize().unwrap();
         let cache = if cfg!(target_os = "macos") {
@@ -39,9 +59,10 @@ impl Fixture {
         .canonicalize()
         .unwrap();
         format!(
-            "command codex --no-daemon '--add-dir' '{}' '--add-dir' '{}'",
+            "command codex --no-daemon '--add-dir' '{}' '--add-dir' '{}' {}",
             tasks.display(),
-            cache.display()
+            cache.display(),
+            self.artifact_arg()
         )
     }
 
@@ -114,6 +135,7 @@ print(json.dumps({'result': result}))
             .current_dir(&self.repo)
             .env("PATH", path)
             .env("HOME", self.root.join("home"))
+            .env("BERBR_HOME", self.root.join("berbr"))
             .env("XDG_CACHE_HOME", self.root.join("cache"))
             .env("BERBR_CONFIG", &self.config)
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
@@ -307,6 +329,107 @@ fn pane_command(commands: &[Vec<String>]) -> &str {
 }
 
 #[test]
+fn claude_variadic_directory_option_never_consumes_fresh_or_review_prompts() {
+    for scenario in ["main", "fresh", "add", "review", "prepare"] {
+        let fixture = Fixture::new("");
+        // A real argv parser with Claude's variadic option shape, executed by
+        // the generated shell command. No actual agent or service is called.
+        let shim = fixture.root.join("bin/claude");
+        fs::write(
+            &shim,
+            r#"#!/usr/bin/env python3
+import argparse, json
+p = argparse.ArgumentParser()
+p.add_argument('--add-dir', nargs='+', action='append', default=[])
+p.add_argument('--name')
+p.add_argument('--model')
+p.add_argument('--resume')
+p.add_argument('prompt', nargs='?')
+print(json.dumps(vars(p.parse_args())))
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(shim, fs::Permissions::from_mode(0o755)).unwrap();
+        let commands = match scenario {
+            "main" => fixture.run(&[
+                "start",
+                "task",
+                "--no-worktree",
+                "--bg",
+                "--agent",
+                "claude",
+            ]),
+            "prepare" => fixture.run(&["start", "task", "-n", "task", "--bg", "--agent", "claude"]),
+            _ => {
+                let tree = fixture.tree();
+                fixture.sessions(&tree, false);
+                match scenario {
+                    "fresh" => {
+                        fixture.run(&["select", "task", "--new", "--bg", "--agent", "claude"])
+                    }
+                    "add" => fixture.run(&["add", "task", "--in", "task", "--agent", "claude"]),
+                    _ => fixture.run(&["review", "task", "--agent", "claude"]),
+                }
+            }
+        };
+        let command = if scenario == "prepare" {
+            let cache = if cfg!(target_os = "macos") {
+                fixture.root.join("home/Library/Caches/berbr")
+            } else {
+                fixture.root.join("cache/berbr")
+            };
+            let spec = fs::read_dir(cache)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("prepare-")
+                })
+                .unwrap();
+            fs::write(spec.with_extension("prompt"), "Context: prepared task").unwrap();
+            format!(
+                "command claude {}",
+                pane_command(&commands)
+                    .split_once(" && command claude ")
+                    .unwrap()
+                    .1
+            )
+        } else {
+            pane_command(&commands).to_string()
+        };
+        let out = fixture
+            .command("/bin/sh")
+            .args(["-c", &command])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let prompt = parsed["prompt"]
+            .as_str()
+            .expect("prompt was consumed by --add-dir");
+        assert!(
+            prompt.contains(if scenario == "review" {
+                "You are a reviewer"
+            } else {
+                "Context:"
+            }),
+            "{scenario}: {parsed}"
+        );
+        assert_eq!(
+            parsed["add_dir"],
+            json!([[fixture.artifact_directory()]]),
+            "{scenario}"
+        );
+    }
+}
+
+#[test]
 fn starts_each_cli_with_the_same_task_brief() {
     for kind in ["claude", "codex"] {
         let fixture = Fixture::new("");
@@ -315,7 +438,10 @@ fn starts_each_cli_with_the_same_task_brief() {
         let prefix = if kind == "codex" {
             fixture.codex_prefix()
         } else {
-            "command claude '--name' 'task'".into()
+            format!(
+                "command claude {} '--name' 'task'",
+                fixture.claude_artifact_arg()
+            )
         };
         assert!(command.starts_with(&format!("{prefix} ")), "{command}");
         assert!(
@@ -323,6 +449,16 @@ fn starts_each_cli_with_the_same_task_brief() {
             "{command}"
         );
         assert!(command.contains("task note"));
+        let artifacts = fixture.root.join("berbr/projects/test/artifacts/test-0");
+        assert!(artifacts.is_dir());
+        let cache = if cfg!(target_os = "macos") {
+            fixture.root.join("home/Library/Caches/berbr")
+        } else {
+            fixture.root.join("cache/berbr")
+        };
+        let brief = fs::read_to_string(cache.join("briefs/test-0.md")).unwrap();
+        assert!(brief.contains("## Shared artifacts"));
+        assert!(brief.contains(artifacts.to_str().unwrap()));
     }
 }
 
@@ -335,7 +471,10 @@ fn prepared_worktree_command_keeps_the_requested_cli() {
         let prefix = if kind == "codex" {
             fixture.codex_prefix()
         } else {
-            "command claude --name 'task'".into()
+            format!(
+                "command claude --name 'task' {}",
+                fixture.claude_artifact_arg()
+            )
         };
         assert!(command.contains(&format!("&& {prefix} ")), "{command}");
         assert!(command.contains(" prepare "));
@@ -352,7 +491,10 @@ fn resumes_the_owning_cli_even_when_native_ids_collide() {
         let expected = if kind == "codex" {
             format!("{} 'resume' 'shared'", fixture.codex_prefix())
         } else {
-            "command claude --name 'task' '--resume' 'shared'".into()
+            format!(
+                "command claude --name 'task' {} '--resume' 'shared'",
+                fixture.claude_artifact_arg()
+            )
         };
         assert_eq!(pane_command(&commands), expected);
     }
@@ -539,6 +681,86 @@ fn review_uses_the_chosen_cli_and_its_own_model_setting() {
 }
 
 #[test]
+fn task_reviewers_receive_the_same_artifact_folder_with_both_clis() {
+    for kind in ["claude", "codex"] {
+        let fixture = Fixture::new("");
+        let tree = fixture.tree();
+        // Explicit bindings take precedence even without sessions or tickets.
+        fs::write(
+            fixture.root.join("vault/tasks/task.md"),
+            format!("---\nid: task\nworktrees: [{tree:?}]\n---\nReview context\n"),
+        )
+        .unwrap();
+        let commands = fixture.run(&["review", "task", "--agent", kind]);
+        let command = pane_command(&commands);
+        let directory = fixture.root.join("berbr/projects/test/artifacts/task");
+        assert!(directory.is_dir());
+        assert!(
+            command.contains(&if kind == "claude" {
+                fixture.claude_artifact_arg()
+            } else {
+                fixture.artifact_arg()
+            }),
+            "{command}"
+        );
+        assert!(command.contains(&format!(
+            "Shared artifacts for this task: {}.",
+            directory.display()
+        )));
+    }
+}
+
+#[test]
+fn closed_task_history_does_not_block_reviewing_the_active_worktree_owner() {
+    let fixture = Fixture::new("");
+    let tree = fixture.tree();
+    fixture.sessions(&tree, false);
+    fs::write(
+        fixture.root.join("vault/tasks/archived.md"),
+        "---\nid: archived\ndone: true\nsessions: ['codex:shared task 2026-10-29']\n---\nOld task\n",
+    ).unwrap();
+    let context = fixture
+        .command(env!("CARGO_BIN_EXE_berbr"))
+        .current_dir(&tree)
+        .args(["context", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        context.status.success(),
+        "{}",
+        String::from_utf8_lossy(&context.stderr)
+    );
+    let context: serde_json::Value = serde_json::from_slice(&context.stdout).unwrap();
+    assert_eq!(context["status"], "resolved");
+    assert_eq!(context["task"]["id"], "task");
+    let artifacts = fixture
+        .command(env!("CARGO_BIN_EXE_berbr"))
+        .current_dir(&tree)
+        .args(["artifacts", "--list"])
+        .output()
+        .unwrap();
+    assert!(
+        artifacts.status.success(),
+        "{}",
+        String::from_utf8_lossy(&artifacts.stderr)
+    );
+    let artifacts: serde_json::Value = serde_json::from_slice(&artifacts.stdout).unwrap();
+    assert_eq!(artifacts["task"], "task");
+    let commands = fixture.run(&["review", "task", "--agent", "codex"]);
+    let command = pane_command(&commands);
+    assert!(command.contains(&format!(
+        "Shared artifacts for this task: {}.",
+        artifacts["path"].as_str().unwrap()
+    )));
+    assert!(
+        !fixture
+            .root
+            .join("berbr/projects/test/artifacts/archived")
+            .exists()
+    );
+}
+
+#[test]
 fn selecting_codex_does_not_focus_claude_with_the_same_session_id() {
     let fixture = Fixture::new("");
     let tree = fixture.tree();
@@ -592,7 +814,10 @@ fn new_session_bypasses_live_agents_and_saved_conversations() {
         let prefix = if kind == "codex" {
             fixture.codex_prefix()
         } else {
-            "command claude --name 'task'".into()
+            format!(
+                "command claude --name 'task' {}",
+                fixture.claude_artifact_arg()
+            )
         };
         assert!(
             command.starts_with(&format!("{prefix} 'Context:")),
@@ -638,7 +863,10 @@ fn tui_n_can_start_either_cli_despite_the_project_default_and_live_agents() {
         let prefix = if kind == "codex" {
             fixture.codex_prefix()
         } else {
-            "command claude --name 'task'".into()
+            format!(
+                "command claude --name 'task' {}",
+                fixture.claude_artifact_arg()
+            )
         };
         assert!(
             command.starts_with(&format!("{prefix} 'Context:")),

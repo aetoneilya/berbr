@@ -8,6 +8,7 @@ import { forgeName, changeKind, changeNumber, githubIssue, walk, sectionLabels, 
   agentActivity, formatElapsed, blockedPrompt, mrPills, focusedTask, focusedTree, treeFocusTarget, jumpItems, matchJump, closePlan, PanelModel, treeMarks, isMergedTree, mergedPlan, backendClosePlan } from "./model.js";
 import { icon, iconButton, button, chip, sectionHeader, statusMark, kbd, pill, keyboardControl } from "./ui.js";
 import { formView, initNote, noteKey } from "./forms.js";
+import { initArtifacts, loadArtifacts, refreshArtifacts, artifactItems, renderArtifact } from "./artifacts.js";
 import { log, logRun, setDebug } from "./log.js";
 
 export default class Berbr extends View {
@@ -49,6 +50,7 @@ export default class Berbr extends View {
     this.cwd = p.cwd ?? this.opening?.cwd ?? null;
     this.handle = cx.focus_handle();
     this.handle.focus();
+    initArtifacts(this, cx);
     if (this.form === "note") { initNote(this, cx); return; }
     this.inputs = {}; this.values = {}; this.searchFocused = false;
     const placeholders = { search: {jump:"Jump to…", projects:"Filter projects"}[this.form] ?? "Filter tasks", title: this.form === "new" ? "Type a name, a branch, or a Jira key or link" : "What are you working on?",
@@ -151,9 +153,10 @@ export default class Berbr extends View {
     cx.notify();
   }
 
-  async cli(args) {
+  async cli(args, {project = this.project, context = this.actionContext()} = {}) {
     const env = ["-u", "HERDR_PLUGIN_CONTEXT_JSON", "-u", "HERDR_PLUGIN_ROOT", "-u", "HERDR_ENV", "-u", "HERDR_WORKSPACE_ID", "-u", "HERDR_TAB_ID", "-u", "HERDR_PANE_ID", "-u", "HC_TERMINAL_ID", "BERBR_BACKEND=herdr-app", "NO_COLOR=1"];
-    const {opening, cwd} = this.actionContext();
+    const {opening, cwd} = context;
+    const fallback = context.fallback ?? this.data?.projects?.find(item => item.name === project)?.cwd;
     // Clear inherited caller ids too: a mod pane can have no terminal.
     if (opening?.space) env.push(`HERDR_WORKSPACE_ID=${opening.space}`);
     if (opening?.tab) env.push(`HERDR_TAB_ID=${opening.tab}`);
@@ -161,7 +164,7 @@ export default class Berbr extends View {
     // Load the same login/interactive environment as the existing terminal TUI.
     // All user values stay argv entries; the shell only forwards "$@".
     const command = ["-lic", 'exec "$@"', "berbr-env", "env", ...env, this.binary,
-      ...(this.project ? ["--project", this.project] : []), ...args];
+      ...(project ? ["--project", project] : []), ...args];
     const started = Date.now();
     let result, retried = null;
     try {
@@ -171,7 +174,6 @@ export default class Berbr extends View {
         // The focused terminal can sit in a folder that is gone (a removed worktree):
         // nothing starts there, so run from the project instead.
         if (!cwd || !/os error 2\b/.test(String(error?.message ?? error))) throw error;
-        const fallback = this.data?.projects?.find(project => project.name === this.project)?.cwd;
         retried = {to:fallback && fallback !== cwd ? fallback : null};
         result = await exec("zsh", command, retried.to ? {cwd:retried.to} : {});
       }
@@ -218,6 +220,7 @@ export default class Berbr extends View {
         this.snapshots.set(data.project, data);
         setDebug(data.debug);
         if (firstData) this.focusInitial(data, cx);
+        refreshArtifacts(this, cx);
       } catch (error) {
         if (load !== this.load) return;
         this.error = String(error.message ?? error);
@@ -556,13 +559,13 @@ export default class Berbr extends View {
     this.perform(cx, ["open", path, ...(shell ? ["--shell"] : [])], {close, action});
   }
 
-  openUrl(url, cx, action = url, {close = false} = {}) {
+  openUrl(url, cx, action = url, {close = false, args = [url]} = {}) {
     if (!url || this.busy) return;
     this.busy = true; this.busyAction = action; this.error = null;
     cx.notify();
     cx.spawn(async cx => {
       try {
-        const result = await exec("open", [url]);
+        const result = await exec("open", args);
         if (result.code !== 0) throw new Error(result.stderr.trim() || "Could not open link");
         if (close && props()?.overlay) closeOverlay(props().overlay);
       } catch (error) { this.error = String(error.message ?? error); log(`open ${url}: ${this.error}`); }
@@ -863,6 +866,8 @@ export default class Berbr extends View {
 
   setExpanded(id, cx) {
     this.expanded = id;
+    const task = walk(this.data?.rows).find(row => row.id === id && row.kind === "task");
+    if (task?.artifacts) loadArtifacts(this, task, "", cx, true);
     try { localStorage.setItem("berbr.expanded", JSON.stringify(id)); } catch (_) { /* Storage is optional. */ }
     cx.notify();
   }
@@ -1076,6 +1081,7 @@ export default class Berbr extends View {
     if (!detail.trees.length && !taskSpace(task, this.liveState().spaces))
       add("action", "start", {label:"Start work", accent:true}, (cx, id) => this.open(task, cx, id));
     if (task.note) add("action", "note", {label:"Note"}, () => this.openNote(task));
+    for (const {type, key, action, ...values} of artifactItems(this, task)) add(type, key, values, action);
     if (!task.done) add("action", "close", {label:"Close task", close:true}, () => this.formOverlay("done", {
       task:task.task, label:task.title ?? task.label, row:task, plan:this.liveState().plan(task),
     }));
@@ -1227,7 +1233,9 @@ export default class Berbr extends View {
     const pending = this.busy && this.busyAction === item.id;
     const line = this.innerRow(t, item);
     const mark = name => pending ? icon("spinner", 11).text_color(t.dim).spin(900) : icon(name, 12).text_color(t.dim);
-    if (item.type === "tree") {
+    if (["artifacts", "artifact", "artifact-status"].includes(item.type)) {
+      renderArtifact(this, t, item, line);
+    } else if (item.type === "tree") {
       if (!treeFocusTarget(item.row, agents(), panes())) line.tooltip("No agent here — use Resume");
       line.child(mark("git-branch"))
         .child(div().flex_1().min_w(0).truncate()

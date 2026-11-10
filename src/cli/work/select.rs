@@ -61,6 +61,7 @@ fn first_worktree(
         None,
     );
     let open = Open {
+        project: config.name.clone(),
         directory: config.workflow.worktree_dir.clone(),
         kind: config.workflow.agent,
         agent: true,
@@ -99,7 +100,11 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
         Work::Task(i) => {
             let row = &table.tasks[i];
             super::common::check_task_identity(&table, &row.task.name)?;
-            (Space::Task(&row.task), row.trees.clone(), Some(row))
+            (
+                Space::Task(&row.task, &config.name),
+                row.trees.clone(),
+                Some(row),
+            )
         }
         Work::Ticket(i) => {
             let loose = &table.loose[i];

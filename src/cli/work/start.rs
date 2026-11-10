@@ -212,7 +212,7 @@ fn start_with(
         std::fs::write(&brief, text).map_err(err)?;
         return launch(
             config.workflow.agent,
-            Space::Task(&task),
+            Space::Task(&task, &config.name),
             &main,
             &label,
             Context {
@@ -251,6 +251,7 @@ fn start_with(
         description.as_deref().or(message.as_deref()),
     );
     let open = Open {
+        project: config.name.clone(),
         directory: config.workflow.worktree_dir.clone(),
         kind: config.workflow.agent,
         agent: !no_agent,
@@ -456,6 +457,7 @@ fn add_with(
         description.as_deref().or(message.as_deref()),
     );
     let open = Open {
+        project: config.name.clone(),
         directory: config.workflow.worktree_dir.clone(),
         kind: config.workflow.agent,
         agent: true,

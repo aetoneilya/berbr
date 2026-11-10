@@ -117,6 +117,17 @@ enum CliCommands {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    /// Print the shared artifact folder of a task, creating it when missing.
+    /// Any files and directories are allowed; --list emits one level as JSON.
+    Artifacts {
+        /// Defaults to the current worktree/workspace's task
+        task: Option<String>,
+        #[arg(long)]
+        list: bool,
+        /// Relative subdirectory to list
+        #[arg(long, requires = "list")]
+        directory: Option<PathBuf>,
+    },
     /// Tasks with their tickets, merge requests, worktrees and agents; then work
     /// that belongs to no task. Updates `state` and `sessions` in task notes.
     Status(StatusArgs),
@@ -412,6 +423,11 @@ pub fn run() -> Result<(), String> {
         CliCommands::Note { task, text } => work::cli_note(&config, task, text),
         CliCommands::Rename { args, tab } => work::cli_rename(&config, args, tab),
         CliCommands::Task { command } => work::cli_task(&config, command),
+        CliCommands::Artifacts {
+            task,
+            list,
+            directory,
+        } => work::cli_artifacts(&config, task.as_deref(), list, directory.as_deref()),
         CliCommands::Prepare { spec } => work::cli_prepare(&spec),
         CliCommands::Attach { key, task } => work::cli_attach(&config, &key, task),
         CliCommands::Review { name } => work::cli_review(&config, name),
@@ -445,6 +461,7 @@ fn changes(command: &CliCommands) -> bool {
         | CliCommands::Prepare { .. }
         | CliCommands::Note { .. }
         | CliCommands::Rename { .. }
+        | CliCommands::Artifacts { .. }
         | CliCommands::Review { .. }
         | CliCommands::Open { .. } => true,
         CliCommands::Done(args) => !args.dry_run,

@@ -41,6 +41,144 @@ const byId = (root, id) => nodes(root).find(node => node.attributes.id?.[0] === 
 const text = root => root && typeof root === "object" ? root.nodes.map(text).join(" ") : String(root ?? "");
 const click = (node, cx) => node.attributes.on_click[0]({}, cx);
 
+const artifactTask = (root = "/artifacts/demo-1") => ({id:"task:demo-1", kind:"task", task:"demo-1", title:"Demo", artifacts:root, children:[]});
+const artifactEntry = (name, kind = "file", extra = {}) => ({name, kind, relative:name, path:`/artifacts/demo-1/${name}`, executable:false, ...extra});
+
+test("Artifacts lists arbitrary files and lazily expands folders with keyboard file opening", async () => {
+  const task = artifactTask();
+  const {view, cx, jobs, key} = setup({data:{rows:[task]}});
+  const calls = [];
+  view.cli = async args => {
+    calls.push(args);
+    return JSON.stringify({project:view.project, task:task.task, path:task.artifacts, entries:args.includes("--directory")
+      ? [artifactEntry("data/данные.csv", "file", {name:"данные.csv"})]
+      : [artifactEntry("data", "directory"), artifactEntry("plan.md"), artifactEntry("page.html"), artifactEntry("unknown.xyz"), artifactEntry(".hidden")]});
+  };
+  view.render(cx);
+  assert.equal(jobs.length, 0);
+  view.showDetails(task, cx);
+  assert.match(text(view.render(cx)), /Loading artifacts/);
+  await jobs.shift()(cx);
+  assert.deepEqual(calls, [["artifacts", "demo-1", "--list"]]);
+  const rendered = view.render(cx);
+  assert.match(text(rendered), /Artifacts.*data.*plan.md.*page.html.*unknown.xyz.*\.hidden/);
+  click(byId(rendered, `${task.id}/artifact/data`), cx);
+  await jobs.shift()(cx);
+  assert.deepEqual(calls[1], ["artifacts", "demo-1", "--list", "--directory", "data"]);
+  assert.match(text(view.render(cx)), /данные.csv/);
+  view.selected = `${task.id}/artifact/data/данные.csv`;
+  key("enter");
+  await jobs.shift()(cx);
+  assert.deepEqual(state.execs, [["open", ["/artifacts/demo-1/data/данные.csv"]]]);
+  click(byId(view.render(cx), `${task.id}/artifact/data`), cx);
+  assert.doesNotMatch(text(view.render(cx)), /данные.csv/);
+});
+
+test("artifact opening previews Markdown, opens ordinary files, edits scripts and reveals links", async () => {
+  const task = artifactTask();
+  const entries = [artifactEntry("PLAN.MD"), artifactEntry("page.html"), artifactEntry("arbitrary.xyz"),
+    artifactEntry("script.command"), artifactEntry("script-without-extension", "file", {executable:true}), artifactEntry("shortcut", "symlink")];
+  const {view, cx, jobs} = setup({data:{rows:[task]}});
+  view.cli = async () => JSON.stringify({project:view.project, task:task.task, path:task.artifacts, entries});
+  view.showDetails(task, cx); await jobs.shift()(cx);
+  for (const entry of entries) {
+    click(byId(view.render(cx), `${task.id}/artifact/${entry.relative}`), cx);
+    if (jobs.length) await jobs.shift()(cx);
+  }
+  assert.equal(state.overlays.length, 1);
+  assert.equal(state.overlays[0].props.path, entries[0].path);
+  assert.equal(state.overlays[0].props.form, "note");
+  assert.equal(state.overlays[0].props.vault, false);
+  assert.deepEqual(state.execs, [
+    ["open", [entries[1].path]], ["open", [entries[2].path]],
+    ["open", ["-t", entries[3].path]], ["open", ["-t", entries[4].path]],
+    ["open", ["-R", entries[5].path]],
+  ]);
+  click(byId(view.render(cx), `${task.id}/artifacts/header/folder`), cx);
+  await jobs.shift()(cx);
+  assert.deepEqual(state.execs.at(-1), ["open", [task.artifacts]]);
+});
+
+test("artifact polling refreshes only visible folders and preserves files across a temporary error", async () => {
+  const task = artifactTask();
+  const {view, cx, jobs, timers} = setup({data:{rows:[task]}});
+  let fail = false, entries = [artifactEntry("data", "directory")];
+  const calls = [];
+  view.cli = async args => {
+    calls.push(args);
+    if (fail) throw new Error("Cannot read folder");
+    return JSON.stringify({project:view.project, task:task.task, path:task.artifacts, entries:args.includes("--directory") ? [] : entries});
+  };
+  const poll = timers.find(timer => timer.ms === 5000).fn;
+  view.showDetails(task, cx); await jobs.shift()(cx);
+  click(byId(view.render(cx), `${task.id}/artifact/data`), cx); await jobs.shift()(cx);
+  assert.match(text(view.render(cx)), /Empty folder/);
+  calls.length = 0;
+  poll(cx); poll(cx);
+  assert.equal(jobs.length, 2); // root + open folder; no overlapping reads
+  while (jobs.length) await jobs.shift()(cx);
+  assert.equal(calls.length, 2);
+  click(byId(view.render(cx), `${task.id}/artifact/data`), cx);
+  entries = [...entries, artifactEntry("new.csv")];
+  poll(cx); await jobs.shift()(cx);
+  assert.match(text(view.render(cx)), /new.csv/);
+  fail = true; poll(cx); await jobs.shift()(cx);
+  assert.match(text(view.render(cx)), /Cannot read folder.*new.csv/);
+  fail = false; poll(cx); await jobs.shift()(cx);
+  assert.doesNotMatch(text(view.render(cx)), /Cannot read folder/);
+  view.setExpanded(null, cx); poll(cx);
+  assert.equal(jobs.length, 0);
+});
+
+test("pending artifact reads stay with their project when task IDs are shared", async () => {
+  const first = artifactTask("/first/demo-1"), second = artifactTask("/second/demo-1");
+  const {view, cx, jobs} = setup({data:{rows:[first]}});
+  let resolve;
+  view.cli = () => new Promise(done => {resolve = done;});
+  view.showDetails(first, cx);
+  const pending = jobs.shift()(cx);
+  view.data = {rows:[second]};
+  view.cli = async () => JSON.stringify({project:view.project, task:second.task, path:second.artifacts, entries:[artifactEntry("second.txt")]});
+  view.showDetails(second, cx); await jobs.shift()(cx);
+  resolve(JSON.stringify({project:null, task:first.task, path:first.artifacts, entries:[artifactEntry("first.txt")]}));
+  await pending;
+  assert.match(text(view.render(cx)), /second.txt/);
+  assert.doesNotMatch(text(view.render(cx)), /first.txt/);
+});
+
+test("artifact requests pin project and cwd before deferred execution, including retries", async () => {
+  const task = artifactTask("/A/demo-1");
+  const data = {project:"A", projects:[{name:"A", cwd:"/A/repo"}], rows:[task]};
+  const {view, cx, jobs} = setup({data});
+  view.project = "A";
+  state.focused = {cwd:"/A/deleted", space:"space-A"};
+  view.showDetails(task, cx);
+  // Switch before the queued callback even starts, rather than after cli().
+  view.project = "B"; view.data = {projects:[{name:"B", cwd:"/B/repo"}], rows:[]};
+  state.focused = {cwd:"/B/repo", space:"space-B"};
+  state.execHandler = async () => {
+    if (state.execs.length === 1) throw new Error("os error 2");
+    return {code:0, stderr:"", stdout:JSON.stringify({project:"A", task:task.task, path:task.artifacts, entries:[artifactEntry("A.txt")]})};
+  };
+  await jobs.shift()(cx);
+  assert.equal(state.execs.length, 2);
+  for (const [, args] of state.execs) {
+    assert.equal(args[args.indexOf("--project") + 1], "A");
+    assert.ok(args.includes("HERDR_WORKSPACE_ID=space-A"));
+    assert.ok(!args.includes("HERDR_WORKSPACE_ID=space-B"));
+  }
+  assert.deepEqual(state.execs.map(call => call[2]), [{cwd:"/A/deleted"}, {cwd:"/A/repo"}]);
+  view.project = "A"; view.data = data;
+  assert.match(text(view.render(cx)), /A.txt/);
+  // A mismatched backend result must not replace the last successful list.
+  state.execHandler = async () => ({code:0, stderr:"", stdout:JSON.stringify({project:"B", task:task.task, path:"/B/demo-1", entries:[artifactEntry("B.txt")]})});
+  click(byId(view.render(cx), `${task.id}/artifacts/header/refresh`), cx);
+  await jobs.shift()(cx);
+  assert.match(text(view.render(cx)), /another project or task/);
+  assert.match(text(view.render(cx)), /A.txt/);
+  assert.doesNotMatch(text(view.render(cx)), /B.txt/);
+});
+
 test("click and Enter on empty, stale, merged, closed and unowned worktrees never launch or remove", () => {
   for (const fields of [{task:"Demo"}, {task:"Demo", merged:true}, {task:"Demo", mr_state:"closed"}, {}]) {
     const tree = {kind:"tree", id:"tree", tree:"Demo", cwd:"/home/demo/worktree", ...fields,
@@ -436,7 +574,7 @@ test("task status columns keep rings for open tasks and ideas and meaningful act
 test("the existing 30 second refresh timer updates elapsed only for visible working tasks", () => {
   const task = {id:"clock", kind:"task", title:"Clock", children:[{kind:"agent", terminal:"agent"}]};
   const {view, cx, timers} = setup({data:{rows:[task]}});
-  assert.deepEqual(timers.map(timer => timer.ms), [1000, 30000, 300000]);
+  assert.deepEqual(timers.map(timer => timer.ms), [5000, 1000, 30000, 300000]);
   let refreshed = 0, notified = 0;
   view.refresh = (_cx, cached) => {assert.equal(cached, true); refreshed++;};
   cx.notify = () => notified++;

@@ -397,8 +397,8 @@ pub(super) fn tree_table(config: &Config, online: bool) -> Result<Table, String>
     if config.repos.is_empty() {
         return Err("no [[repo]] in ~/.config/berbr/config.toml".to_string());
     }
-    // tasks don't decide which worktree is which, and are not needed here
-    Ok(table::build(config, Vec::new(), online))
+    // Reviewers need task ownership to receive the same shared artifacts.
+    Ok(table::build(config, crate::cli::load(config)?, online))
 }
 
 /// A worktree by name or branch, otherwise the one containing the cwd, otherwise

@@ -22,7 +22,8 @@ pub(super) fn snapshot(projects: &[Config], chosen: usize, cached: bool) -> Resu
             ..Default::default()
         },
     );
-    let rows: Vec<_> = roots.iter().map(|n| row(&table, n, None)).collect();
+    let mut rows: Vec<_> = roots.iter().map(|n| row(&table, n, None)).collect();
+    add_artifact_paths(&mut rows, &config.name);
     println!(
         "{}",
         json!({
@@ -36,6 +37,20 @@ pub(super) fn snapshot(projects: &[Config], chosen: usize, cached: bool) -> Resu
         })
     );
     Ok(())
+}
+
+/// Paths only: snapshots never create folders or scan arbitrary artifact trees.
+fn add_artifact_paths(rows: &mut [Value], project: &str) {
+    for row in rows {
+        if row["kind"] == "task"
+            && let Some(id) = row["task"].as_str()
+        {
+            row["artifacts"] = json!(crate::artifacts::directory(project, id));
+        }
+        if let Some(children) = row["children"].as_array_mut() {
+            add_artifact_paths(children, project);
+        }
+    }
 }
 
 fn row(table: &Table, node: &Node, owner: Option<&str>) -> Value {

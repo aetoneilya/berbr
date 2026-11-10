@@ -10,6 +10,33 @@ use crate::vault::task::{Task, same_name};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+pub(in crate::cli) fn cli_artifacts(
+    config: &Config,
+    target: Option<&str>,
+    list: bool,
+    directory: Option<&Path>,
+) -> Result<(), String> {
+    // Polling file lists needs identities/bindings, not every task's complete
+    // Agent notes and session history.
+    let (tasks, skipped) = crate::vault::task::load_previews(config);
+    for error in skipped {
+        eprintln!("skipped {error}");
+    }
+    let task = resolve_tool_task(config, target, tasks)?;
+    let root = crate::artifacts::ensure(&config.name, &task.name)?;
+    if list {
+        let directory = directory.unwrap_or_else(|| Path::new(""));
+        let entries = crate::artifacts::list(&root, directory)?;
+        println!(
+            "{}",
+            serde_json::json!({"project":config.name, "task":task.name, "path":root, "directory":directory, "entries":entries})
+        );
+    } else {
+        println!("{}", root.display());
+    }
+    Ok(())
+}
+
 pub(in crate::cli) fn cli_task(config: &Config, command: TaskCommand) -> Result<(), String> {
     if let TaskCommand::List { json, all } = command {
         let (mut tasks, skipped) = crate::vault::task::load(config)?;
@@ -277,7 +304,14 @@ pub(in crate::cli) fn cli_rename(
 }
 
 fn tool_task(config: &Config, target: Option<&str>) -> Result<Task, String> {
-    let mut tasks = load(config)?;
+    resolve_tool_task(config, target, load(config)?)
+}
+
+fn resolve_tool_task(
+    config: &Config,
+    target: Option<&str>,
+    mut tasks: Vec<Task>,
+) -> Result<Task, String> {
     if let Some(target) = target {
         let i = find_task(&tasks, target, true)?.ok_or_else(|| format!("no task {target}"))?;
         return Ok(tasks.swap_remove(i));
@@ -297,7 +331,10 @@ fn tool_task(config: &Config, target: Option<&str>) -> Result<Task, String> {
 
 /// Explicit note bindings win over session/ticket/workspace inference for
 /// context tools. Keep this separate from table ownership and close planning.
-fn bound_context_task(table: &table::Table, root: &Path) -> Result<Option<usize>, String> {
+pub(super) fn bound_context_task(
+    table: &table::Table,
+    root: &Path,
+) -> Result<Option<usize>, String> {
     let tasks: Vec<_> = table.tasks.iter().map(|r| &r.task).collect();
     let roots: Vec<_> = table.trees.iter().map(|t| t.wt.path.clone()).collect();
     let (matches, ambiguous_name) = super::context::bound_tasks(&tasks, root, &roots);

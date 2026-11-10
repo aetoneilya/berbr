@@ -115,6 +115,7 @@ print(json.dumps(out))
                 ),
             )
             .env("HOME", self.root.join("home"))
+            .env("BERBR_HOME", self.root.join("home/.berbr"))
             .env("XDG_CACHE_HOME", self.root.join("cache"))
             .env("BERBR_CONFIG", self.root.join("config.toml"))
             .env("BERBR_BACKEND", "herdr-app")
@@ -144,6 +145,278 @@ fn success(out: Output) -> Value {
         String::from_utf8_lossy(&out.stderr)
     );
     serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn task_artifacts_list_any_files_and_folders_and_survive_renaming_and_closing() {
+    let f = Fixture::new();
+    let root = f.root.join("home/.berbr/projects/test/artifacts/test-0");
+    let before = fs::read(f.root.join("vault/tasks/test-0.md")).unwrap();
+    let list = success(
+        f.command()
+            .args(["artifacts", "test-0", "--list"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(list["path"], root.to_str().unwrap());
+    assert_eq!(list["entries"], serde_json::json!([]));
+    fs::create_dir(root.join("folder with spaces")).unwrap();
+    for name in [
+        "plan.md",
+        "page.html",
+        "data.csv",
+        "script.sh",
+        "unknown.xyz",
+        ".hidden",
+    ] {
+        fs::write(root.join(name), "content").unwrap();
+    }
+    fs::write(root.join("folder with spaces/данные.csv"), "a,b").unwrap();
+    let list = success(
+        f.command()
+            .args(["artifacts", "test-0", "--list"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(list["entries"].as_array().unwrap().len(), 7);
+    assert_eq!(list["entries"][0]["kind"], "directory");
+    let nested = success(
+        f.command()
+            .args([
+                "artifacts",
+                "test-0",
+                "--list",
+                "--directory",
+                "folder with spaces",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        nested["entries"][0]["relative"],
+        "folder with spaces/данные.csv"
+    );
+    assert_eq!(
+        fs::read(f.root.join("vault/tasks/test-0.md")).unwrap(),
+        before
+    );
+    for directory in ["../", root.to_str().unwrap()] {
+        assert!(
+            !f.command()
+                .args(["artifacts", "test-0", "--list", "--directory", directory])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    success(
+        f.command()
+            .args(["task", "update", "test-0", "--title", "A different title"])
+            .output()
+            .unwrap(),
+    );
+    // The normal close operation moves the note to done/. Artifact identity
+    // must depend on neither its title nor its note's current directory.
+    let note = f.root.join("vault/tasks/test-0.md");
+    let text = fs::read_to_string(&note)
+        .unwrap()
+        .replace("id: test-0", "id: test-0\ndone: true");
+    fs::create_dir(f.root.join("vault/tasks/done")).unwrap();
+    fs::write(f.root.join("vault/tasks/done/test-0.md"), text).unwrap();
+    fs::remove_file(note).unwrap();
+    let out = f.command().args(["artifacts", "test-0"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        root.to_str().unwrap()
+    );
+    assert!(root.join("plan.md").exists());
+}
+
+#[test]
+fn artifact_paths_in_snapshots_are_read_only_and_project_scoped() {
+    let f = Fixture::new();
+    let snapshot = success(
+        f.command()
+            .args(["app-snapshot", "--cached"])
+            .output()
+            .unwrap(),
+    );
+    fn task(rows: &[Value]) -> &Value {
+        for row in rows {
+            if row["kind"] == "task" {
+                return row;
+            }
+            if row["children"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty())
+            {
+                return task(row["children"].as_array().unwrap());
+            }
+        }
+        panic!("no task");
+    }
+    let expected = f.root.join("home/.berbr/projects/test/artifacts/test-0");
+    assert_eq!(
+        task(snapshot["rows"].as_array().unwrap())["artifacts"],
+        expected.to_str().unwrap()
+    );
+    assert!(!expected.exists());
+    let config = f.root.join("config.toml");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("\n[[project]]\nname = 'other'\ntask_dirs = ['tasks']\n");
+    fs::write(config, text).unwrap();
+    let other = success(
+        f.command()
+            .args(["-p", "other", "artifacts", "test-0", "--list"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        other["path"],
+        f.root
+            .join("home/.berbr/projects/other/artifacts/test-0")
+            .to_str()
+            .unwrap()
+    );
+    assert!(!expected.exists());
+}
+
+#[test]
+fn agents_in_different_worktrees_resolve_one_shared_artifact_folder() {
+    let f = Fixture::new();
+    let repo = f.root.join("repo");
+    let trees = [
+        repo.join(".herdr/worktrees/first"),
+        repo.join(".herdr/worktrees/second"),
+    ];
+    for (i, tree) in trees.iter().enumerate() {
+        f.git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                &format!("tree-{i}"),
+                tree.to_str().unwrap(),
+            ],
+        );
+        fs::create_dir(tree.join("subdir")).unwrap();
+    }
+    fs::write(
+        f.root.join("vault/tasks/test-0.md"),
+        format!(
+            "---\nid: test-0\nworktrees: [{:?}, {:?}]\n---\nContext\n",
+            trees[0], trees[1]
+        ),
+    )
+    .unwrap();
+    let first = success(
+        f.command()
+            .current_dir(trees[0].join("subdir"))
+            .args(["artifacts", "--list"])
+            .output()
+            .unwrap(),
+    );
+    let root = PathBuf::from(first["path"].as_str().unwrap());
+    fs::write(root.join("plan.md"), "Shared plan").unwrap();
+    let second = success(
+        f.command()
+            .current_dir(&trees[1])
+            .args(["artifacts", "--list"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(first["path"], second["path"]);
+    assert_eq!(second["entries"][0]["name"], "plan.md");
+    fs::write(
+        f.root.join("vault/tasks/other.md"),
+        "---\nid: other\n---\nOther task\n",
+    )
+    .unwrap();
+    let other = success(
+        f.command()
+            .args(["artifacts", "other", "--list"])
+            .output()
+            .unwrap(),
+    );
+    assert_ne!(first["path"], other["path"]);
+    assert_eq!(other["entries"], serde_json::json!([]));
+    // Both context tools must refuse conflicting explicit bindings.
+    fs::write(
+        f.root.join("vault/tasks/other.md"),
+        format!("---\nid: other\nworktrees: [{:?}]\n---\n", trees[0]),
+    )
+    .unwrap();
+    let out = f
+        .command()
+        .current_dir(&trees[0])
+        .args(["artifacts"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("belongs to several tasks"));
+}
+
+#[test]
+fn artifacts_reject_symlinks_in_every_managed_namespace_component() {
+    use std::os::unix::fs::symlink;
+    for relative in [
+        "projects",
+        "projects/test",
+        "projects/test/artifacts",
+        "projects/test/artifacts/test-0",
+    ] {
+        let f = Fixture::new();
+        let home = f.root.join("home/.berbr");
+        let link = home.join(relative);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let foreign = f.root.join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("keep.txt"), "Other task").unwrap();
+        symlink(&foreign, &link).unwrap();
+        let out = f
+            .command()
+            .args(["artifacts", "test-0", "--list"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "accepted symlink: {relative}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("symlink"));
+        assert!(link.symlink_metadata().unwrap().is_symlink());
+        assert_eq!(fs::read_dir(foreign).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn artifacts_support_long_legacy_names_without_colliding() {
+    let f = Fixture::new();
+    let mut paths = Vec::new();
+    for suffix in ["a", "b"] {
+        let name = format!("{}{suffix}", "я".repeat(120));
+        fs::write(
+            f.root.join("vault/tasks").join(format!("{name}.md")),
+            "---\n---\nLegacy\n",
+        )
+        .unwrap();
+        let result = success(
+            f.command()
+                .args(["artifacts", &name, "--list"])
+                .output()
+                .unwrap(),
+        );
+        let path = PathBuf::from(result["path"].as_str().unwrap());
+        assert!(path.is_dir());
+        assert!(path.file_name().unwrap().to_str().unwrap().len() <= 200);
+        paths.push(path);
+    }
+    assert_ne!(paths[0], paths[1]);
+    fs::write(paths[0].join("private.txt"), "First task").unwrap();
+    assert_eq!(fs::read_dir(&paths[1]).unwrap().count(), 0);
 }
 
 #[test]

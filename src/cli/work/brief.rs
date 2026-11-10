@@ -111,6 +111,17 @@ pub(super) fn brief_text(
     };
     brief.push_str(&format!("\n## What is needed\n\n{todo}\n"));
     if let Some(task) = task {
+        brief.push_str(&format!(
+            "\n## Shared artifacts\n\nAll agents of this task share this folder: {}\n\
+             Put plans, pages, data, scripts and other useful files or directories here. \
+             Its contents appear in the task's Artifacts list in Berbr. \
+             Use descriptive names, inspect existing files before editing, and preserve other agents' changes. \
+             These files survive worktree removal and task closing. \
+             Use `berbr artifacts` to get the path from this worktree; outside it, use `berbr -p {} artifacts {}`.\n",
+            crate::artifacts::directory(project, &task.name).display(),
+            crate::client::herdr::shell_quote(project),
+            crate::client::herdr::shell_quote(&task.name),
+        ));
         let id = crate::client::herdr::shell_quote(&task.name);
         let command = format!("berbr -p {}", crate::client::herdr::shell_quote(project));
         brief.push_str(&format!(

@@ -6,6 +6,14 @@ attention. Click a task to select its Herdr space; the separate `⋯` button
 opens its note and related tickets, merge requests, worktrees and agents.
 Tasks without a live space open details with an explicit Start work action.
 
+Expanded tasks also show **Artifacts**, a shared tree of any files and folders.
+Folders load on expansion; only visible directories refresh every five seconds.
+The header can refresh them manually or open the root folder in Finder.
+Markdown uses Berbr's note viewer/editor, other files their default app, and
+scripts/executables the text editor. Symlinks are revealed rather than traversed.
+Artifacts live under Berbr's home, outside worktrees and task-note directories,
+and remain available for closed tasks.
+
 The existing Rust model owns Jira, GitLab, notes, worktrees and Claude/Codex
 history. The mod consumes `berbr app-snapshot` JSON. It launches the backend through
 login/interactive zsh to inherit the same credentials as the terminal TUI;

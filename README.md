@@ -54,6 +54,7 @@ Like `~/.claude`, berbr keeps its own folder, `~/.berbr` (`BERBR_HOME` overrides
   logs/berbr.log
   projects/<project>/tasks/*.md        open tasks
   projects/<project>/tasks/done/*.md   closed ones, moved there by `berbr done`
+  projects/<project>/artifacts/<task-id>/   shared task files and folders
 ```
 
 Task notes are plain Markdown with YAML frontmatter; `o` in the TUI and the
@@ -206,6 +207,9 @@ berbr add [<task>] [<KEY>]    new agent tab; omit KEY with --name <name> or --in
 berbr attach <KEY> [<task>]   put a ticket into a task without a worktree
 berbr select [<task|KEY>]     go back to a task: its agent, or claude resuming its session; a task with nothing yet gets its first worktree
 berbr note "<text>"           (for agents) append a finding to the note's "Agent notes"
+berbr artifacts [<task>]      print/create the task's shared artifact folder
+berbr artifacts [<task>] --list [--directory <relative-path>]
+                           list one folder as JSON, without scanning its children
 berbr status                  the table in plain text; updates `state` and `sessions` in notes
 berbr review [<worktree>]     start a reviewer agent next to the worktree's agent
 berbr done [<task>] [--tree <name-or-path> [--repo <path>]] [--merged] [-y] [--dry-run [--json]]
@@ -228,6 +232,26 @@ directory and Berbr's cache (the shared note-write lock). Existing running agent
 keep their current sandbox permissions until restarted or granted access.
 An inherited `WORKTABLE_CONFIG` still selects that explicit configuration;
 after migration, remove the stale override or point it to `~/.berbr/config.toml`.
+
+Every task has a shared artifact folder under
+`~/.berbr/projects/<project>/artifacts/<task-id>/` (`BERBR_HOME` overrides).
+It accepts any files and folders: plans, HTML pages, CSV data, scripts, images,
+and other outputs. The path depends on the project and stable task ID, so agents
+in different repositories/worktrees of the same task share it. Renaming a task,
+removing worktrees and closing the task preserve its artifacts. Legacy note names
+are encoded as a single folder name; titles never determine the path.
+
+Fresh agents get the path and usage instructions in their brief; Claude and
+Codex launches/resumes receive `--add-dir` for that task's artifact folder.
+Already-running agents retain their permissions until restarted or granted
+access. `berbr artifacts` uses the same task resolution and ambiguity checks as
+`task show` and `note`; pass a task explicitly and select its project with `-p`
+when outside its worktree. The native panel shows an **Artifacts** tree in the
+expanded task, including closed tasks. It refreshes visible folders every five
+seconds and offers manual refresh and **Open artifact folder**. Markdown opens
+inside Berbr; ordinary files open in their default app, scripts/executables in
+the text editor. Symlinks and special files are shown and revealed in Finder.
+Listing a folder never runs scripts or recursively follows symlinks.
 
 `done --dry-run` prints the same plan without changing Jira, notes, worktrees,
 branches, herdr or caches. Add `--json` for one plan object, including blockers,
