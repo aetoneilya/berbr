@@ -74,6 +74,8 @@ function openArtifact(view, entry, cx, id) {
 
 export function artifactItems(view, task) {
   if (!task.artifacts) return [];
+  const root = listing(view, task);
+  if (root?.loaded && !root.error && !root.entries.length) return [];
   const items = [{type:"artifacts", key:"header", task, groupStart:true}];
   const visit = (relative, depth) => {
     const state = listing(view, task, relative);
@@ -102,8 +104,7 @@ export function artifactItems(view, task) {
 export function renderArtifact(view, t, item, line) {
   if (item.type === "artifacts") {
     const task = item.task;
-    return line.child(icon("folder", 12).text_color(t.dim))
-      .child(div().flex_1().text_size(12).text_color(t.muted).child("Artifacts"))
+    return line.child(div().flex_1().text_size(12).text_color(t.muted).child("Artifacts"))
       .child(iconButton(t, `${item.id}/folder`, "folder", "Open artifact folder", cx => {
         if (listing(view, task)?.loaded) view.openUrl(listing(view, task).path, cx);
         else loadArtifacts(view, task, "", cx, true);
