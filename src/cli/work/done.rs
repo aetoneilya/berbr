@@ -531,7 +531,8 @@ fn finish_task_with(
         problems.push(format!("can't close herdr workspace {space}: {e}"));
     }
     // agents labelled with the task in another space: a task without a worktree
-    // runs as a pane in the project's space, which stays
+    // runs as a pane in the project's space. Leave sibling tabs alone; closing
+    // its last pane may also remove an otherwise empty project space.
     if herdr::available() {
         for agent in row
             .agents
