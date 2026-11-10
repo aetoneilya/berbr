@@ -84,10 +84,26 @@ fn enabled_from_env(backend: Option<&str>, socket: Option<&str>, herdr_env: Opti
 fn output_of(bin: &str, args: &[&str]) -> Result<Vec<u8>> {
     let out = crate::log::command(bin, Command::new(bin).args(args))?;
     if !out.status.success() {
-        return Err(HerdrError::NonZeroExit(format!(
-            "{bin}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let response = serde_json::from_slice::<Value>(&out.stdout).ok();
+        let message = response
+            .as_ref()
+            .and_then(|v| {
+                v["error"]
+                    .as_str()
+                    .or_else(|| v["error"]["message"].as_str())
+            })
+            .unwrap_or(&stdout)
+            .trim();
+        let detail = match (message, stderr.trim()) {
+            ("", "") => format!("process exited with {}", out.status),
+            ("", stderr) => stderr.to_string(),
+            (message, "") => message.to_string(),
+            (message, stderr) if message == stderr => message.to_string(),
+            (message, stderr) => format!("{message}\n{stderr}"),
+        };
+        return Err(HerdrError::NonZeroExit(format!("{bin}: {detail}")));
     }
     Ok(out.stdout)
 }
@@ -403,6 +419,27 @@ fn pane_of(address: &str) -> Result<String> {
     )))
 }
 
+fn close_pane(address: &str) -> Result<Value> {
+    let pane = pane_of(address)?;
+    let error = match act("pane.close", json!({"pane": pane})) {
+        Ok(result) => return Ok(result),
+        Err(error) => error,
+    };
+    // Closing the last pane escalates to space.close, but pane.close exposes
+    // no confirmed argument. Stop only this terminal instead: Herdr removes
+    // its pane when it observes the explicit kill, including an empty space.
+    // Never confirm a tab/space close: a concurrent split could add a sibling.
+    if !matches!(&error, HerdrError::NonZeroExit(message)
+        if message == "herdr-app: space.close ends its terminals: pass confirmed: true")
+    {
+        return Err(error);
+    }
+    let stopped = output_of("hc", &["kill", address]);
+    invalidate();
+    stopped?;
+    Ok(json!({}))
+}
+
 fn arg<'a>(args: &'a [&str], name: &str) -> Result<&'a str> {
     args.windows(2)
         .find(|a| a[0] == name)
@@ -503,10 +540,7 @@ pub(super) fn output(args: &[&str]) -> Result<Vec<u8>> {
             labelled?;
             json!({})
         }
-        ["pane", "close", address] => {
-            let pane = pane_of(address)?;
-            act("pane.close", json!({"pane": pane}))?
-        }
+        ["pane", "close", address] => close_pane(address)?,
         ["agent", "rename", address, name] => {
             let renamed = output_of("hc", &["label", address, &format!("berbr.name={name}")]);
             invalidate();

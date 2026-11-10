@@ -3038,3 +3038,230 @@ fn role_label_failure_reports_the_created_terminal_without_starting_an_agent() {
     );
     assert!(!f.calls().iter().any(|c| c[0] == "hc" && c[1][0] == "send"));
 }
+
+// Model Herdr's CLI contract: errors are JSON on stdout with a nonzero exit.
+// Keep the agent in a project space, outside a dedicated task workspace.
+fn pane_close_fixture(scenario: Value) -> Fixture {
+    let f = Fixture::new();
+    fs::write(f.root.join("close-scenario.json"), scenario.to_string()).unwrap();
+    fs::write(f.root.join("bin/herdr-app"), r#"#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+r=Path(os.environ['BERBR_TEST_ROOT']); a=sys.argv[1:]
+with (r/'calls.jsonl').open('a') as f: f.write(json.dumps(['herdr-app',a])+'\n')
+s=json.loads((r/'close-scenario.json').read_text())
+if a==['ls']:
+ terms=[] if (r/'stopped-terminal').exists() else [{'terminal':'t1','pane':'p1','app':'codex','status':'idle'}]
+ tabs=[{'id':'tb-project','terminals':terms}]
+ if (r/'close-failed').exists():
+  if s.get('grow')=='pane': terms.append({'terminal':'other','pane':'other-pane'})
+  if s.get('grow')=='tab': tabs.append({'id':'other-tab','terminals':[{'terminal':'other','pane':'other-pane'}]})
+ out={'spaces':[] if (r/'all-closed').exists() else [{'id':'sp-project','name':'project','machine':None,'tabs':tabs}]}
+elif a[:2]==['do','tab.close'] or a[:2]==['do','space.close']:
+ (r/'all-closed').touch();out={'ok':True}
+elif a[:2]==['do','pane.close'] and s.get('fail'):
+ (r/'close-failed').touch()
+ if s.get('raw_stdout') is not None: print(s['raw_stdout'])
+ elif s.get('error') is not None: print(json.dumps({'error':s['error']}))
+ if s.get('stderr'): print(s['stderr'],file=sys.stderr)
+ sys.exit(1)
+else: out={'ok':True}
+print(json.dumps(out))
+"#).unwrap();
+    fs::write(f.root.join("bin/hc"), r#"#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+r=Path(os.environ['BERBR_TEST_ROOT']); a=sys.argv[1:]
+with (r/'calls.jsonl').open('a') as f: f.write(json.dumps(['hc',a])+'\n')
+if a[:1]==['ls']: out={'terminals':[]}
+elif a[:1]==['kill']:
+ s=json.loads((r/'close-scenario.json').read_text())
+ if s.get('kill_error'):
+  print(json.dumps({'error':{'message':s['kill_error']}}),file=sys.stderr);sys.exit(1)
+ (r/'stopped-terminal').write_text(a[1]);out={'address':a[1],'state':'finished'}
+else: out={'address':a[1],'cwd':str(r/'repo'),'foreground':{'name':'codex','cwd':str(r/'repo')},'labels':{'berbr.task':'test-0','berbr.name':'task-agent'}}
+print(json.dumps(out))
+"#).unwrap();
+    f
+}
+
+fn pane_close_actions(f: &Fixture) -> Vec<(String, Value)> {
+    f.calls()
+        .iter()
+        .filter_map(|call| {
+            let args = call[1].as_array()?;
+            (call[0] == "herdr-app" && args.first()? == "do").then(|| {
+                (
+                    args[1].as_str().unwrap().to_string(),
+                    serde_json::from_str(args[2].as_str().unwrap()).unwrap(),
+                )
+            })
+        })
+        .collect()
+}
+
+const LAST_PANE_CONFIRMATION: &str = "space.close ends its terminals: pass confirmed: true";
+
+fn pane_close_stops(f: &Fixture) -> Vec<String> {
+    f.calls()
+        .iter()
+        .filter_map(|call| {
+            (call[0] == "hc" && call[1][0] == "kill")
+                .then(|| call[1][1].as_str().unwrap().to_string())
+        })
+        .collect()
+}
+
+fn pane_close_survivors(f: &Fixture) -> Vec<String> {
+    let inventory = success(
+        Command::new(f.root.join("bin/herdr-app"))
+            .arg("ls")
+            .env("BERBR_TEST_ROOT", &f.root)
+            .output()
+            .unwrap(),
+    );
+    inventory["spaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|space| space["tabs"].as_array().unwrap())
+        .flat_map(|tab| tab["terminals"].as_array().unwrap())
+        .map(|term| term["terminal"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn done_stops_only_the_last_task_terminal_without_a_tab_or_space_confirmation() {
+    let f = pane_close_fixture(serde_json::json!({
+        "fail":true, "error":LAST_PANE_CONFIRMATION,
+    }));
+    let out = f
+        .command()
+        .args(["done", "test-0", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        pane_close_actions(&f),
+        vec![("pane.close".into(), serde_json::json!({"pane":"p1"})),]
+    );
+    assert_eq!(pane_close_stops(&f), ["t1"]);
+    assert_eq!(
+        fs::read_to_string(f.root.join("stopped-terminal")).unwrap(),
+        "t1"
+    );
+}
+
+#[test]
+fn done_does_not_end_new_siblings_after_the_last_pane_close_failed() {
+    for growth in ["pane", "tab"] {
+        let f = pane_close_fixture(serde_json::json!({
+            "fail":true, "error":LAST_PANE_CONFIRMATION, "grow":growth,
+        }));
+        let out = f
+            .command()
+            .args(["done", "test-0", "--yes"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Even if the UI changes at any point, only the original terminal ID
+        // is stopped; no confirmed tab/space close can kill its new siblings.
+        assert_eq!(
+            pane_close_actions(&f),
+            vec![("pane.close".into(), serde_json::json!({"pane":"p1"})),]
+        );
+        assert_eq!(pane_close_stops(&f), ["t1"]);
+        assert_eq!(pane_close_survivors(&f), ["other"]);
+    }
+}
+
+#[test]
+fn done_preserves_close_error_details_without_confirming_unrelated_failures() {
+    for (scenario, expected) in [
+        (
+            serde_json::json!({"fail":true,"error":"permission denied"}),
+            vec!["permission denied"],
+        ),
+        (
+            serde_json::json!({"fail":true,"error":{"message":"missing pane"}}),
+            vec!["missing pane"],
+        ),
+        (
+            serde_json::json!({"fail":true,"error":"request failed","stderr":"backend detail"}),
+            vec!["request failed", "backend detail"],
+        ),
+        (
+            serde_json::json!({"fail":true,"stderr":"socket unavailable"}),
+            vec!["socket unavailable"],
+        ),
+        (
+            serde_json::json!({"fail":true,"raw_stdout":"plain error"}),
+            vec!["plain error"],
+        ),
+        (
+            serde_json::json!({"fail":true}),
+            vec!["process exited with"],
+        ),
+    ] {
+        let f = pane_close_fixture(scenario);
+        let out = f
+            .command()
+            .args(["done", "test-0", "--yes"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let error = String::from_utf8_lossy(&out.stderr);
+        for message in expected {
+            assert!(error.contains(message), "{error}");
+        }
+        assert_eq!(pane_close_actions(&f).len(), 1);
+        assert_eq!(pane_close_actions(&f)[0].0, "pane.close");
+        assert!(pane_close_stops(&f).is_empty());
+    }
+}
+
+#[test]
+fn done_keeps_successful_pane_close_scoped_to_the_pane() {
+    let f = pane_close_fixture(serde_json::json!({}));
+    let out = f
+        .command()
+        .args(["done", "test-0", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        pane_close_actions(&f),
+        vec![("pane.close".into(), serde_json::json!({"pane":"p1"})),]
+    );
+}
+
+#[test]
+fn done_reports_failed_terminal_stop_without_retrying_or_closing_the_space() {
+    let f = pane_close_fixture(serde_json::json!({
+        "fail":true,"error":LAST_PANE_CONFIRMATION,"kill_error":"stop denied",
+    }));
+    let out = f
+        .command()
+        .args(["done", "test-0", "--yes"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("stop denied"));
+    assert_eq!(
+        pane_close_actions(&f),
+        vec![("pane.close".into(), serde_json::json!({"pane":"p1"})),]
+    );
+    assert_eq!(pane_close_stops(&f), ["t1"]);
+}
