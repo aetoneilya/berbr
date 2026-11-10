@@ -39,7 +39,7 @@ fn first_worktree(
     let key = task.tickets.first();
     let issue = key.map(|k| fetch_issue(config, k)).transpose()?;
     let desired = work_name(task, tree_name, issue.as_ref());
-    let main = super::common::choose_discovered_repo(mains, ui)?;
+    let main = super::common::choose_issue_repo(config, key.map(String::as_str), mains, ui)?;
     let name = worktree::reserve_name(
         &main,
         &config.workflow.worktree_dir,
@@ -52,6 +52,7 @@ fn first_worktree(
     let branch = branch_name(config, key, &name);
     let tree = worktree::worktree_dir(&main, &config.workflow.worktree_dir, &name);
     let brief = brief_text(
+        &config.name,
         &tree,
         &branch,
         Some(task),
@@ -60,6 +61,7 @@ fn first_worktree(
         None,
     );
     let open = Open {
+        project: config.name.clone(),
         directory: config.workflow.worktree_dir.clone(),
         kind: config.workflow.agent,
         agent: true,
@@ -85,6 +87,7 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
         new_session,
         bg,
     } = args;
+    let target = target.as_deref().map(|t| config.issue_key(t)).transpose()?;
     let table = table::build(config, load(config)?, false);
     let key = target.clone().filter(|t| is_ticket_key(t));
     let work = match target {
@@ -97,7 +100,11 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
         Work::Task(i) => {
             let row = &table.tasks[i];
             super::common::check_task_identity(&table, &row.task.name)?;
-            (Space::Task(&row.task), row.trees.clone(), Some(row))
+            (
+                Space::Task(&row.task, &config.name),
+                row.trees.clone(),
+                Some(row),
+            )
         }
         Work::Ticket(i) => {
             let loose = &table.loose[i];
@@ -282,10 +289,7 @@ pub(super) fn resume_in_tree(
         .iter()
         .position(|tree| tree.wt.path == path)
         .ok_or_else(|| format!("{} is not a configured worktree", path.display()))?;
-    let task = table
-        .tasks
-        .iter()
-        .find(|row| row.trees.contains(&tree_index));
+    let task = super::task::worktree_owner(&table, tree_index)?;
     let saved = task
         .into_iter()
         .flat_map(|row| row.task.sessions.iter().chain(&row.new_sessions))
@@ -316,7 +320,7 @@ pub(super) fn resume_in_tree(
     });
     let label = table.tree(tree_index).wt.name();
     let space = task
-        .map(|row| Space::Task(&row.task))
+        .map(|row| Space::Task(&row.task, &config.name))
         .unwrap_or(Space::Label(&label));
     resume_with_role(
         &table,

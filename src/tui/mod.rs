@@ -632,6 +632,7 @@ mod close_plan_tests {
             name: "demo".into(),
             jira: None,
             gitlab: None,
+            github: None,
             workflow: Default::default(),
             repos: vec![],
             vault: crate::config::VaultConfig {

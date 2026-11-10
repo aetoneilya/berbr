@@ -26,23 +26,38 @@ pub(super) fn snapshot(projects: &[Config], chosen: usize, cached: bool) -> Resu
         },
     );
     let stopped = stopped_by_tree(&table);
-    let rows: Vec<_> = roots
+    let mut rows: Vec<_> = roots
         .iter()
         .map(|n| row_with_history(&table, n, None, &stopped))
         .collect();
+    add_artifact_paths(&mut rows, &config.name);
     println!(
         "{}",
         json!({
             "version": 3, "project": config.name,
-            "projects": projects.iter().map(|c| json!({"name":c.name,"cwd":c.repos.first().map(|r|&r.path),"agent":c.workflow.agent})).collect::<Vec<_>>(),
+            "projects": projects.iter().map(|c| json!({"name":c.name,"cwd":c.repos.first().map(|r|&r.path),"agent":c.workflow.agent,"integrations":{"jira":c.jira.is_some(),"github":c.has_github()}})).collect::<Vec<_>>(),
             "rows": rows, "warnings": table.warnings, "debug": crate::log::debug_enabled(),
             "settings": {"agent":config.workflow.agent, "generation_agent":config.workflow.generation_agent,
                 "generation_model":config.workflow.generation_model},
             "store": if config.vault.own { "berbr" } else { "vault" },
-            "sources": {"jira":format!("{:?}",table.jira.fresh),"gitlab":format!("{:?}",table.gitlab.fresh)}
+            "sources": {"jira":format!("{:?}",table.jira.fresh),"gitlab":format!("{:?}",table.gitlab.fresh),"github":format!("{:?}",table.github.fresh)}
         })
     );
     Ok(())
+}
+
+/// Paths only: snapshots never create folders or scan arbitrary artifact trees.
+fn add_artifact_paths(rows: &mut [Value], project: &str) {
+    for row in rows {
+        if row["kind"] == "task"
+            && let Some(id) = row["task"].as_str()
+        {
+            row["artifacts"] = json!(crate::artifacts::directory(project, id));
+        }
+        if let Some(children) = row["children"].as_array_mut() {
+            add_artifact_paths(children, project);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -259,8 +274,16 @@ fn row_with_history(
         Kind::Mr(i) => {
             let m = table.mr(*i);
             value["kind"] = json!("mr");
-            value["label"] = json!(format!("!{}  {}", m.mr.iid(), look::mr_title(m)));
-            value["state"] = json!(m.mr.state().as_str());
+            value["label"] = json!(format!("{}  {}", m.mr.number_label(), look::mr_title(m)));
+            value["state"] = json!(if m.mr.github && m.opened() {
+                "open"
+            } else {
+                m.mr.state().as_str()
+            });
+            value["provider"] = json!(m.mr.provider());
+            value["repository"] = json!(m.project);
+            value["head_repository"] = json!(m.mr.head_repo);
+            value["review_decision"] = json!(m.mr.review_decision);
             value["url"] = json!(m.mr.web_url());
             value["branch"] = json!(m.mr.source_branch());
             value["body"] = json!(
@@ -282,7 +305,8 @@ fn row_with_history(
                 value["merge_status"] = json!(m.mr.detailed_merge_status);
                 value["conflict"] = json!(conflict);
                 value["ready"] = json!(
-                    !m.mr.draft
+                    (!m.mr.github || table.github.fresh == table::Fresh::Live)
+                        && !m.mr.draft
                         && ci == Some("success")
                         && !conflict
                         && unresolved == 0
@@ -335,7 +359,7 @@ fn row_with_history(
         }
         Kind::Header(section) => {
             value["kind"] = json!("header");
-            value["label"] = json!(section.title());
+            value["label"] = json!(section.title_for(table));
         }
         Kind::NewTask => {
             value["kind"] = json!("new");
@@ -373,6 +397,9 @@ fn row_with_history(
 
 fn ticket(table: &Table, value: &mut Value, key: &str) {
     value["kind"] = json!("ticket");
+    if crate::client::issue::github_parts(key).is_some() {
+        value["provider"] = json!("github");
+    }
     value["label"] = json!(format!("{key}  {}", look::summary(table.tickets.get(key))));
     value["target"] = json!(key);
     value["state"] = json!(table.tickets.get(key).map(|t| t.status.as_str()));
@@ -460,6 +487,7 @@ mod tests {
             name: "demo".into(),
             jira: None,
             gitlab: None,
+            github: None,
             workflow: WorkflowConfig::default(),
             repos: vec![],
             vault: VaultConfig {
@@ -839,5 +867,44 @@ mod tests {
         );
         table.trees[0].agents.clear();
         assert!(!session_may_be_live(&table, "conversation"));
+    }
+}
+
+#[cfg(test)]
+mod github_tests {
+    use super::*;
+    use crate::client::gitlab::MrReview;
+    use crate::table::fixtures::{mr, table};
+
+    #[test]
+    fn snapshot_github_review_and_cached_or_missing_data_cannot_report_ready() {
+        let mut pr = mr(7, "same", "Synthetic pull", "opened");
+        pr.mr.github = true;
+        pr.project = "github.com/demo/repo".into();
+        pr.mr.head_repo = Some(pr.project.clone());
+        pr.mr.detailed_merge_status = Some("mergeable".into());
+        pr.mr.review_decision = Some("APPROVED".into());
+        pr.review = Some(MrReview {
+            pipeline: Some("success".into()),
+            approved_by: vec!["reviewer".into()],
+            unresolved: 0,
+        });
+        let mut table = table(vec![], vec![], vec![pr], vec![]);
+        let node = Node {
+            id: "pr".into(),
+            kind: Kind::Mr(0),
+            children: vec![],
+        };
+        let value = row(&table, &node, None);
+        assert_eq!(value["provider"], "github");
+        assert_eq!(value["state"], "open");
+        assert_eq!(value["label"], "#7  Synthetic pull");
+        assert_eq!(value["ready"], true);
+        table.github.fresh = table::Fresh::Cached;
+        assert_eq!(row(&table, &node, None)["ready"], false);
+        table.github.fresh = table::Fresh::Live;
+        table.mrs[0].review = None;
+        assert_eq!(row(&table, &node, None)["ready"], false);
+        assert!(row(&table, &node, None)["ci"].is_null());
     }
 }

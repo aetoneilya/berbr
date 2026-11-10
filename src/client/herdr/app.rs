@@ -415,11 +415,20 @@ fn create(command: &str, args: Value) -> Result<Value> {
     let before = read("herdr-app", &["status"])?;
     let result = act(command, args)?;
     if before["space"].as_str().is_some() {
-        act("space.select", json!({"id": before["space"]}))?;
-        act("tab.select", json!({"id": before["tab"]}))?;
-        if before["focused_pane"].as_str().is_some() {
-            act("pane.focus", json!({"pane": before["focused_pane"]}))?;
-        }
+        let restore = || -> Result<()> {
+            act("space.select", json!({"id": before["space"]}))?;
+            act("tab.select", json!({"id": before["tab"]}))?;
+            if before["focused_pane"].as_str().is_some() {
+                act("pane.focus", json!({"pane": before["focused_pane"]}))?;
+            }
+            Ok(())
+        };
+        restore().map_err(|e| {
+            HerdrError::NonZeroExit(format!(
+                "created tab: {}; terminal: {}; could not restore caller: {e}",
+                result["tab"], result["terminal"]
+            ))
+        })?;
     }
     Ok(result)
 }

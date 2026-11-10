@@ -388,6 +388,7 @@ mod tests {
             name: name.into(),
             jira: None,
             gitlab: None,
+            github: None,
             workflow: WorkflowConfig::default(),
             vault: VaultConfig {
                 path: PathBuf::from("/v"),

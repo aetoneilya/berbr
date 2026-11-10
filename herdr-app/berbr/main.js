@@ -2,12 +2,13 @@ import { View, div, svg, image } from "gpui-kit";
 import { h_flex, v_flex, Input, InputState, Textarea, TextareaState, TextView } from "gpui-base";
 import { appHome, exec, focused, spaces, agents, panes, terminals, theme, run, props,
   openOverlay, closeOverlay, notify, shared, setShared, nextCommand, hc } from "herdr";
-import { walk, sectionLabels, taskSpace, rowMenu, taskDetail, agentIdentity, agentRole,
+import { forgeName, changeKind, changeNumber, githubIssue, walk, sectionLabels, taskSpace, rowMenu, taskDetail, agentIdentity, agentRole,
   normalizeTicketState, ticketTitle,
   cleanCliText, isClosedTicket, newTaskArgs, freeTickets,
   agentActivity, formatElapsed, blockedPrompt, mrPills, focusedTask, focusedTree, treeFocusTarget, jumpItems, matchJump, closePlan, PanelModel, treeMarks, isMergedTree, mergedPlan, backendClosePlan } from "./model.js";
 import { icon, iconButton, button, chip, sectionHeader, statusMark, kbd, pill, keyboardControl } from "./ui.js";
 import { formView, initNote, noteKey } from "./forms.js";
+import { initArtifacts, loadArtifacts, refreshArtifacts, artifactItems, renderArtifact } from "./artifacts.js";
 import { log, logRun, setDebug } from "./log.js";
 
 export default class Berbr extends View {
@@ -49,6 +50,7 @@ export default class Berbr extends View {
     this.cwd = p.cwd ?? this.opening?.cwd ?? null;
     this.handle = cx.focus_handle();
     this.handle.focus();
+    initArtifacts(this, cx);
     if (this.form === "note") { initNote(this, cx); return; }
     this.inputs = {}; this.values = {}; this.searchFocused = false;
     const placeholders = { search: {jump:"Jump to…", projects:"Filter projects"}[this.form] ?? "Filter tasks", title: this.form === "new" ? "Type a name, a branch, or a Jira key or link" : "What are you working on?",
@@ -87,7 +89,7 @@ export default class Berbr extends View {
     }
     this.agent = p.agent ?? "codex"; this.worktree = true;
     // "smart" is the internal key for the description-only Generate tab.
-    this.source = p.prefill?.ticket ? "jira" : "smart";
+    this.source = p.prefill?.ticket ? (githubIssue(p.prefill.ticket) ? "github" : "jira") : "smart";
     this.ticket = p.prefill?.ticket ?? null;
     this.newTicket = false; this.createMore = false; this.choosing = null;
     if (this.form === "new") {
@@ -151,9 +153,10 @@ export default class Berbr extends View {
     cx.notify();
   }
 
-  async cli(args) {
+  async cli(args, {project = this.project, context = this.actionContext()} = {}) {
     const env = ["-u", "HERDR_PLUGIN_CONTEXT_JSON", "-u", "HERDR_PLUGIN_ROOT", "-u", "HERDR_ENV", "-u", "HERDR_WORKSPACE_ID", "-u", "HERDR_TAB_ID", "-u", "HERDR_PANE_ID", "-u", "HC_TERMINAL_ID", "BERBR_BACKEND=herdr-app", "NO_COLOR=1"];
-    const {opening, cwd} = this.actionContext();
+    const {opening, cwd} = context;
+    const fallback = context.fallback ?? this.data?.projects?.find(item => item.name === project)?.cwd;
     // Clear inherited caller ids too: a mod pane can have no terminal.
     if (opening?.space) env.push(`HERDR_WORKSPACE_ID=${opening.space}`);
     if (opening?.tab) env.push(`HERDR_TAB_ID=${opening.tab}`);
@@ -161,7 +164,7 @@ export default class Berbr extends View {
     // Load the same login/interactive environment as the existing terminal TUI.
     // All user values stay argv entries; the shell only forwards "$@".
     const command = ["-lic", 'exec "$@"', "berbr-env", "env", ...env, this.binary,
-      ...(this.project ? ["--project", this.project] : []), ...args];
+      ...(project ? ["--project", project] : []), ...args];
     const started = Date.now();
     let result, retried = null;
     try {
@@ -171,17 +174,23 @@ export default class Berbr extends View {
         // The focused terminal can sit in a folder that is gone (a removed worktree):
         // nothing starts there, so run from the project instead.
         if (!cwd || !/os error 2\b/.test(String(error?.message ?? error))) throw error;
-        const fallback = this.data?.projects?.find(project => project.name === this.project)?.cwd;
         retried = {to:fallback && fallback !== cwd ? fallback : null};
         result = await exec("zsh", command, retried.to ? {cwd:retried.to} : {});
       }
     } catch (error) {
-      logRun(args, {cwd, ms:Date.now() - started, error:String(error?.message ?? error), retried});
+      await logRun(args, {cwd, ms:Date.now() - started, error:String(error?.message ?? error), retried});
       throw error;
     }
-    logRun(args, {cwd, ms:Date.now() - started, code:result.code, retried});
-    if (result.code !== 0) log(`berbr ${args[0]}: ${cleanCliText(result.stderr) || cleanCliText(result.stdout)}`);
-    if (result.code !== 0) throw new Error(cleanCliText(result.stderr) || cleanCliText(result.stdout) || `berbr exited ${result.code}`);
+    const logged = logRun(args, {cwd, ms:Date.now() - started, code:result.code, retried});
+    if (result.code !== 0) {
+      const fallback = result.code < 0
+        ? `berbr ended without an exit status (code ${result.code}); no diagnostic output was captured`
+        : `berbr exited ${result.code}`;
+      const message = cleanCliText(result.stderr) || cleanCliText(result.stdout) || fallback;
+      await logged;
+      await log(`berbr ${args[0]}: ${message}`);
+      throw new Error(message);
+    }
     return result.stdout;
   }
 
@@ -212,6 +221,7 @@ export default class Berbr extends View {
         this.snapshots.set(data.project, data);
         setDebug(data.debug);
         if (firstData) this.focusInitial(data, cx);
+        refreshArtifacts(this, cx);
       } catch (error) {
         if (load !== this.load) return;
         this.error = String(error.message ?? error);
@@ -550,13 +560,13 @@ export default class Berbr extends View {
     this.perform(cx, ["open", path, ...(shell ? ["--shell"] : [])], {close, action});
   }
 
-  openUrl(url, cx, action = url, {close = false} = {}) {
+  openUrl(url, cx, action = url, {close = false, args = [url]} = {}) {
     if (!url || this.busy) return;
     this.busy = true; this.busyAction = action; this.error = null;
     cx.notify();
     cx.spawn(async cx => {
       try {
-        const result = await exec("open", [url]);
+        const result = await exec("open", args);
         if (result.code !== 0) throw new Error(result.stderr.trim() || "Could not open link");
         if (close && props()?.overlay) closeOverlay(props().overlay);
       } catch (error) { this.error = String(error.message ?? error); log(`open ${url}: ${this.error}`); }
@@ -614,7 +624,8 @@ export default class Berbr extends View {
   newTaskProps() {
     const projects = (this.data?.projects ?? []).map(project => project.name);
     const tickets = Object.fromEntries([...this.snapshots].map(([name, snapshot]) => [name, freeTickets(snapshot)]));
-    return {projects, tickets};
+    const integrations = Object.fromEntries((this.data?.projects ?? []).map(p => [p.name, p.integrations]));
+    return {projects, tickets, integrations};
   }
 
   menuTarget(item) {
@@ -878,7 +889,7 @@ export default class Berbr extends View {
   submitNew(cx) {
     if (this.busy) return;
     const {args, error, target} = newTaskArgs({source:this.source, text:this.source === "smart" ? "" : this.values.title, ticket:this.ticket,
-      agent:this.agent, worktree:this.worktree, newTicket:this.newTicket, description:this.values.description});
+      agent:this.agent, worktree:this.worktree, newTicket:(props()?.integrations?.[this.project]?.jira ?? true) && this.newTicket, description:this.values.description});
     if (error) { this.error = error; cx.notify(); return; }
     const saveNaming = target.kind === "empty" && Boolean(this.values.description?.trim()) && this.namingDirty;
     if (saveNaming && (!this.settingsReady || this.settingsLoading || !this.availableNamingModels().some(model => model.id === this.namingModel))) {
@@ -900,7 +911,11 @@ export default class Berbr extends View {
   /** New task: the project the task goes to (the CLI's --project). */
   chooseNewProject(name, cx) {
     if (this.busy || !name) return;
-    if (name !== this.project) { this.project = name; this.ticket = null; }
+    if (name !== this.project) {
+      this.project = name; this.ticket = null;
+      const integrations = props()?.integrations?.[name];
+      if ((this.source === "github" && !integrations?.github) || (this.source === "jira" && integrations?.jira === false)) this.source = "smart";
+    }
     this.choosing = null; this.error = null; cx.notify();
   }
 
@@ -911,7 +926,7 @@ export default class Berbr extends View {
 
   submitTicket(cx, worktree) {
     const ticket = this.values.ticket?.trim();
-    if (!ticket) { this.error = "Enter a Jira ticket key."; cx.notify(); return; }
+    if (!ticket) { this.error = "Enter a ticket key or GitHub issue reference."; cx.notify(); return; }
     const task = props()?.task;
     const args = worktree ? ["add", task, ticket] : ["attach", ticket, task];
     if (worktree) {
@@ -961,6 +976,8 @@ export default class Berbr extends View {
 
   setExpanded(id, cx) {
     this.expanded = id;
+    const task = walk(this.data?.rows).find(row => row.id === id && row.kind === "task");
+    if (task?.artifacts) loadArtifacts(this, task, "", cx, true);
     try { localStorage.setItem("berbr.expanded", JSON.stringify(id)); } catch (_) { /* Storage is optional. */ }
     cx.notify();
   }
@@ -1108,7 +1125,7 @@ export default class Berbr extends View {
       const mr = signal.mrs[0], spec = mrPills(mr)[0];
       hints.child(this.externalLink(t, `task-mr-${row.id}`, mr, [
         div().flex_none().child(signal.mrKey),
-        spec && pill(t, {...spec, tooltip:`${spec.label} — open ${signal.mrKey} in GitLab`}),
+        spec && pill(t, {...spec, tooltip:`${spec.label} — open ${signal.mrKey} in ${forgeName(signal.mrs?.[0])}`}),
         signal.mrs.length > 1 && div().flex_none().text_color(t.dim).child(`+${signal.mrs.length - 1}`),
       ]).min_w(0));
     }
@@ -1157,7 +1174,7 @@ export default class Berbr extends View {
     }
     for (const mr of detail.openMrs) add("mr", mr.row.id, mr, (cx, id) => this.openUrl(mr.row.url, cx, id));
     for (const [key, label, rows, expanded] of [
-      ["history", `History · ${detail.history.length} MRs`, detail.history, this.history],
+      ["history", `History · ${detail.history.length} ${detail.history.every(m => forgeName(m.row ?? m) === "GitHub") ? "PRs" : detail.history.some(m => forgeName(m.row ?? m) === "GitHub") ? "PRs / MRs" : "MRs"}`, detail.history, this.history],
       ["subtasks", `Subtasks · ${detail.subtasks.length}`, detail.subtasks, this.subtasks],
     ]) {
       if (!rows.length) continue;
@@ -1175,6 +1192,7 @@ export default class Berbr extends View {
     if (!detail.trees.length && !taskSpace(task, this.liveState().spaces))
       add("action", "start", {label:"Start work", accent:true}, (cx, id) => this.open(task, cx, id));
     if (task.note) add("action", "note", {label:"Note"}, () => this.openNote(task));
+    for (const {type, key, action, ...values} of artifactItems(this, task)) add(type, key, values, action);
     if (!task.done) add("action", "close", {label:"Close task", close:true}, () => this.formOverlay("done", {
       task:task.task, label:task.title ?? task.label, row:task, plan:this.liveState().plan(task),
     }));
@@ -1208,7 +1226,7 @@ export default class Berbr extends View {
       this.formOverlay("attach-task", {ticket:ticket.target, tasks});
     });
     if (["ticket", "mr"].includes(row.kind)) add("action", "url", {
-      label:ticket ? "Open in Jira" : "Open in GitLab", link:true,
+      label:`Open in ${forgeName(row)}`, link:true,
     }, (cx, id) => this.openUrl(row.url, cx, id));
     return items;
   }
@@ -1265,9 +1283,9 @@ export default class Berbr extends View {
 
   externalLink(t, id, row, content = []) {
     const mr = row.kind === "mr";
-    const key = mr ? row.label?.match(/!\d+/)?.[0] ?? "MR" : row.target ?? "ticket";
+    const key = mr ? row.label?.match(/[!#]\d+/)?.[0] ?? "MR" : row.target ?? "ticket";
     return h_flex().id(id).min_w(0).gap(4).items_center().text_color(t.muted).cursor_pointer()
-      .tooltip(`Open ${key} in ${mr ? "GitLab" : "Jira"}`)
+      .tooltip(`Open ${key} in ${forgeName(row)}`)
       .opacity(this.busy && this.busyAction !== id ? 0.4 : 1)
       .hover(el => el.text_color(t.foreground).underline())
       .when(this.panelFocused() && this.selected === row.id, el => el.bg(t.selected))
@@ -1280,10 +1298,10 @@ export default class Berbr extends View {
   }
 
   mrState(t, mr, historical = false, state = mr?.state?.toLowerCase()) {
-    const key = mr?.label?.match(/!\d+/)?.[0] ?? "MR";
+    const key = mr?.label?.match(/[!#]\d+/)?.[0] ?? "MR";
     return h_flex().flex_none().gap(4).items_center().text_color(historical || ["merged", "closed"].includes(state) ? t.dim : t.muted)
       .children(mrPills(mr, {historical, state}).map(spec => pill(t, {...spec,
-        tooltip:`${spec.label} — open ${key} in GitLab`})));
+        tooltip:`${spec.label} — open ${key} in ${forgeName(mr)}`})));
   }
 
   agentLine(t, line, item) {
@@ -1317,7 +1335,9 @@ export default class Berbr extends View {
     const pending = this.busy && this.busyAction === item.id;
     const line = this.innerRow(t, item);
     const mark = name => pending ? icon("spinner", 11).text_color(t.dim).spin(900) : icon(name, 12).text_color(t.dim);
-    if (item.type === "tree") {
+    if (["artifacts", "artifact", "artifact-status"].includes(item.type)) {
+      renderArtifact(this, t, item, line);
+    } else if (item.type === "tree") {
       if (!treeFocusTarget(item.row, agents(), panes())) line.tooltip("No live agent — open a terminal or start an agent from the menu");
       line.h_auto().min_h(28).child(mark("git-branch").flex_none())
         .child(div().flex_1().min_w(24).truncate()
@@ -1332,7 +1352,7 @@ export default class Berbr extends View {
       const state = this.treeState(t, item.row, {compact:true, hideMerged:Boolean(item.mr && !item.loose), hideChanges:!item.loose});
       if (state) right.child(state);
       if (item.mr && !item.loose) right.child(this.externalLink(t, `${item.id}/mr`, item.mr, [
-        div().flex_none().text_size(12).child(item.mr.label?.match(/!\d+/)?.[0] ?? "MR"),
+        div().flex_none().text_size(12).child(item.mr.label?.match(/[!#]\d+/)?.[0] ?? "MR"),
         this.mrState(t, item.mr, false, isMergedTree(item.row) ? "merged"
           : item.row.mr_state ?? item.mr.state?.toLowerCase()).max_w("100%").flex_wrap(),
       ]).flex_none().max_w("100%").flex_wrap());
@@ -1348,14 +1368,14 @@ export default class Berbr extends View {
       line.child(right).children(this.treeActions(t, item.row, item.mr, item.id, {loose:item.loose, ticket:item.ticket}));
     } else if (item.type === "ticket") {
       line.child(this.externalLink(t, `${item.id}/ticket`, item.row, [div().child(item.row.target ?? "Ticket")])
-        .flex_none().tooltip("Open in Jira"))
+        .flex_none().tooltip(`Open in ${forgeName(item.row)}`))
         .child(chip(t, normalizeTicketState(item.row.state)))
         .child(div().flex_1().min_w(0).truncate().child(ticketTitle(item.row)));
     } else if (item.type === "agent") {
       this.agentLine(t, line, item);
     } else if (item.type === "mr") {
-      const iid = item.row.label?.match(/!\d+/)?.[0] ?? "MR";
-      const title = item.row.label?.replace(/^\s*!\d+\s*/, "") ?? "";
+      const iid = item.row.label?.match(/[!#]\d+/)?.[0] ?? "MR";
+      const title = item.row.label?.replace(/^\s*[!#]\d+\s*/, "") ?? "";
       line.text_color(item.historical ? t.dim : t.foreground).child(mark("git-compare"))
         .child(this.externalLink(t, `${item.id}/mr`, item.row, [
           div().flex_none().child(iid),
@@ -1474,7 +1494,7 @@ export default class Berbr extends View {
   looseRow(t, row, section) {
     const selected = this.panelFocused() && row.id === this.selected;
     const expanded = row.id === this.expanded;
-    const reason = section === "todo" ? "Assigned in Jira" : this.liveState().reason(row);
+    const reason = section === "todo" ? (forgeName(row) === "GitHub" ? "GitHub issue" : "Assigned in Jira") : this.liveState().reason(row);
     const kindIcon = { ticket:"file-text", tree:"git-branch", mr:"git-compare" }[row.kind] ?? "file-text";
     const line = h_flex().id(`loose-${row.id}`).h(44).flex_none().px(8).gap(8).items_center().rounded(6)
       .when(selected, el => el.bg(t.selected)).hover(el => el.bg(selected ? t.selected : t.hover)).cursor_pointer()

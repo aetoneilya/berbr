@@ -272,7 +272,13 @@ pub fn label_role(pane: &str, role: &str) -> Result<()> {
     if !app::enabled() {
         return Ok(());
     }
-    herdr_output(&["pane", "label", pane, &format!("berbr.role={role}")]).map(|_| ())
+    herdr_output(&["pane", "label", pane, &format!("berbr.role={role}")])
+        .map(|_| ())
+        .map_err(|e| {
+            HerdrError::NonZeroExit(format!(
+                "could not set role {role} on terminal {pane}; terminal remains available: {e}"
+            ))
+        })
 }
 
 /// Shows `pane` of `space`: the space, the pane's tab, then the pane.

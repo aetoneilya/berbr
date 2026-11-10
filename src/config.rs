@@ -25,6 +25,12 @@ pub struct GitLabConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubConfig {
+    pub repo: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct WorkflowConfig {
     /// Prepended to new task branches, e.g. "demo/".
@@ -107,6 +113,7 @@ pub struct RepoConfig {
     pub main_branch: Option<String>,
     /// Where its merge requests are; none without GitLab.
     pub gitlab_project: Option<String>,
+    pub github_repo: Option<String>,
 }
 
 /// One project, as every command sees it: its notes, repos, and the Jira and
@@ -117,6 +124,7 @@ pub struct Config {
     pub name: String,
     pub jira: Option<JiraConfig>,
     pub gitlab: Option<GitLabConfig>,
+    pub github: Option<GitHubConfig>,
     pub workflow: WorkflowConfig,
     pub vault: VaultConfig,
     pub repos: Vec<RepoConfig>,
@@ -146,6 +154,7 @@ struct ProjectFile {
     name: String,
     jira: Option<JiraConfig>,
     gitlab: Option<GitLabConfig>,
+    github: Option<GitHubConfig>,
     /// Relative to the vault, or to the project's own folder; default `tasks`
     /// there, required with a vault.
     #[serde(default)]
@@ -198,10 +207,25 @@ impl FileConfig {
                 {
                     workflow.generation_model = Some(workflow.naming_model.clone());
                 }
+                if let Some(g) = &mut p.github {
+                    g.repo = crate::client::issue::github_repo(&g.repo)?;
+                }
+                for repo in &mut p.repos {
+                    if let Some(g) = &mut repo.github_repo {
+                        *g = crate::client::issue::github_repo(g)?;
+                    }
+                    if repo.github_repo.is_some() && repo.gitlab_project.is_some() {
+                        return Err(
+                            "a repository cannot configure both github_repo and gitlab_project"
+                                .into(),
+                        );
+                    }
+                }
                 Ok(Config {
                     name: p.name,
                     jira: p.jira,
                     gitlab: p.gitlab,
+                    github: p.github,
                     workflow,
                     vault: VaultConfig {
                         path: vault.clone().unwrap_or(home),
@@ -224,6 +248,58 @@ impl FileConfig {
 }
 
 impl Config {
+    pub fn github_repos(&self) -> Vec<String> {
+        let mut repos: Vec<_> = self
+            .repos
+            .iter()
+            .filter_map(|r| r.github_repo.clone())
+            .collect();
+        if let Some(g) = &self.github {
+            repos.push(g.repo.clone());
+        }
+        repos.sort();
+        repos.dedup();
+        repos
+    }
+
+    pub fn has_github(&self) -> bool {
+        !self.github_repos().is_empty()
+    }
+
+    pub fn issue_key(&self, text: &str) -> Result<String, String> {
+        if let Some(key) = crate::client::issue::github_key(text) {
+            let (repo, _) =
+                crate::client::issue::github_parts(&key).ok_or("invalid GitHub issue")?;
+            if !self.github_repos().iter().any(|r| r == repo) {
+                return Err(format!(
+                    "GitHub repository {repo} is not configured in project {}",
+                    self.name
+                ));
+            }
+            return Ok(key);
+        }
+        if let Some(n) = text.strip_prefix('#') {
+            if !n.chars().all(|c| c.is_ascii_digit()) || !n.parse::<u64>().is_ok_and(|n| n > 0) {
+                return Err("invalid GitHub issue number".into());
+            }
+            let repos = self.github_repos();
+            if repos.len() != 1 {
+                return Err("ambiguous GitHub issue: use owner/repo#number".into());
+            }
+            return self.issue_key(&format!("{}#{n}", repos[0]));
+        }
+        if text.starts_with("https://github.com/")
+            || text.starts_with("github.com/")
+            || text.starts_with('#')
+            || text
+                .rsplit_once('#')
+                .is_some_and(|(repo, _)| crate::client::issue::github_repo(repo).is_ok())
+        {
+            return Err("invalid GitHub issue: use owner/repo#number or https://github.com/owner/repo/issues/number".into());
+        }
+        Ok(text.to_string())
+    }
+
     /// A Jira client for the project; an error when it has no Jira.
     pub fn jira_client(&self) -> Result<crate::client::jira::JiraClient, String> {
         let jira = self
@@ -761,5 +837,57 @@ mod tests {
         );
         assert!(projects[1].repos[0].path.ends_with("code/kcal"));
         assert!(projects[2].repos.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod github_tests {
+    use super::*;
+
+    #[test]
+    fn github_only_and_mixed_config_normalize_and_disambiguate_issue_arguments() {
+        let configs = toml::from_str::<FileConfig>(
+            r#"
+[[project]]
+name = "demo"
+github = {repo = "Owner/Repo"}
+[[project.repo]]
+path = "/synthetic/demo"
+[[project]]
+name = "mixed"
+jira = {host = "https://jira.example.invalid"}
+gitlab = {host = "gitlab.example.invalid", project = "demo/service"}
+github = {repo = "owner/repo"}
+[[project.repo]]
+path = "/synthetic/fork"
+github_repo = "Fork/Repo"
+"#,
+        )
+        .unwrap()
+        .projects()
+        .unwrap();
+        let demo = &configs[0];
+        assert!(demo.jira.is_none() && demo.gitlab.is_none());
+        assert_eq!(demo.issue_key("#1").unwrap(), "github.com/owner/repo#1");
+        assert_eq!(
+            demo.issue_key("https://github.com/Owner/Repo/issues/1")
+                .unwrap(),
+            "github.com/owner/repo#1"
+        );
+        assert!(demo.issue_key("other/repo#1").is_err());
+        for text in ["#0", "#invalid", "demo/repo#0", "demo/repo#invalid"] {
+            assert!(demo.issue_key(text).is_err(), "{text}");
+        }
+        assert!(
+            demo.issue_key("https://github.com/owner/repo/pull/1")
+                .is_err()
+        );
+        let mixed = &configs[1];
+        assert!(mixed.issue_key("#1").is_err());
+        assert_eq!(
+            mixed.issue_key("fork/repo#1").unwrap(),
+            "github.com/fork/repo#1"
+        );
+        assert_eq!(mixed.issue_key("DEMO-1").unwrap(), "DEMO-1");
     }
 }

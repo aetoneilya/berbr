@@ -7,7 +7,7 @@ use super::common::{
 };
 use super::launch::{Context, Open, Space, launch, open_added_work, open_work};
 use crate::cli::{AddArgs, StartArgs, load};
-use crate::client::jira::JiraIssue;
+use crate::client::issue::Issue;
 use crate::client::worktree;
 use crate::config::Config;
 use crate::vault::task::{Task, ticket_keys};
@@ -40,7 +40,7 @@ fn start_with(
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
     {
-        Some(target) => target,
+        Some(target) => config.issue_key(&target)?,
         None if args.unnamed => String::new(),
         None if args.description.is_some() => {
             // a headless call of its own: works without an agent for the task too
@@ -85,7 +85,7 @@ fn start_with(
         // work always gets a task: a note for shared context and agents' findings,
         // named after the ticket
         let issue = fetch_issue(config, &target)?;
-        let title = note_title(&issue.fields.summary);
+        let title = note_title(&issue.summary);
         if title.is_empty() {
             return Err(format!("{target} has no summary to name the task after"));
         }
@@ -126,7 +126,24 @@ fn start_with(
         }
     }
 
-    let mut keys: Vec<String> = tickets.iter().flat_map(|t| ticket_keys(t)).collect();
+    let mut keys: Vec<String> = tickets
+        .iter()
+        .map(|t| config.issue_key(t))
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .flat_map(|t| ticket_keys(t))
+        .collect();
+    // Validate every explicitly linked GitHub issue before creating either a
+    // note or a Jira ticket, including tasks with no checkout and no agent.
+    let mut github_issues = std::collections::HashMap::new();
+    for key in keys
+        .iter()
+        .filter(|k| crate::client::issue::github_parts(k).is_some())
+    {
+        if !github_issues.contains_key(key) {
+            github_issues.insert(key.clone(), fetch_issue(config, key)?);
+        }
+    }
     let tree_name = name;
     if new_ticket {
         let key = create_ticket(config, &target)?;
@@ -163,13 +180,22 @@ fn start_with(
         return Ok(());
     }
 
-    let issue = keys.first().map(|k| fetch_issue(config, k)).transpose()?;
-    let main = choose_repo(config, ui)?;
+    let issue = keys
+        .first()
+        .map(|key| {
+            github_issues
+                .remove(key)
+                .map(Ok)
+                .unwrap_or_else(|| fetch_issue(config, key))
+        })
+        .transpose()?;
+    let main = choose_repo(config, keys.first().map(String::as_str), ui)?;
     if no_worktree {
         // The agent in the main checkout, its brief in berbr's cache
         let label = work_name(&task, tree_name, issue.as_ref());
         let branch = worktree::current_branch(&main).unwrap_or_default();
         let text = brief_text(
+            &config.name,
             &main,
             &branch,
             Some(&task),
@@ -186,7 +212,7 @@ fn start_with(
         std::fs::write(&brief, text).map_err(err)?;
         return launch(
             config.workflow.agent,
-            Space::Task(&task),
+            Space::Task(&task, &config.name),
             &main,
             &label,
             Context {
@@ -216,6 +242,7 @@ fn start_with(
     let branch = branch.unwrap_or_else(|| branch_name(config, keys.first(), &wt_name));
     let tree = worktree::worktree_dir(&main, &config.workflow.worktree_dir, &wt_name);
     let brief = brief_text(
+        &config.name,
         &tree,
         &branch,
         Some(&task),
@@ -224,6 +251,7 @@ fn start_with(
         description.as_deref().or(message.as_deref()),
     );
     let open = Open {
+        project: config.name.clone(),
         directory: config.workflow.worktree_dir.clone(),
         kind: config.workflow.agent,
         agent: !no_agent,
@@ -247,7 +275,7 @@ fn create_ticket(config: &Config, title: &str) -> Result<String, String> {
 }
 
 /// `berbr add [<task>] [<KEY>]`: a new agent tab in the task's herdr workspace,
-/// in a new worktree or `--in` one the task has. KEY is optional only with `--in`.
+/// in a new worktree or `--in` one the task has. KEY is optional with --name/--in.
 pub(in crate::cli) fn cli_add(config: &Config, args: AddArgs) -> Result<(), String> {
     add(config, args, &mut Terminal).map_err(|e| e.lines().collect::<Vec<_>>().join(" "))
 }
@@ -272,17 +300,25 @@ fn add_with(
         bg,
     } = args;
     let (task_arg, key) = match args.as_slice() {
-        [] if in_tree.is_some() => (None, None),
-        [task] if in_tree.is_some() && !is_ticket_key(task) => (Some(task.clone()), None),
+        [] if in_tree.is_some() || name.is_some() => (None, None),
+        [task] if (in_tree.is_some() || name.is_some()) && !is_ticket_key(task) => {
+            (Some(task.clone()), None)
+        }
         [key] => (None, Some(key.clone())),
         [task, key] => (Some(task.clone()), Some(key.clone())),
-        _ => return Err("berbr add [<task>] <KEY>".to_string()),
+        _ => {
+            return Err(
+                "berbr add [<task>] [<KEY>] --name <name>, or berbr add [<task>] --in <tree>"
+                    .to_string(),
+            );
+        }
     };
+    let key = key.as_deref().map(|k| config.issue_key(k)).transpose()?;
     if let Some(key) = &key
         && !is_ticket_key(key)
     {
         return Err(format!(
-            "\"{key}\" is not a ticket key: berbr add [<task>] <KEY>"
+            "\"{key}\" is not a ticket key: berbr add [<task>] [<KEY>] --name <name>, or use --in <tree>"
         ));
     }
     let (mut table, row) = resolve_task_table(config, tasks, task_arg.as_deref(), ui)?;
@@ -304,7 +340,7 @@ fn add_with(
     }
     let issue = key
         .as_deref()
-        .filter(|_| config.jira.is_some())
+        .filter(|key| config.jira.is_some() || crate::client::issue::github_parts(key).is_some())
         .map(|key| fetch_issue(config, key))
         .transpose()?;
     let main = match &in_tree {
@@ -330,7 +366,7 @@ fn add_with(
                 }
             }
         }
-        None => super::common::choose_discovered_repo(&table.mains, ui)?,
+        None => super::common::choose_issue_repo(config, key.as_deref(), &table.mains, ui)?,
     };
     let existing = in_tree.is_some();
     let (tree, branch, wt_name) = match in_tree {
@@ -373,22 +409,46 @@ fn add_with(
         return Err("berbr add needs Herdr to open the worktree tab and agent".into());
     }
     if !existing {
+        worktree::reserve_exact_name(&main, &config.workflow.worktree_dir, &wt_name, &task.name)
+            .map_err(err)?;
         worktree::create_new_worktree(&main, &config.workflow.worktree_dir, &wt_name, &branch)
             .map_err(err)?;
     }
-    if let Some(key) = &key
-        && !task.tickets.contains(key)
-    {
-        let _lock = crate::vault::lock().map_err(err)?;
-        task.note.reload().map_err(err)?;
+    // GitHub branches use issue-N rather than the full provider-qualified key,
+    // so local context cannot recover their ownership from the branch alone.
+    let bind_tree = !existing
+        && (key.is_none()
+            || key
+                .as_deref()
+                .is_some_and(|k| crate::client::issue::github_parts(k).is_some()));
+    if bind_tree || key.as_ref().is_some_and(|key| !task.tickets.contains(key)) {
+        let record_error = |e: String| {
+            format!(
+                "worktree {} exists; could not update task note: {e}",
+                tree.display()
+            )
+        };
+        let _lock = crate::vault::lock().map_err(err).map_err(&record_error)?;
+        task.note.reload().map_err(err).map_err(&record_error)?;
         task = Task::from_note(task.note);
-        if !task.tickets.contains(key) {
+        if let Some(key) = &key
+            && !task.tickets.contains(key)
+        {
             task.tickets.push(key.clone());
             task.note.set("tickets", list(&task.tickets));
-            task.note.save().map_err(err)?;
         }
+        if bind_tree {
+            let mut trees = task.note.strings("worktrees");
+            let path = tree.to_string_lossy().into_owned();
+            if !trees.contains(&path) {
+                trees.push(path);
+            }
+            task.note.set("worktrees", list(&trees));
+        }
+        task.note.save().map_err(err).map_err(record_error)?;
     }
     let brief = brief_text(
+        &config.name,
         &tree,
         &branch,
         Some(&task),
@@ -397,33 +457,66 @@ fn add_with(
         description.as_deref().or(message.as_deref()),
     );
     let open = Open {
+        project: config.name.clone(),
         directory: config.workflow.worktree_dir.clone(),
         kind: config.workflow.agent,
         agent: true,
         focus: !bg && ui.can_ask(),
         description,
     };
-    open_added_work(&task, &tree, &wt_name, brief, open, ui)
+    open_added_work(&task, &tree, &wt_name, brief, open, ui).map_err(|e| {
+        format!(
+            "worktree {} exists; could not launch agent: {e}",
+            tree.display()
+        )
+    })
 }
 
 /// My open Jira tickets that belong to no task, plus "new task…".
 fn pick_start_target(config: &Config, tasks: &[Task], ui: &mut dyn Ui) -> Result<String, String> {
-    let client = config.jira_client()?;
-    let issues = client
-        .search_issues_brief(
-            "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC",
-            50,
-        )
-        .map_err(err)?;
-    let free: Vec<&JiraIssue> = issues
+    let mut issues: Vec<Issue> = if config.has_github() {
+        crate::client::github::GitHub::from_env()?
+            .tickets(&config.github_repos(), &[], &[])?
+            .into_values()
+            .filter(|i| !i.closed())
+            .map(|i| Issue {
+                key: i.key,
+                summary: i.summary,
+                description: None,
+            })
+            .collect()
+    } else {
+        config
+            .jira_client()?
+            .search_issues_brief(
+                "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC",
+                50,
+            )
+            .map_err(err)?
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    };
+    if config.has_github() && config.jira.is_some() {
+        issues.extend(
+            config
+                .jira_client()?
+                .search_issues_brief(
+                    "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC",
+                    50,
+                )
+                .map_err(err)?
+                .into_iter()
+                .map(Into::into),
+        );
+    }
+    issues.sort_by(|a, b| a.key.cmp(&b.key));
+    let free: Vec<&Issue> = issues
         .iter()
         .filter(|i| !tasks.iter().any(|t| t.tickets.contains(&i.key)))
         .collect();
     let mut items = vec!["+ new task…".to_string()];
-    items.extend(
-        free.iter()
-            .map(|i| format!("{}  {}", i.key, i.fields.summary)),
-    );
+    items.extend(free.iter().map(|i| format!("{}  {}", i.key, i.summary)));
     match ui.pick("Start", &items)? {
         0 => ui.input("Task name"),
         i => Ok(free[i - 1].key.clone()),

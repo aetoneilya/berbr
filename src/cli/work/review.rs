@@ -1,7 +1,7 @@
 //! `berbr review`: a reviewer agent next to the task's agent.
 
 use super::common::{Terminal, Ui, err, resolve_tree, tree_table};
-use super::launch::live_agents;
+use super::launch::{Space, live_agents, task_agent_args};
 use crate::client::agent::AgentKind;
 use crate::client::herdr;
 use crate::config::Config;
@@ -23,9 +23,11 @@ pub(crate) fn review(config: &Config, name: Option<String>, ui: &mut dyn Ui) -> 
     if !herdr::available() {
         return Err("berbr review needs herdr: run it inside a herdr pane".to_string());
     }
-    // worktrees and agents only: nothing here needs Jira or GitLab
+    // Task context and local work only: nothing here needs fresh Jira/GitLab.
     let table = tree_table(config, false)?;
-    let wt = &table.tree(resolve_tree(&table, name, ui)?).wt;
+    let index = resolve_tree(&table, name, ui)?;
+    let wt = &table.tree(index).wt;
+    let task = super::task::worktree_owner(&table, index)?.map(|row| &row.task);
 
     let task_agent = live_agents().into_iter().find(|a| {
         a.runs_in(&wt.path)
@@ -55,7 +57,19 @@ pub(crate) fn review(config: &Config, name: Option<String>, ui: &mut dyn Ui) -> 
     if let Some(model) = model.as_deref() {
         args.extend(["--model", model]);
     }
-    args.push(REVIEW_PROMPT);
+    let prompt = match task {
+        Some(task) => format!(
+            "{REVIEW_PROMPT} Shared artifacts for this task: {}.",
+            crate::artifacts::directory(&config.name, &task.name).display()
+        ),
+        None => REVIEW_PROMPT.into(),
+    };
+    args.push(&prompt);
+    let space = task
+        .map(|task| Space::Task(task, &config.name))
+        .unwrap_or(Space::Label("review"));
+    let args = task_agent_args(kind, space, &args)?;
+    let args: Vec<_> = args.iter().map(String::as_str).collect();
     herdr::label_role(&pane, "helper").map_err(err)?;
     herdr::start_agent(kind, &reviewer, &pane, &args).map_err(err)?;
 

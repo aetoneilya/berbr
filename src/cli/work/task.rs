@@ -10,9 +10,70 @@ use crate::vault::task::{Task, same_name};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+pub(in crate::cli) fn cli_artifacts(
+    config: &Config,
+    target: Option<&str>,
+    list: bool,
+    directory: Option<&Path>,
+) -> Result<(), String> {
+    // Polling file lists needs identities/bindings, not every task's complete
+    // Agent notes and session history.
+    let (tasks, skipped) = crate::vault::task::load_previews(config);
+    for error in skipped {
+        eprintln!("skipped {error}");
+    }
+    let task = resolve_tool_task(config, target, tasks)?;
+    let root = crate::artifacts::ensure(&config.name, &task.name)?;
+    if list {
+        let directory = directory.unwrap_or_else(|| Path::new(""));
+        let entries = crate::artifacts::list(&root, directory)?;
+        println!(
+            "{}",
+            serde_json::json!({"project":config.name, "task":task.name, "path":root, "directory":directory, "entries":entries})
+        );
+    } else {
+        println!("{}", root.display());
+    }
+    Ok(())
+}
+
 pub(in crate::cli) fn cli_task(config: &Config, command: TaskCommand) -> Result<(), String> {
+    if let TaskCommand::List { json, all } = command {
+        let (mut tasks, skipped) = crate::vault::task::load(config)?;
+        tasks.retain(|task| all || !task.done);
+        tasks.sort_by(|a, b| a.name.cmp(&b.name));
+        let warnings: Vec<_> = skipped
+            .into_iter()
+            .map(|e| format!("skipped {e}"))
+            .collect();
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "version": 1, "project": config.name,
+                    "tasks": tasks.iter().map(|t| serde_json::json!({
+                        "id": t.name, "title": t.title(), "note": t.note.path,
+                        "done": t.done, "tickets": t.tickets, "tags": t.tags,
+                    })).collect::<Vec<_>>(), "warnings": warnings,
+                })
+            );
+        } else {
+            for task in tasks {
+                println!(
+                    "{}{}",
+                    task.display_name(),
+                    if task.done { " [done]" } else { "" }
+                );
+            }
+            for warning in warnings {
+                eprintln!("{warning}");
+            }
+        }
+        return Ok(());
+    }
     let target = match &command {
         TaskCommand::Show { task } | TaskCommand::Update { task, .. } => task.as_deref(),
+        TaskCommand::List { .. } => unreachable!(),
     };
     let mut task = tool_task(config, target)?;
     if let TaskCommand::Update {
@@ -67,12 +128,22 @@ fn update_context(
     if description.is_some_and(|s| s.trim().is_empty()) {
         return Err("description must not be empty".into());
     }
+    // A no-op needs only read access, including in an existing agent whose
+    // sandbox does not grant the shared note directory or write lock.
+    task.note.reload().map_err(err)?;
+    task = Task::from_note(task.note);
+    if !context_changes(&task, title, description, fill_empty) {
+        return Ok(task);
+    }
     let _lock = crate::vault::lock().map_err(err)?;
     let mut saved = false;
     for _ in 0..3 {
         task.note.reload().map_err(err)?;
         // Re-read under the lock, so another agent's first update wins.
         task = Task::from_note(task.note);
+        if !context_changes(&task, title, description, fill_empty) {
+            return Ok(task);
+        }
         if let Some(title) = title
             && (!fill_empty || task.title().is_none())
         {
@@ -97,6 +168,21 @@ fn update_context(
         return Err("task keeps changing, not written".into());
     }
     Ok(task)
+}
+
+fn context_changes(
+    task: &Task,
+    title: Option<&str>,
+    description: Option<&str>,
+    fill_empty: bool,
+) -> bool {
+    let current_title = task.title();
+    title.is_some_and(|title| {
+        (!fill_empty || current_title.is_none()) && current_title.as_deref() != Some(title.trim())
+    }) || description.is_some_and(|description| {
+        let current = task.note.description();
+        (!fill_empty || current.is_empty()) && current != description.trim()
+    })
 }
 
 /// A task started without a title runs in a space, tab and branch named
@@ -218,7 +304,14 @@ pub(in crate::cli) fn cli_rename(
 }
 
 fn tool_task(config: &Config, target: Option<&str>) -> Result<Task, String> {
-    let mut tasks = load(config)?;
+    resolve_tool_task(config, target, load(config)?)
+}
+
+fn resolve_tool_task(
+    config: &Config,
+    target: Option<&str>,
+    mut tasks: Vec<Task>,
+) -> Result<Task, String> {
     if let Some(target) = target {
         let i = find_task(&tasks, target, true)?.ok_or_else(|| format!("no task {target}"))?;
         return Ok(tasks.swap_remove(i));
@@ -238,70 +331,49 @@ fn tool_task(config: &Config, target: Option<&str>) -> Result<Task, String> {
 
 /// Explicit note bindings win over session/ticket/workspace inference for
 /// context tools. Keep this separate from table ownership and close planning.
-fn bound_context_task(table: &table::Table, root: &Path) -> Result<Option<usize>, String> {
-    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let root = canonical(root);
-    let references: Vec<_> = table
+pub(super) fn bound_context_task(
+    table: &table::Table,
+    root: &Path,
+) -> Result<Option<usize>, String> {
+    let tasks: Vec<_> = table.tasks.iter().map(|r| &r.task).collect();
+    let roots: Vec<_> = table.trees.iter().map(|t| t.wt.path.clone()).collect();
+    let (matches, ambiguous_name) = super::context::bound_tasks(&tasks, root, &roots);
+    if ambiguous_name {
+        return Err("ambiguous worktree name; save its full path in the task note or pass the task ID explicitly".into());
+    }
+    match matches.as_slice() {
+        [] => Ok(None),
+        [i] => Ok(Some(*i)),
+        _ => Err(format!(
+            "worktree belongs to several tasks ({}); pass the task ID explicitly",
+            matches
+                .iter()
+                .map(|&i| tasks[i].name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// One active owner for launch actions that inherit a task's space and artifacts.
+/// An explicit worktree binding wins over inferred ticket/session associations.
+pub(super) fn worktree_owner(
+    table: &table::Table,
+    tree: usize,
+) -> Result<Option<&table::TaskRow>, String> {
+    if let Some(index) = bound_context_task(table, &table.tree(tree).wt.path)? {
+        return Ok(Some(&table.tasks[index]));
+    }
+    let owners: Vec<_> = table
         .tasks
         .iter()
-        .map(|row| {
-            row.task
-                .note
-                .strings("worktrees")
-                .into_iter()
-                .chain(row.task.note.strings_at(&["bindings", "worktrees"]))
-                .collect::<Vec<_>>()
-        })
+        .filter(|row| !row.task.done && row.trees.contains(&tree))
         .collect();
-    // Absolute paths carry repository identity; a basename alone does not.
-    for absolute in [true, false] {
-        let mut matches = Vec::new();
-        for (i, row) in table
-            .tasks
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| !row.task.done)
-        {
-            let matches_root = references[i].iter().any(|reference| {
-                let path = Path::new(reference);
-                if absolute {
-                    path.is_absolute() && canonical(path) == root
-                } else {
-                    !path.is_absolute()
-                        && root.file_name().and_then(|n| n.to_str()) == Some(reference)
-                }
-            });
-            if !matches_root {
-                continue;
-            }
-            if !absolute
-                && table
-                    .trees
-                    .iter()
-                    .filter(|tree| tree.wt.path.file_name() == root.file_name())
-                    .count()
-                    > 1
-            {
-                return Err("ambiguous worktree name; save its full path in the task note or pass the task ID explicitly".into());
-            }
-            matches.push((i, row.task.name.as_str()));
-        }
-        match matches.as_slice() {
-            [] => {}
-            [(i, _)] => return Ok(Some(*i)),
-            _ => {
-                return Err(format!(
-                    "worktree belongs to several tasks ({}); pass the task ID explicitly",
-                    matches
-                        .iter()
-                        .map(|(_, name)| *name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-        }
+    match owners.as_slice() {
+        [] => Ok(None),
+        [row] => Ok(Some(row)),
+        _ => Err("worktree belongs to several tasks; cannot choose its shared artifacts".into()),
     }
-    Ok(None)
 }
 
 /// `berbr note "<text>"`: an agent's finding, appended to `## Agent notes` of the
