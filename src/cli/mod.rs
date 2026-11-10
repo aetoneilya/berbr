@@ -113,14 +113,20 @@ enum CliCommands {
     Status(StatusArgs),
     /// Start a reviewer agent next to the task's agent
     Review { name: Option<String> },
-    /// Open a worktree that belongs to no task: a new agent (or a shell) in a
-    /// space named after its branch, filed under the project's space
+    /// Open a worktree: a new agent, a shell, or a specific saved conversation,
+    /// in a space named after its branch, filed under the project's space
     Open {
         /// The worktree's folder
         path: PathBuf,
         /// A shell, no agent
         #[arg(long)]
         shell: bool,
+        /// Resume this exact saved conversation in the worktree.
+        #[arg(long, conflicts_with = "shell")]
+        resume: Option<String>,
+        /// Retain the saved conversation's role when resuming it.
+        #[arg(long, requires = "resume", value_parser = ["primary", "helper"])]
+        role: Option<String>,
     },
     /// Close a task: `berbr done "<task>"` (or a ticket of it) removes its finished
     /// worktrees, closes my tickets in Jira and marks the note done. Use --tree
@@ -394,7 +400,12 @@ pub fn run() -> Result<(), String> {
         CliCommands::Prepare { spec } => work::cli_prepare(&spec),
         CliCommands::Attach { key, task } => work::cli_attach(&config, &key, task),
         CliCommands::Review { name } => work::cli_review(&config, name),
-        CliCommands::Open { path, shell } => work::cli_open(&config, &path, shell),
+        CliCommands::Open {
+            path,
+            shell,
+            resume,
+            role,
+        } => work::cli_open(&config, &path, shell, resume.as_deref(), role.as_deref()),
         CliCommands::Done(args) => work::cli_done(&config, args),
         CliCommands::Completions { shell } => {
             generate(shell, &mut Cli::command(), "berbr", &mut io::stdout());

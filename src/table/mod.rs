@@ -139,6 +139,12 @@ pub struct Agent {
     pub tab: String,
     pub status: AgentStatus,
     pub kind: Option<crate::client::agent::AgentKind>,
+    /// Backend-qualified conversation ID, retained when the terminal closes.
+    pub session: Option<String>,
+    pub session_aliases: Vec<String>,
+    pub created_ms: u64,
+    pub role: Option<String>,
+    pub role_explicit: bool,
     /// The herdr workspace it runs in.
     pub workspace: String,
     /// Unix time its session last wrote to the transcript.
@@ -162,6 +168,34 @@ impl Agent {
                     .session(sessions)
                     .map(|s| crate::client::agent::AgentKind::from_session_key(&s.id))
             }),
+            session: agent
+                .session(sessions)
+                .map(|s| s.id.clone())
+                .or_else(|| Some(agent.kind()?.session_key(agent.session_id()?))),
+            created_ms: agent
+                .extra
+                .get("created_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            session_aliases: agent
+                .extra
+                .get("session_aliases")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|id| Some(agent.kind()?.session_key(id.as_str()?)))
+                .collect(),
+            role: agent
+                .extra
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .filter(|role| matches!(*role, "primary" | "helper"))
+                .map(str::to_owned),
+            role_explicit: agent
+                .extra
+                .get("role_explicit")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
             workspace: agent.workspace_id.clone(),
             active: agent
                 .session(sessions)

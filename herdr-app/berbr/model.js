@@ -22,15 +22,20 @@ export function rowMenu(row, ctx = {}) {
     if (row.task) add("rename", "Rename…");
     if (row.note) add("note", "Open note");
     if (row.title || row.label || row.task) add("copy-title", "Copy title");
+    if (ctx.hasService ?? walk(row.children).some(child => child.kind === "agent" && agentRole(child) === "helper"))
+      add("service-sessions", "Service sessions…");
     if (row.task && !row.done) add("done", "Close task…", {danger:true, separatorBefore:items.length > 0});
   } else if (row.kind === "tree") {
-    if (row.task) add("resume", "Resume agent");
     if (row.task && row.tree) add("new-agent", "New agent");
     const path = row.cwd || treeMarks(row).path;
+    if (path) add("open-shell", "New terminal");
     if (!row.task && path) {
       add("open-agent", "New agent");
-      add("open-shell", "New terminal");
     }
+    if (ctx.hasService ?? walk(row.children).some(child => child.kind === "agent" && agentRole(child) === "helper"))
+      add("service-sessions", "Service sessions…");
+    if (ctx.hasHistory ?? walk(row.children).some(child => child.kind === "agent" && agentRole(child) === "unknown"))
+      add("session-history", "Session history…");
     if (row.task && row.tree) add("review", "Review");
     const mr = ctx.mr ?? row.children?.find(child => child.kind === "mr");
     if (mr?.url) add("mr", "Open MR");
@@ -38,11 +43,15 @@ export function rowMenu(row, ctx = {}) {
     if (row.branch) add("copy-branch", "Copy branch");
     if (row.tree) add("remove-tree", "Remove worktree…", {danger:true, separatorBefore:items.length > 0});
   } else if (row.kind === "agent") {
-    if (ctx.live?.address || row.terminal) {
+    if (ctx.live?.address || (row.terminal && row.state !== "stopped")) {
       add("agent", "Go to agent");
       add("copy-terminal", "Copy terminal address");
       add("stop-agent", "Stop agent…", {danger:true, separatorBefore:true});
     }
+    const tree = ctx.tree;
+    if (row.state === "stopped" && !row.resume_blocked && row.session && (row.cwd || tree?.cwd)) add("resume-agent", "Resume agent");
+    if (tree && (tree.task && tree.tree || tree.cwd)) add("new-agent", "New agent on branch");
+    if (agentIdentity(row, tree) && (row.session || !ctx.live)) add("remove-agent", "Remove from branch…", {danger:true, separatorBefore:items.length > 0});
   } else if (["mr", "ticket"].includes(row.kind)) {
     if (row.url) {
       add("url", row.kind === "mr" ? "Open in GitLab" : "Open in Jira");
@@ -51,6 +60,17 @@ export function rowMenu(row, ctx = {}) {
     if (row.kind === "mr" && row.branch) add("copy-branch", "Copy branch");
   }
   return items;
+}
+
+export function agentRole(row) {
+  if (row?.role === "primary" || row?.role === "helper") return row.role;
+  return row?.terminal ? "primary" : "unknown";
+}
+
+export function agentIdentity(row, tree) {
+  const path = row?.cwd || tree?.cwd || (tree && treeMarks(tree).path);
+  const id = row?.session || row?.terminal;
+  return path && id ? `${path}\n${id}` : null;
 }
 
 export function walk(rows = []) {
@@ -244,14 +264,16 @@ export function focusedTree(rows, cwd) {
 export function treeFocusTarget(tree, liveAgents = [], livePanes = []) {
   const path = String(tree.cwd || treeMarks(tree).path || "").replace(/\/+$/, "");
   const inside = cwd => Boolean(path && cwd && (cwd === path || cwd.startsWith(path + "/")));
-  const linked = new Set(walk(tree.children).filter(row => row.kind === "agent" && row.terminal).map(row => row.terminal));
-  const candidates = liveAgents.filter(agent => linked.has(agent.address) || linked.has(agent.pane) ||
+  const children = walk(tree.children).filter(row => row.kind === "agent" && row.terminal);
+  const helpers = new Set(children.filter(row => agentRole(row) === "helper").map(row => row.terminal));
+  const linked = new Set(children.filter(row => agentRole(row) === "primary").map(row => row.terminal));
+  const candidates = liveAgents.filter(agent => !helpers.has(agent.address) && !helpers.has(agent.pane) && (linked.has(agent.address) || linked.has(agent.pane) ||
     livePanes.some(pane => pane.terminal && [pane.terminal, pane.pane]
-      .some(id => id && [agent.address, agent.pane].includes(id)) && inside(pane.cwd)));
+      .some(id => id && [agent.address, agent.pane].includes(id)) && inside(pane.cwd))));
   const agent = candidates.sort((a, b) => Number(b.status === "working") - Number(a.status === "working") ||
     (b.seq ?? 0) - (a.seq ?? 0))[0];
   if (agent) return {agent:true, terminal:agent.address || agent.pane};
-  const pane = livePanes.filter(pane => pane.terminal && inside(pane.cwd))
+  const pane = livePanes.filter(pane => pane.terminal && !helpers.has(pane.terminal) && !helpers.has(pane.pane) && inside(pane.cwd))
     .sort((a, b) => Number(b.focused) - Number(a.focused))[0];
   return pane ? {agent:false, terminal:pane.terminal, tab:pane.tab} : null;
 }
@@ -261,7 +283,7 @@ export function jumpItems(data, liveAgents = []) {
   const visit = (rows, task = null, parent = null) => {
     for (const row of rows ?? []) {
       const owner = row.kind === "task" ? task ?? row : task;
-      if (["task", "tree", "agent", "ticket", "mr"].includes(row.kind)) {
+      if (["task", "tree", "agent", "ticket", "mr"].includes(row.kind) && (row.kind !== "agent" || agentRole(row) === "primary")) {
         const live = row.kind === "agent" && liveAgents.find(agent => [agent.address, agent.pane].includes(row.terminal));
         const key = `${row.kind}:${row.url || row.terminal || row.id}`;
         if (!seen.has(key)) {
@@ -352,7 +374,7 @@ export function taskDetail(row, liveAgents = [], liveByTerminal = new Map(liveAg
     const live = item.terminal ? liveByTerminal.get(item.terminal) : undefined;
     return { row:item, live, status:live ? live.status : item.state ?? "unknown" };
   };
-  const treeRank = tree => tree.agents.some(agent => agent.live) ? 0
+  const treeRank = tree => tree.agents.some(agent => agent.live && agentRole(agent.row) === "primary") ? 0
     : tree.mr?.state?.toLowerCase() === "opened" ? 1
     : isMergedTree(tree.row) || ["merged", "closed"].includes(tree.mr?.state?.toLowerCase()) ? 3 : 2;
   const treeName = tree => tree.row.label ?? tree.row.tree ?? "";
@@ -416,7 +438,7 @@ function plainParagraph(text) {
 
 export function taskSignals(row, liveAgents = [], liveSpaces = [], related = walk(row.children),
   live = new Map(liveAgents.flatMap(agent => [[agent.address, agent], [agent.pane, agent]])), relatedFor = row => walk(row.children)) {
-  const terminals = new Set(related.filter(item => item.kind === "agent").map(item => item.terminal).filter(Boolean));
+  const terminals = new Set(related.filter(item => item.kind === "agent" && agentRole(item) === "primary").map(item => item.terminal).filter(Boolean));
   const taskAgents = [...new Set([...terminals].map(terminal => live.get(terminal)).filter(Boolean))];
   const working = taskAgents.filter(agent => agent.status === "working").length;
   const attention = taskAgents.some(agent => agent.status === "blocked") ? "blocked"

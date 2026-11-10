@@ -1,8 +1,8 @@
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, v_flex, Input, InputState, Textarea, TextareaState, TextView } from "gpui-base";
-import { appHome, exec, focused, spaces, agents, panes, theme, run, props,
+import { appHome, exec, focused, spaces, agents, panes, terminals, theme, run, props,
   openOverlay, closeOverlay, notify, shared, setShared, nextCommand, hc } from "herdr";
-import { walk, sectionLabels, taskSpace, rowMenu,
+import { walk, sectionLabels, taskSpace, rowMenu, taskDetail, agentIdentity, agentRole,
   normalizeTicketState, ticketTitle,
   cleanCliText, isClosedTicket, newTaskArgs, freeTickets,
   agentActivity, formatElapsed, blockedPrompt, mrPills, focusedTask, focusedTree, treeFocusTarget, jumpItems, matchJump, closePlan, PanelModel, treeMarks, isMergedTree, mergedPlan, backendClosePlan } from "./model.js";
@@ -25,7 +25,7 @@ export default class Berbr extends View {
     this.promptQueue = []; this.promptWorkers = 0;
     this.jumpIndex = 0; this.jumpQuery = "";
     this.menuIndex = 0; this.pickerIndex = 0;
-    if (this.form === "menu") this.menuItems = rowMenu(p.row, {spaces:spaces(), mr:p.mr, live:p.live});
+    if (this.form === "menu") this.menuItems = rowMenu(p.row, {spaces:spaces(), mr:p.mr, live:p.live, tree:p.tree, hasService:p.hasService, hasHistory:p.hasHistory});
     if (this.form === "done") this.closePlan = p.plan ?? closePlan(p.row, spaces());
     if (this.form === "remove-merged") this.bulkPlan = mergedPlan(p.trees);
     this.history = new Set(); this.subtasks = new Set(); this.closedTickets = new Set();
@@ -208,6 +208,7 @@ export default class Berbr extends View {
         setShared("berbr.project", this.project);
         const firstData = !this.data;
         this.data = data; this.contextRow = null; this.error = null;
+        this.rememberAgents(data);
         this.snapshots.set(data.project, data);
         setDebug(data.debug);
         if (firstData) this.focusInitial(data, cx);
@@ -573,8 +574,15 @@ export default class Berbr extends View {
   open(row, cx, action = row?.id) {
     if (!row || this.busy) return;
     if (row.kind === "agent") {
-      run("agent.focus", {terminal:row.terminal});
-      if (props()?.overlay) closeOverlay(props().overlay);
+      const live = this.liveAgent(row);
+      if (live) {
+        run(live.child ? "terminal.peek" : "agent.focus", {terminal:live.address});
+        if (props()?.overlay) closeOverlay(props().overlay);
+      } else if (row.resume_blocked) {
+        this.error = "A running agent may be using this conversation. Close it before resuming."; cx.notify();
+      } else if (row.session && row.cwd) {
+        this.perform(cx, ["open", row.cwd, "--resume", row.session, ...(agentRole(row) === "helper" ? ["--role", "helper"] : [])], {close:true, action});
+      } else { this.error = "Saved conversation is unavailable. Refresh the panel."; cx.notify(); }
     } else if (row.kind === "mr" || row.kind === "ticket") this.openUrl(row.url, cx, action);
     else if (row.kind === "task" || row.kind === "tree") {
       if (!row.task) {
@@ -595,8 +603,8 @@ export default class Berbr extends View {
     const popup = ["projects", "attach-task", "menu"].includes(form);
     openOverlay({ mod:"berbr", kind: popup ? "popup" : "dialog",
       width: ["done", "remove-merged"].includes(form) ? 520 : ["projects", "menu"].includes(form) ? 220 : form === "attach-task" ? 300 : form === "jump" ? 560 : form === "remove-tree" ? 440 : 480,
-      height: ["projects", "attach-task"].includes(form) ? 0.6 : popup ? undefined : form === "jump" ? 0.6 : ["done", "remove-merged"].includes(form) ? 0.75 : form === "new" ? 480 : form === "settings" ? 240 : form === "ticket" ? 420 : form === "remove-tree" ? 360 : 240,
-      modal: ["new", "settings", "rename", "stop-agent", "remove-tree", "done", "remove-merged"].includes(form),
+      height: ["projects", "attach-task"].includes(form) ? 0.6 : popup ? undefined : ["jump", "service-sessions", "session-history"].includes(form) ? 0.6 : ["done", "remove-merged"].includes(form) ? 0.75 : form === "new" ? 480 : form === "settings" ? 240 : form === "ticket" ? 420 : form === "remove-tree" ? 360 : 240,
+      modal: ["new", "settings", "rename", "stop-agent", "remove-tree", "done", "remove-merged", "service-sessions", "session-history"].includes(form),
       ...(popup ? {at:"pointer"} : {}),
       props:{ form, project:this.project, binary:this.binary, agent:shared("berbr.settings")?.agent ?? this.agent,
         ...(form === "new" ? this.newTaskProps() : {}), ...this.actionContext(), ...extra } });
@@ -619,13 +627,16 @@ export default class Berbr extends View {
     if (this.busy) return;
     const row = this.menuTarget(item);
     const mr = item?.mr ?? row?.children?.find(child => child.kind === "mr");
-    const live = row?.terminal && this.liveState().live.get(row.terminal);
-    if (!rowMenu(row, {spaces:spaces(), mr, live}).length) return;
+    const live = this.liveAgent(row);
+    const tree = item?.tree;
+    const hasService = row && ["task", "tree"].includes(row.kind) ? this.serviceEntries(row).length > 0 : false;
+    const hasHistory = row?.kind === "tree" && this.historyEntries(row).length > 0;
+    if (!rowMenu(row, {spaces:spaces(), mr, live, tree, hasService, hasHistory}).length) return;
     // Inline links may represent a row which also appears as a detail item.
     this.selected = this.rows().find(candidate => candidate.id === item.id || candidate.row?.id === row.id)?.id ?? item.id;
     this.contextRow = item;
     this.handle.focus(); cx.notify();
-    this.formOverlay("menu", {row, mr, live, rows:this.data?.rows ?? []});
+    this.formOverlay("menu", {row, mr, live, tree, hasService, hasHistory, rows:this.data?.rows ?? []});
   }
 
   chooseMenu(cx, id = this.menuItems?.[this.menuIndex]?.id) {
@@ -642,7 +653,14 @@ export default class Berbr extends View {
         break;
       }
       case "start": case "resume": this.open(row, cx); break;
-      case "new-agent": this.perform(cx, ["add", row.task, "--in", row.tree], {close:true}); break;
+      case "new-agent": {
+        const tree = row.kind === "tree" ? row : p.tree;
+        if (tree?.task && tree.tree) this.perform(cx, ["add", tree.task, "--in", tree.cwd || tree.tree], {close:true});
+        else if (tree) this.openLoose(tree, false, cx, {close:true});
+        break;
+      }
+      case "service-sessions": form("service-sessions", {row, entries:this.serviceEntries(row)}); break;
+      case "session-history": form("session-history", {row, entries:this.historyEntries(row)}); break;
       case "review": this.perform(cx, ["review", row.tree], {close:true}); break;
       case "open-agent": case "open-shell": this.openLoose(row, id === "open-shell", cx, {close:true}); break;
       case "rename": form("rename", {row, prefill:{title:row.title ?? row.label ?? row.task}}); break;
@@ -650,6 +668,11 @@ export default class Berbr extends View {
       case "done": form("done", {task:row.task, label:row.title ?? row.label, row}); break;
       case "remove-tree": close(); this.removeTree(row, p.mr, p.rows); break;
       case "stop-agent": form("stop-agent", {row, terminal}); break;
+      case "resume-agent": this.open({...row, cwd:row.cwd || p.tree?.cwd}, cx); break;
+      case "remove-agent":
+        if (p.live) form("stop-agent", {row, tree:p.tree, terminal, remove:true});
+        else { this.forgetAgent(row, p.tree); close(); cx.notify(); }
+        break;
       case "agent": this.open({...row, terminal}, cx); break;
       case "url": this.openUrl(row.url, cx, id, {close:true}); break;
       case "mr": this.openUrl(p.mr?.url ?? row.children?.find(child => child.kind === "mr")?.url, cx, id, {close:true}); break;
@@ -690,12 +713,99 @@ export default class Berbr extends View {
       try {
         const result = await hc(["kill", terminal]);
         if (result.code !== 0) throw new Error(result.stderr.trim() || result.stdout.trim() || "Could not stop agent");
+        if (props()?.remove) this.forgetAgent(props().row, props().tree);
         run("berbr.refresh");
         notify({title:"Berbr", body:"Agent stopped", level:"info"});
         if (props()?.overlay) closeOverlay(props().overlay);
       } catch (error) { this.error = String(error.message ?? error); }
       this.busy = false; cx.notify();
     });
+  }
+
+  liveAgent(row) {
+    if (!row?.terminal) return null;
+    const listed = agents().find(agent => [agent.address, agent.pane].includes(row.terminal));
+    if (listed) return listed;
+    const child = terminals().find(term => term.address === row.terminal && term.parent && term.state === "live");
+    return child ? {address:child.address, pane:child.address, child:true,
+      status:child.status === "error" ? "blocked" : child.status, title:child.title || child.name || row.label,
+      program:child.program} : null;
+  }
+
+  agentVisible(row, tree) {
+    if (this.liveAgent(row)) return true;
+    return !(shared("berbr.removedAgents") ?? []).includes(agentIdentity(row, tree));
+  }
+
+  agentGroups(entries, tree) {
+    const groups = {primary:[], helper:[], unknown:[]};
+    for (const entry of entries) if (this.agentVisible(entry.row, tree)) groups[agentRole(entry.row)].push(entry);
+    return groups;
+  }
+
+  serviceEntries(scope) { return this.sessionEntries(scope, "helper"); }
+
+  historyEntries(scope) { return this.sessionEntries(scope, "unknown"); }
+
+  sessionEntries(scope, role) {
+    const entries = [];
+    for (const tree of scope.kind === "tree" ? [scope] : walk(scope.children).filter(row => row.kind === "tree")) {
+      const context = {id:tree.id, task:tree.task, tree:tree.tree, cwd:tree.cwd};
+      for (const row of tree.children ?? []) if (row.kind === "agent" && agentRole(row) === role && this.agentVisible(row, tree))
+        entries.push({row, tree:context});
+    }
+    if (scope.kind !== "tree") for (const row of scope.children ?? [])
+      if (row.kind === "agent" && agentRole(row) === role && this.agentVisible(row)) entries.push({row});
+    return entries;
+  }
+
+  addTreeAgents(add, tree, entries) {
+    const groups = this.agentGroups(entries, tree);
+    groups.primary.forEach(entry => add("agent", `${tree.id}/${entry.row.id}`, {...entry, tree, nested:true},
+      cx => this.open({...entry.row, cwd:entry.row.cwd || tree.cwd}, cx)));
+    return groups.primary.length > 0;
+  }
+
+  forgetAgent(row, tree) {
+    const keys = [row.session, ...(row.session_aliases ?? [])].filter(Boolean)
+      .map(session => agentIdentity({...row, session}, tree));
+    keys.push(agentIdentity(row, tree));
+    setShared("berbr.removedAgents", [...new Set([...(shared("berbr.removedAgents") ?? []), ...keys.filter(Boolean)])]);
+    run("berbr.refresh");
+  }
+
+  rememberAgents(data) {
+    const labels = {...shared("berbr.agentLabels")};
+    const roles = {...shared("berbr.agentRoles")};
+    let changed = false, rolesChanged = false;
+    const revived = new Set();
+    for (const tree of walk(data.rows).filter(row => row.kind === "tree")) {
+      for (const row of (tree.children ?? []).filter(row => row.kind === "agent")) {
+        const key = agentIdentity(row, tree);
+        const live = this.liveAgent(row);
+        // Resuming a service conversation creates a top-level terminal. Keep
+        // the conversation's known role instead of promoting it with its pane.
+        const keys = [key, ...(row.session_aliases ?? []).map(session => agentIdentity({...row, session}, tree))];
+        if (!row.role_explicit && keys.some(alias => roles[alias] === "helper")) row.role = "helper";
+        if (key && ["primary", "helper"].includes(row.role)) {
+          for (const session of [row.session, ...(row.session_aliases ?? [])].filter(Boolean)) {
+            const alias = agentIdentity({...row, session}, tree);
+            if (roles[alias] !== row.role) { roles[alias] = row.role; rolesChanged = true; }
+          }
+          if (roles[key] !== row.role) { roles[key] = row.role; rolesChanged = true; }
+        } else if (key && ["primary", "helper"].includes(roles[key])) row.role = roles[key];
+        if (!key || !live) continue;
+        for (const session of [row.session, ...(row.session_aliases ?? [])].filter(Boolean))
+          revived.add(agentIdentity({...row, session}, tree));
+        revived.add(key);
+        const value = {label:live.title?.trim() || row.label, program:live.program};
+        if (JSON.stringify(labels[key]) !== JSON.stringify(value)) { labels[key] = value; changed = true; }
+      }
+    }
+    if (changed) setShared("berbr.agentLabels", labels);
+    if (rolesChanged) setShared("berbr.agentRoles", roles);
+    const removed = shared("berbr.removedAgents") ?? [];
+    if (removed.some(key => revived.has(key))) setShared("berbr.removedAgents", removed.filter(key => !revived.has(key)));
   }
 
   loadClosePlan(cx) {
@@ -1036,13 +1146,14 @@ export default class Berbr extends View {
         action:action ? cx => action(cx, id) : null});
     };
     for (const [index, tree] of detail.trees.entries()) {
-      add("tree", tree.row.id, {...tree, groupStart:index > 0, hasAgents:tree.agents.length > 0}, (cx, id) => this.navigateTree(tree.row, cx, id));
-      for (const agent of tree.agents) add("agent", `${tree.row.id}/${agent.row.id}`, {...agent, tree:tree.row, nested:true},
-        cx => this.open(agent.row, cx));
+      const groups = this.agentGroups(tree.agents, tree.row);
+      add("tree", tree.row.id, {...tree, groupStart:index > 0, hasAgents:groups.primary.length > 0}, (cx, id) => this.navigateTree(tree.row, cx, id));
+      this.addTreeAgents(add, tree.row, tree.agents);
     }
-    if (detail.mainAgents.length) {
+    const mainAgents = this.agentGroups(detail.mainAgents).primary;
+    if (mainAgents.length) {
       add("main", "header", {label:"Main checkout", groupStart:detail.trees.length > 0, hasAgents:true});
-      for (const agent of detail.mainAgents) add("agent", agent.row.id, {...agent, nested:true}, cx => this.open(agent.row, cx));
+      for (const agent of mainAgents) add("agent", agent.row.id, {...agent, nested:true}, cx => this.open(agent.row, cx));
     }
     for (const mr of detail.openMrs) add("mr", mr.row.id, mr, (cx, id) => this.openUrl(mr.row.url, cx, id));
     for (const [key, label, rows, expanded] of [
@@ -1081,7 +1192,10 @@ export default class Berbr extends View {
     const trees = row.kind === "tree" ? [row] : (row.children ?? []).filter(child => child.kind === "tree");
     for (const tree of trees) {
       const mr = tree.children?.find(child => child.kind === "mr");
-      add("tree", tree.id, {row:tree, mr, loose:true, ticket}, (cx, id) => this.navigateTree(tree, cx, id));
+      const agents = taskDetail({children:[tree]}, [], this.liveState().live).trees[0]?.agents ?? [];
+      const groups = this.agentGroups(agents, tree);
+      add("tree", tree.id, {row:tree, mr, loose:true, ticket, hasAgents:groups.primary.length > 0}, (cx, id) => this.navigateTree(tree, cx, id));
+      this.addTreeAgents(add, tree, agents);
     }
     const mrs = new Map((row.kind === "mr" ? [row] : walk(row.children)).filter(child => child.kind === "mr")
       .map(mr => [mr.url || mr.id || mr, mr]));
@@ -1114,8 +1228,8 @@ export default class Berbr extends View {
     if (marks.quietDays !== null) parts.push([`${compact ? "" : "quiet "}${marks.quietDays}d`, t.dim, `quiet ${marks.quietDays}d`]);
     if (!parts.length) return null;
     return h_flex().min_w(0).gap(6).text_size(11).items_center().tooltip(parts.map(([, , label]) => label).join(" · "))
-      .when(compact, el => el.flex_none())
-      .children(parts.map(([label, tone]) => div().when(compact, el => el.flex_none())
+      .when(compact, el => el.flex_none().max_w("100%").flex_wrap())
+      .children(parts.map(([label, tone]) => div().when(compact, el => el.flex_none().max_w("100%").whitespace_normal())
         .when(!compact, el => el.min_w(0).truncate()).text_color(tone).child(label)));
   }
 
@@ -1131,7 +1245,7 @@ export default class Berbr extends View {
       .when(selected, el => el.bg(t.selected)).hover(el => el.bg(selected ? t.selected : t.hover))
       .when(here, el => el.child(div().absolute().left(0).top(4).bottom(4).w(2).bg(t.accent)
         .tooltip("You are here").accessibility_label("You are here")))
-      .opacity(this.busy && !pending && ![`${item.id}/resume`, `${item.id}/mr`, `${item.id}/ticket`].includes(this.busyAction) ? 0.4 : 1)
+      .opacity(this.busy && !pending && ![`${item.id}/shell`, `${item.id}/mr`, `${item.id}/ticket`].includes(this.busyAction) ? 0.4 : 1)
       .when(Boolean(item.action), el => el.cursor_pointer()
         .on_hover((hovered, cx) => this.hoverRow(item.id, hovered, cx))
         .on_click((_event, cx) => { cx.stop_propagation(); this.taskClick(item, cx); }))
@@ -1140,32 +1254,13 @@ export default class Berbr extends View {
       }));
   }
 
-  treeActions(t, tree, mr, id, {remove = false, suffix = "", loose = false, ticket = null} = {}) {
-    const primaryRemove = !tree.task;
-    const closed = remove || isMergedTree(tree) || [tree.mr_state, mr?.state]
-      .some(state => ["merged", "closed"].includes(state?.toLowerCase()));
-    const action = `${id}/${primaryRemove ? "remove" : "resume"}${suffix ? `/${suffix}` : ""}`;
-    const shown = this.hovered === id || (this.panelFocused() && this.selected === id) ||
-      [action, `${id}/resume`, `${id}/remove`].includes(this.busyAction);
-    const group = buttons => [h_flex().flex_none().gap(6).items_center()
-      .when(!shown, el => el.invisible()).children(buttons)];
-    if (loose && !tree.task) {
-      const buttons = [iconButton(t, `${id}/remove`, "archive", "Remove worktree", () => this.removeTree(tree, mr),
-        {size:20, disabled:this.busy})];
-      for (const [kind, icon, label, shell] of [["shell", "terminal", "New terminal", true], ["agent", "plus", "New agent", false]])
-        buttons.push(iconButton(t, `${id}/${kind}`, icon, label, cx => this.openLoose(tree, shell, cx, {action:`${id}/${kind}`}),
-          {size:20, disabled:this.busy, spinning:this.busy && this.busyAction === `${id}/${kind}`}));
-      if (ticket && !isClosedTicket(ticket) && ticket.target) buttons.push(iconButton(t, `${id}/resume`, "terminal", "Resume agent",
-        cx => this.perform(cx, ["select", ticket.target], {close:true, action:`${id}/resume`}),
-        {size:20, disabled:this.busy, spinning:this.busy && this.busyAction === `${id}/resume`}));
-      return group(buttons);
-    }
-    const buttons = [iconButton(t, action, primaryRemove ? "archive" : "terminal", primaryRemove ? "Remove worktree" : "Resume agent",
-      cx => this.enterTree(tree, mr, cx, action),
-      {size:20, disabled:this.busy, spinning:this.busy && this.busyAction === action})];
-    if (tree.task && closed) buttons.push(iconButton(t, `${id}/remove`, "archive", "Remove worktree",
-      () => this.removeTree(tree, mr), {size:20, disabled:this.busy}));
-    return group(buttons);
+  treeActions(t, tree, mr, id) {
+    const action = `${id}/shell`;
+    const shown = this.hovered === id || (this.panelFocused() && this.selected === id) || this.busyAction === action;
+    return [h_flex().flex_none().items_center().when(!shown, el => el.invisible())
+      .child(iconButton(t, action, "terminal", "Open terminal in worktree",
+        cx => this.openLoose(tree, true, cx, {action}),
+        {size:20, disabled:this.busy || !(tree.cwd || treeMarks(tree).path), spinning:this.busy && this.busyAction === action}))];
   }
 
   externalLink(t, id, row, content = []) {
@@ -1195,17 +1290,24 @@ export default class Berbr extends View {
     const status = item.live && ["working", "blocked", "done", "idle"].includes(item.status) ? item.status : "unknown";
     const treeName = item.tree?.tree ?? item.tree?.label;
     const activity = status === "working" ? this.activity(item.live, treeName) : null;
-    const title = activity ? activity.text : agentActivity(item.live?.title?.trim() || item.row.label || "Agent", null, treeName);
-    const program = item.live?.program;
+    const savedLabel = shared("berbr.agentLabels")?.[agentIdentity(item.row, item.tree)]?.label;
+    const title = activity ? activity.text : agentActivity(item.live?.title?.trim() || savedLabel || item.row.label || "Agent", null, treeName);
+    const saved = shared("berbr.agentLabels")?.[agentIdentity(item.row, item.tree)];
+    const program = item.live?.program ?? saved?.program;
     const mark = program?.icon
       ? program.tint ? svg(program.icon).size(14).text_color(t.muted) : image(program.icon).size(14)
       : icon("terminal", 14).text_color(t.dim);
-    const label = activity ? activity.elapsed : !item.live ? "stopped"
+    const label = activity ? activity.elapsed : !item.live ? item.row.resume_blocked ? "unknown" : "stopped"
       : status === "blocked" ? this.attention(item.live) : status === "done" ? "finished" : "";
-    return line.text_size(12).text_color(item.live ? t.muted : t.dim)
+    return line.text_size(12).text_color(item.live ? t.muted : t.dim).when(!item.live, el => el.opacity(0.55))
       .child(mark.flex_none().tooltip(program?.name || "Terminal").accessibility_label(program?.name || "Terminal"))
       .child(div().flex_1().min_w(0).truncate().tooltip(title).when(Boolean(activity), el => el.text_color(t.muted)).child(title))
       .child(h_flex().min_w(0).max_w("50%").gap(4).items_center().text_size(11)
+        .when(!item.live && !item.row.resume_blocked && Boolean(item.row.session && (item.row.cwd || item.tree?.cwd)), el => el.cursor_pointer()
+          .tooltip("Resume agent").on_click((_event, cx) => {
+            cx.stop_propagation(); this.open({...item.row, cwd:item.row.cwd || item.tree?.cwd}, cx, item.id);
+          }))
+        .when(Boolean(item.row.resume_blocked), el => el.tooltip("A running agent may be using this conversation"))
         .text_color(["blocked", "done"].includes(status) ? t[status] : t.dim)
         .child(activity ? icon("spinner", 11).text_color(t.working).spin(900) : statusMark(t, status))
         .when(Boolean(label), el => el.child(div().min_w(0).truncate().tooltip(label).child(label))));
@@ -1216,30 +1318,31 @@ export default class Berbr extends View {
     const line = this.innerRow(t, item);
     const mark = name => pending ? icon("spinner", 11).text_color(t.dim).spin(900) : icon(name, 12).text_color(t.dim);
     if (item.type === "tree") {
-      if (!treeFocusTarget(item.row, agents(), panes())) line.tooltip("No agent here — use Resume");
-      line.child(mark("git-branch"))
-        .child(div().flex_1().min_w(0).truncate()
+      if (!treeFocusTarget(item.row, agents(), panes())) line.tooltip("No live agent — open a terminal or start an agent from the menu");
+      line.h_auto().min_h(28).child(mark("git-branch").flex_none())
+        .child(div().flex_1().min_w(24).truncate()
           .text_color(isMergedTree(item.row) || ["merged", "closed"].includes(item.mr?.state?.toLowerCase()) ? t.muted : t.foreground)
           .tooltip(item.row.label ?? item.row.tree ?? "Untitled").child(item.row.label ?? item.row.tree ?? "Untitled"));
       const summary = [item.row.branch, item.row.body, item.mr?.label, ...mrPills(item.mr).map(spec => spec.label),
         item.row.diff ? `+${item.row.diff.adds} −${item.row.diff.dels}` : ""].filter(Boolean).join(" · ");
-      const right = h_flex().min_w(0).max_w("35%").gap(6).items_center().overflow_hidden().tooltip(summary);
+      // Keep metadata intact; narrow panels can grow the row instead of cutting off counts or MR status.
+      const right = h_flex().min_w(0).max_w("60%").flex_shrink(1).flex_wrap().gap(6).items_center().tooltip(summary);
       if (item.loose && item.row.branch) right.child(div().flex_1().min_w(0).truncate()
         .text_size(11).text_color(t.dim).tooltip(item.row.branch).child(item.row.branch));
       const state = this.treeState(t, item.row, {compact:true, hideMerged:Boolean(item.mr && !item.loose), hideChanges:!item.loose});
-      if (state) right.child(state.min_w(0).overflow_hidden());
+      if (state) right.child(state);
       if (item.mr && !item.loose) right.child(this.externalLink(t, `${item.id}/mr`, item.mr, [
         div().flex_none().text_size(12).child(item.mr.label?.match(/!\d+/)?.[0] ?? "MR"),
         this.mrState(t, item.mr, false, isMergedTree(item.row) ? "merged"
-          : item.row.mr_state ?? item.mr.state?.toLowerCase()),
-      ]).min_w(0).overflow_hidden());
+          : item.row.mr_state ?? item.mr.state?.toLowerCase()).max_w("100%").flex_wrap(),
+      ]).flex_none().max_w("100%").flex_wrap());
       else if (!item.loose) right.child(div().flex_none().text_size(11).text_color(t.dim).child("no MR"));
       const changes = treeMarks(item.row).changes;
       if (!item.loose && changes) right.child(div().flex_none().size(6).rounded(3).bg(t.working)
         .tooltip(`${changes} uncommitted ${changes === 1 ? "file" : "files"}`)
         .accessibility_label(`${changes} uncommitted ${changes === 1 ? "file" : "files"}`));
       const diff = item.row.diff;
-      if (diff && (diff.adds > 0 || diff.dels > 0)) right.child(h_flex().flex_none().gap(4).text_size(11)
+      if (diff && (diff.adds > 0 || diff.dels > 0)) right.child(h_flex().flex_none().max_w("100%").flex_wrap().gap(4).text_size(11)
         .child(div().flex_none().text_color(t.done ?? t.dim).child(`+${diff.adds}`))
         .child(div().flex_none().text_color(t.blocked ?? t.dim).child(`−${diff.dels}`)));
       line.child(right).children(this.treeActions(t, item.row, item.mr, item.id, {loose:item.loose, ticket:item.ticket}));
@@ -1343,10 +1446,12 @@ export default class Berbr extends View {
       if (item.close) actions.child(div().flex_1());
       const pending = this.busy && this.busyAction === item.id;
       actions.child(this.innerRow(t, item).text_size(12).text_color(item.accent ? t.accent : t.muted)
+        .justify_center().accessibility_label(item.label)
         .hover(el => el.bg(t.hover).text_color(item.close ? t.blocked : t.foreground))
         .when(item.link, el => el.tooltip(item.label).hover(el => el.text_color(t.foreground).underline()))
-        .child(item.label).child(div().size(11).flex_none().when(!pending, el => el.invisible())
-          .child(icon("spinner", 11).text_color(t.dim).when(pending, el => el.spin(900)))));
+        .child(div().when(pending, el => el.invisible()).child(item.label))
+        .when(pending, el => el.child(h_flex().absolute().inset_0().items_center().justify_center()
+          .child(icon("spinner", 11).text_color(t.dim).spin(900)))));
     }
     return actions;
   }

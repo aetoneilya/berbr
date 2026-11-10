@@ -4,7 +4,7 @@ use super::brief::{brief_path, brief_text};
 use super::common::{
     Terminal, Ui, branch_name, err, fetch_issue, find_task, find_worktree, is_ticket_key, work_name,
 };
-use super::launch::{Context, Open, Space, launch, open_agent, open_work};
+use super::launch::{Context, Open, Space, launch, open_agent_with_role, open_work};
 use crate::cli::SelectArgs;
 use crate::cli::load;
 use crate::client::agent::AgentKind;
@@ -234,10 +234,11 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
 
     if !new_session {
         if let Some(agent) = tree.agents.iter().find(|a| {
-            config
-                .workflow
-                .agent_override
-                .is_none_or(|kind| a.kind == Some(kind))
+            a.role.as_deref() != Some("helper")
+                && config
+                    .workflow
+                    .agent_override
+                    .is_none_or(|kind| a.kind == Some(kind))
         }) {
             if !bg {
                 herdr::focus_known(&agent.workspace, &agent.tab, &agent.pane).map_err(err)?;
@@ -266,6 +267,69 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
     )
 }
 
+/// Resume one specific conversation without changing the CLI-wide latest picker.
+pub(super) fn resume_in_tree(
+    config: &Config,
+    path: &Path,
+    id: &str,
+    role: Option<&str>,
+    ui: &mut dyn Ui,
+) -> Result<(), String> {
+    let _operation = herdr::operation();
+    let table = table::build(config, load(config)?, false);
+    let tree_index = table
+        .trees
+        .iter()
+        .position(|tree| tree.wt.path == path)
+        .ok_or_else(|| format!("{} is not a configured worktree", path.display()))?;
+    let task = table
+        .tasks
+        .iter()
+        .find(|row| row.trees.contains(&tree_index));
+    let saved = task
+        .into_iter()
+        .flat_map(|row| row.task.sessions.iter().chain(&row.new_sessions))
+        .find(|session| {
+            session.id == id
+                && session.matches_tree(path)
+                && task.is_some_and(|row| {
+                    row.trees
+                        .iter()
+                        .filter(|&&i| session.matches_tree(&table.tree(i).wt.path))
+                        .count()
+                        == 1
+                })
+        });
+    let transcript = table
+        .sessions
+        .get(id)
+        .filter(|session| crate::cli::app::session_worktree(&table, session) == Some(path));
+    if saved.is_none() && transcript.is_none() {
+        return Err(
+            "This conversation does not belong to the worktree or is no longer available".into(),
+        );
+    }
+    let session = saved.cloned().unwrap_or_else(|| SessionRef {
+        id: id.into(),
+        worktree: path.to_string_lossy().into_owned(),
+        date: transcript.map(|s| s.date.clone()).unwrap_or_default(),
+    });
+    let label = table.tree(tree_index).wt.name();
+    let space = task
+        .map(|row| Space::Task(&row.task))
+        .unwrap_or(Space::Label(&label));
+    resume_with_role(
+        &table,
+        space,
+        &session,
+        path,
+        task.map(|row| row.task.note.path.as_path()),
+        false,
+        role,
+        ui,
+    )
+}
+
 /// Most recently active transcript first; saved date breaks ties or missing files.
 fn newest_first(sessions: &mut [SessionRef], transcripts: &HashMap<String, Session>) {
     let modified = |s: &SessionRef| transcripts.get(&s.id).map(|t| t.modified);
@@ -287,8 +351,33 @@ fn resume(
     bg: bool,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
+    resume_with_role(table, space, session, tree, note, bg, None, ui)
+}
+
+fn resume_with_role(
+    table: &Table,
+    space: Space<'_>,
+    session: &SessionRef,
+    tree: &Path,
+    note: Option<&Path>,
+    bg: bool,
+    role: Option<&str>,
+    ui: &mut dyn Ui,
+) -> Result<(), String> {
     // A session already open in an agent must be focused instead of opened twice:
     // two conversations in one transcript
+    if let Some(terminal) = crate::cli::app::session_terminal(table, &session.id) {
+        if !bg {
+            herdr::focus_agent(&terminal).map_err(err)?;
+        }
+        ui.say(format!("Session already open → {terminal}"));
+        return Ok(());
+    }
+    if crate::cli::app::session_may_be_live(table, &session.id) {
+        return Err(
+            "A running agent may be using this conversation. Close it before resuming.".into(),
+        );
+    }
     if let Some(agent) = herdr::list_agents()
         .unwrap_or_default()
         .into_iter()
@@ -333,13 +422,14 @@ fn resume(
         .unwrap_or_else(|| tree.to_path_buf());
     let args = kind.resume_args(&session.id);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    open_agent(
+    open_agent_with_role(
         kind,
         space,
         &launch_dir,
         session.tree_name(),
         &args,
         !bg,
+        role,
         ui,
     )
 }
@@ -541,6 +631,7 @@ mod tests {
                         first_cwd: None,
                         last_cwd: None,
                         modified: 100 + i as u64,
+                        created_ms: 0,
                     },
                 )
             })
@@ -569,6 +660,7 @@ mod tests {
             first_cwd: None,
             last_cwd: None,
             modified,
+            created_ms: 0,
         };
         let transcripts: HashMap<String, Session> =
             [transcript("morning", 100), transcript("evening", 200)]

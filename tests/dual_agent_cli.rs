@@ -76,6 +76,8 @@ impl Fixture {
         let fake = r#"#!/usr/bin/env python3
 import json, os, sys
 args = sys.argv[1:]
+if args[:2] == ['pane', 'label']:
+    sys.exit(2) # The classic backend does not support pane labels.
 with open(os.environ['BERBR_TEST_CAPTURE'], 'a') as f:
     f.write(json.dumps(args) + '\n')
 result = {'agents': [], 'workspaces': []}
@@ -892,4 +894,32 @@ fn saved_settings_are_visible_to_subsequent_commands_and_drive_new_work() {
     let cleared = settings(&["settings", "--generation-model", ""]);
     assert_eq!(cleared["generation_model"], "");
     assert_eq!(cleared["agent"], "codex");
+}
+
+#[test]
+fn opening_a_saved_agent_resumes_that_exact_session_instead_of_the_latest() {
+    let fixture = Fixture::new("");
+    let tree = fixture.tree();
+    fixture.sessions(&tree, false);
+    fs::write(fixture.root.join("codex/sessions/2026/10/29/rollout-recent.jsonl"),
+        json!({"type":"session_meta","timestamp":"2026-10-30T10:00:00Z","payload":{"id":"recent","cwd":tree,"source":"cli"}}).to_string()+"\n").unwrap();
+    let before = git_snapshot(&fixture.repo);
+    let commands = fixture.run(&["open", tree.to_str().unwrap(), "--resume", "codex:shared"]);
+    assert_eq!(
+        pane_command(&commands),
+        format!("{} 'resume' 'shared'", fixture.codex_prefix())
+    );
+    assert_eq!(git_snapshot(&fixture.repo), before);
+    let output = fixture
+        .command(env!("CARGO_BIN_EXE_berbr"))
+        .args([
+            "open",
+            tree.to_str().unwrap(),
+            "--resume",
+            "codex:unrelated",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not belong"));
 }

@@ -1,7 +1,8 @@
 //! Small hand-built inputs for the matching and view tests: tasks are real
 //! notes in a temp directory, everything else is built in memory.
 
-use super::matching::{Inputs, assemble};
+use super::matching::Inputs;
+pub(crate) use super::matching::assemble;
 use super::{Category, Fresh, Mr, Source, Table, Ticket, Tree};
 use crate::client::gitlab::MergeRequest;
 use crate::client::herdr;

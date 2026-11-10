@@ -27,7 +27,10 @@ pub(crate) fn review(config: &Config, name: Option<String>, ui: &mut dyn Ui) -> 
     let table = tree_table(config, false)?;
     let wt = &table.tree(resolve_tree(&table, name, ui)?).wt;
 
-    let task_agent = live_agents().into_iter().find(|a| a.runs_in(&wt.path));
+    let task_agent = live_agents().into_iter().find(|a| {
+        a.runs_in(&wt.path)
+            && a.extra.get("role").and_then(serde_json::Value::as_str) != Some("helper")
+    });
     let pane = match &task_agent {
         Some(agent) => herdr::split_pane(&agent.pane_id, "down", &wt.path),
         None => {
@@ -53,6 +56,7 @@ pub(crate) fn review(config: &Config, name: Option<String>, ui: &mut dyn Ui) -> 
         args.extend(["--model", model]);
     }
     args.push(REVIEW_PROMPT);
+    herdr::label_role(&pane, "helper").map_err(err)?;
     herdr::start_agent(kind, &reviewer, &pane, &args).map_err(err)?;
 
     ui.say(format!("Started {reviewer} in {}", wt.path.display()));

@@ -225,7 +225,24 @@ ticket requires `--name` for a new worktree or `--in <tree>` to reuse one; an
 existing path requires `--in`. Without Jira, supply `--name` or `--in`.
 With `--in`, the key is optional: `berbr add [<task>] --in <tree>` starts a fresh
 agent briefed from the task without changing its tickets. The panel's worktree
-menu uses this for **New agent**; **Resume agent** continues the last session.
+menu uses this for **New agent**. Primary agents stay below their worktree,
+including dimmed stopped agents; **stopped** resumes that specific session.
+Child agents and explicitly marked reviewers stay out of the normal list,
+attention status and jump search. The worktree menu opens **Service sessions…**
+when they are needed. Their role is based on actual parent/launch metadata and
+remembered locally with the session, never inferred from its name. A remembered
+service role survives resuming in a top-level terminal; the panel passes
+`--role helper` to keep CLI navigation consistent. Older sessions
+whose role is unknown are available from the worktree context menu →
+**Session history…**, keeping the branch list compact.
+The worktree's terminal button opens a shell in its directory. An agent's context
+menu can start a new agent on the branch or remove that conversation from the
+panel, retaining its transcript and worktree. Removing a live agent first confirms
+that its terminal will be stopped. Hidden conversations stay hidden across panel
+reloads; explicitly resuming a hidden conversation brings it back. If a running
+agent's session cannot be identified, an ambiguous saved row shows **unknown**
+and cannot be resumed until that agent closes. `berbr open <path> --resume <session-id>` also resumes one exact conversation,
+using its owning CLI and refusing sessions unrelated to that worktree.
 Without a TTY, `add` never prompts and automatically behaves like `--bg`, keeping
 the caller's focus. It waits for worktree creation and the agent launch request,
 then prints one line with the path, tab and terminal IDs. Errors exit nonzero

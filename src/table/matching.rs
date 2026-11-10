@@ -254,8 +254,13 @@ pub fn assemble(inputs: Inputs) -> Table {
 
 pub(super) fn task_trees(task: &Task, trees: &[Tree], space: Option<&str>) -> Vec<usize> {
     let has_key = |keys: &[String]| keys.iter().any(|k| task.tickets.contains(k));
-    let in_space =
-        |tree: &Tree| space.is_some_and(|s| tree.agents.iter().any(|a| a.workspace == s));
+    let in_space = |tree: &Tree| {
+        space.is_some_and(|s| {
+            tree.agents
+                .iter()
+                .any(|a| a.workspace == s && a.role.as_deref() != Some("helper"))
+        })
+    };
     let from_session = |tree: &Tree| {
         task.sessions
             .iter()
@@ -699,6 +704,31 @@ mod tests {
     }
 
     #[test]
+    fn helper_inherited_space_does_not_reassign_another_tasks_worktree() {
+        let mut input = inputs(
+            vec![
+                task("coordinator", &[]),
+                task_note("owner", "worktrees: [owner]", "2026-10-01"),
+            ],
+            vec![],
+            vec![],
+            vec![tree("owner", "feature")],
+        );
+        input.workspaces = vec![workspace("w1", "coordinator")];
+        let mut helper = agent("helper", "owner", "w1");
+        helper
+            .extra
+            .insert("role".into(), serde_json::json!("helper"));
+        input.agents = vec![helper];
+        let table = assemble(input);
+        assert!(table.task_row("coordinator").trees.is_empty());
+        assert_eq!(
+            table.task_row("owner").trees,
+            vec![table.tree_index("owner")]
+        );
+    }
+
+    #[test]
     fn an_agent_outside_the_worktrees_stays_with_the_task_of_its_workspace() {
         let mut inputs = inputs(
             vec![task("video", &[]), task("a2i", &["DEMO-1"])],
@@ -1025,6 +1055,7 @@ mod tests {
             first_cwd: None,
             last_cwd: None,
             modified: 0,
+            created_ms: 0,
         };
         for s in [
             session("s0", "gone"),
@@ -1068,6 +1099,7 @@ mod tests {
                     first_cwd: None,
                     last_cwd: None,
                     modified: 1,
+                    created_ms: 0,
                 },
             );
             let table = assemble(input);
@@ -1102,6 +1134,7 @@ mod tests {
                 first_cwd: None,
                 last_cwd: None,
                 modified: 0,
+                created_ms: 0,
             },
         );
         let mut table = assemble(inputs);
@@ -1271,6 +1304,7 @@ mod scoped_identity_tests {
                     first_cwd: None,
                     last_cwd: None,
                     modified: 0,
+                    created_ms: 0,
                 },
             );
         }

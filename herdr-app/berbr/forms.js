@@ -425,7 +425,8 @@ function newForm(view, t) {
         .child(div().flex_1())
         .child(cancel(view, t))
         .child(button(t, "create", view.busyAction === "start" && plan.target?.kind === "empty" && view.values.description?.trim() ? "Naming…" : "Create task", cx => view.submitNew(cx), "primary", view.busy, view.busyAction === "start")
-          .child(kbd(t, "⌘↵").px(4).py(2).rounded(4).border_1().border_color(t.border).text_color(t.solid_foreground)))));
+          .child(kbd(t, "⌘↵").px(4).py(2).rounded(4).border_1().border_color(t.border).text_color(t.solid_foreground)
+            .when(view.busyAction === "start", el => el.invisible())))));
 }
 
 function ticketForm(view, t, p) {
@@ -568,13 +569,14 @@ function renameForm(view, t) {
 
 function stopAgentForm(view, t, p) {
   return v_flex().size_full().min_h(0).p(24).gap(12).bg(t.popover).text_color(t.foreground)
-    .child(div().text_size(15).font_semibold().child("Stop agent?"))
+    .child(div().text_size(15).font_semibold().child(p.remove ? "Remove agent from branch?" : "Stop agent?"))
     .child(div().text_size(13).text_color(t.muted).whitespace_normal()
-      .child(`Stops terminal ${p.terminal ?? "unknown"}. Work in progress in this agent will be interrupted.`))
+      .child(p.remove ? "Stops this agent and removes it from this branch’s list. The saved conversation is kept."
+        : `Stops terminal ${p.terminal ?? "unknown"}. Work in progress in this agent will be interrupted.`))
     .when(Boolean(view.error), el => el.child(errorLine(view, t).whitespace_normal()))
     .child(div().flex_1())
     .child(h_flex().gap(8).justify_end().child(cancel(view, t))
-      .child(button(t, "stop-agent", "Stop agent", cx => view.submitStopAgent(cx), "primary", view.busy)));
+      .child(button(t, "stop-agent", p.remove ? "Remove agent" : "Stop agent", cx => view.submitStopAgent(cx), "primary", view.busy)));
 }
 
 // A popup is as tall as its content: a list that only grows (flex_1) gets no
@@ -635,9 +637,27 @@ function attachTaskForm(view, t, p) {
     .child(kbd(t, "↑↓ move · ⏎ attach · esc close"));
 }
 
+function sessionsForm(view, t, p) {
+  const history = view.form === "session-history";
+  const prefix = history ? "history-session" : "service";
+  const entries = (p.entries ?? []).filter(entry => view.agentVisible(entry.row, entry.tree));
+  return v_flex().size_full().min_h(0).p(20).gap(12).bg(t.popover).text_color(t.foreground)
+    .child(h_flex().gap(8).items_center()
+      .child(div().flex_1().text_size(15).font_semibold().child(history ? "Session history" : "Service sessions"))
+      .child(iconButton(t, `${prefix}-close`, "x", "Close", () => closeOverlay(p.overlay))))
+    .child(v_flex().id(`${prefix}-sessions-list`).flex_1().min_h(0).overflow_y_scrollbar()
+      .when(!entries.length, el => el.child(div().text_size(13).text_color(t.dim).child(history ? "No saved sessions" : "No service sessions")))
+      .children(entries.map(entry => {
+        const current = view.liveAgent(entry.row);
+        return view.detailRow(t, {id:`${prefix}/${entry.row.id}`, kind:"detail", type:"agent", ...entry,
+          live:current, status:current?.status ?? "stopped", action:cx => view.open(entry.row, cx)});
+      })));
+}
+
 export function formView(view, t) {
   const p = props() ?? {};
   if (view.form === "menu") return menuForm(view, t);
+  if (["service-sessions", "session-history"].includes(view.form)) return sessionsForm(view, t, p);
   if (view.form === "rename") return renameForm(view, t);
   if (view.form === "stop-agent") return stopAgentForm(view, t, p);
   if (view.form === "note") return noteForm(view, t, p);

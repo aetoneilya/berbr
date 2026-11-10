@@ -119,6 +119,14 @@ pub struct AgentSession {
 }
 
 impl Agent {
+    /// Descendants discovered through hc inherit a place, but do not own it.
+    pub fn occupies_pane(&self) -> bool {
+        self.extra
+            .get("has_pane")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+    }
+
     pub fn session_id(&self) -> Option<&str> {
         self.agent_session.as_ref().map(|s| s.value.as_str())
     }
@@ -162,7 +170,16 @@ impl Agent {
         key: &str,
         sessions: &std::collections::HashMap<String, super::sessions::Session>,
     ) -> bool {
-        if self.session_id() != Some(AgentKind::native_id(key)) {
+        if self.session_id() != Some(AgentKind::native_id(key))
+            && !self
+                .extra
+                .get("session_aliases")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|ids| {
+                    ids.iter()
+                        .any(|id| id.as_str() == Some(AgentKind::native_id(key)))
+                })
+        {
             return false;
         }
         self.kind()
@@ -248,6 +265,14 @@ pub fn space_places() -> Result<Vec<SpacePlace>> {
 /// that runs outside the task's own space.
 pub fn label_task(pane: &str, task: &str) -> Result<()> {
     herdr_output(&["pane", "label", pane, &format!("berbr.task={task}")]).map(|_| ())
+}
+
+pub fn label_role(pane: &str, role: &str) -> Result<()> {
+    // Classic Herdr has no pane labels. Its inventory remains role-unknown.
+    if !app::enabled() {
+        return Ok(());
+    }
+    herdr_output(&["pane", "label", pane, &format!("berbr.role={role}")]).map(|_| ())
 }
 
 /// Shows `pane` of `space`: the space, the pane's tab, then the pane.
@@ -548,6 +573,7 @@ mod tests {
             first_cwd: None,
             last_cwd: None,
             modified: 1,
+            created_ms: 0,
         };
         let sessions = [transcript("same"), transcript("codex:same")]
             .into_iter()

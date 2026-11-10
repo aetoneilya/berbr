@@ -85,12 +85,16 @@ if kind=='herdr-app':
  elif a[:2]==['do','pane.split']: out={'terminal':'t7'}
  else: out={'ok':True}
 else:
- if a[:1]==['get']:
+ if a[:1]==['ls'] and os.environ.get('BERBR_TEST_CHILD_CWD'):
+  out={'terminals':[{'address':'child','parent':'t1','state':'live','agent':'codex','status':'working'}]}
+ elif a[:1]==['get']:
   busy=os.environ.get('BERBR_TEST_BUSY') and a[1]=='t7'
   starting=False
   if os.environ.get('BERBR_TEST_STARTING') and a[1]=='t7':
    count=r/'ready-count'; n=int(count.read_text()) if count.exists() else 0; count.write_text(str(n+1)); starting=n==0
   out={'address':a[1],'cwd':os.environ.get('BERBR_TEST_AGENT_CWD',str(r/'repo')),'foreground':None if starting else {'name':'codex' if busy else 'zsh','cwd':os.environ.get('BERBR_TEST_AGENT_CWD',str(r/'repo'))},'labels':{},'status':'working' if busy else None}
+  if a[1]=='child' and os.environ.get('BERBR_TEST_CHILD_CWD'):
+   out.update({'cwd':os.environ['BERBR_TEST_CHILD_CWD'],'foreground':{'name':'codex','cwd':os.environ['BERBR_TEST_CHILD_CWD']},'parent':'t1'})
  else: out={}
 print(json.dumps(out))
 "#;
@@ -1703,6 +1707,7 @@ print(json.dumps({'spaces':[{'id':'space','name':'test-0','machine':None,'tabs':
 import os,sys,json,time,fcntl
 from pathlib import Path
 root=Path(os.environ['BERBR_TEST_ROOT']); path=root/'detail-pool.json'
+if sys.argv[1]=='ls': print(json.dumps({'terminals':[]})); sys.exit(0)
 def update(delta):
  with path.open('a+') as f:
   fcntl.flock(f,fcntl.LOCK_EX); f.seek(0)
@@ -1855,4 +1860,150 @@ fn migrate_copies_tasks_out_of_the_vault_and_berbr_then_reads_its_own_folder() {
     // a second run copies nothing over what is there
     let out = fixture.command().arg("migrate").output().unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("Copied 0 task(s)"));
+}
+
+#[test]
+fn task_worktree_shell_uses_its_task_space_even_when_the_first_terminal_is_elsewhere() {
+    let f = Fixture::new();
+    let main = f.root.join("repo");
+    let a = main.join(".herdr/worktrees/a");
+    let b = main.join(".herdr/worktrees/b");
+    f.git(
+        &main,
+        &["worktree", "add", "-qb", "branch-a", a.to_str().unwrap()],
+    );
+    f.git(
+        &main,
+        &["worktree", "add", "-qb", "branch-b", b.to_str().unwrap()],
+    );
+    fs::create_dir_all(a.join("src")).unwrap();
+    fs::write(
+        f.root.join("vault/tasks/test-0.md"),
+        format!(
+            "---\nid: test-0\nworktrees: [{:?}, {:?}]\n---\nTask\n",
+            a, b
+        ),
+    )
+    .unwrap();
+    let out = f
+        .command()
+        .env("BERBR_TEST_AGENT_CWD", a.join("src"))
+        .args(["open", b.to_str().unwrap(), "--shell"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = f.calls();
+    let new_tab = calls
+        .iter()
+        .find(|c| c[0] == "herdr-app" && c[1][0] == "do" && c[1][1] == "tab.new")
+        .unwrap();
+    let args: Value = serde_json::from_str(new_tab[1][2].as_str().unwrap()).unwrap();
+    assert_eq!(args["space"], "sp-local");
+    assert_eq!(args["folder"], b.to_string_lossy().as_ref());
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c[0] == "herdr-app" && c[1][1] == "space.new")
+    );
+}
+
+#[test]
+fn removing_worktree_with_a_child_agent_keeps_the_coordinators_tab() {
+    let f = Fixture::new();
+    let repo = f.root.join("repo");
+    let tree = repo.join(".claude/worktrees/work");
+    f.git(
+        &repo,
+        &["worktree", "add", "-qb", "work", tree.to_str().unwrap()],
+    );
+    f.git(&repo, &["update-ref", "refs/remotes/origin/HEAD", "HEAD"]);
+    let out = f
+        .command()
+        .env("BERBR_TEST_CHILD_CWD", &tree)
+        .args(["done", "--tree", "work", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!tree.exists());
+    let calls = f.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c[0] == "hc" && c[1][0] == "get" && c[1][1] == "child")
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c[0] == "herdr-app" && c[1][0] == "do" && c[1][1] == "tab.close")
+    );
+}
+
+#[test]
+fn resuming_service_conversation_labels_it_before_starting_the_agent() {
+    let f = Fixture::new();
+    let repo = f.root.join("repo");
+    let tree = repo.join(".claude/worktrees/work");
+    f.git(
+        &repo,
+        &["worktree", "add", "-qb", "work", tree.to_str().unwrap()],
+    );
+    let sessions = f.root.join("codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("rollout-saved.jsonl"),
+        serde_json::json!({
+            "type":"session_meta", "timestamp":"2026-11-09T10:00:00Z",
+            "payload":{"id":"saved", "cwd":tree, "source":"cli"}
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+    let out = f
+        .command()
+        .args([
+            "open",
+            tree.to_str().unwrap(),
+            "--resume",
+            "codex:saved",
+            "--role",
+            "helper",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = f.calls();
+    let label = calls
+        .iter()
+        .position(|c| {
+            c[0] == "hc"
+                && c[1][0] == "label"
+                && c[1]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|arg| arg == "berbr.role=helper")
+        })
+        .unwrap();
+    let start = calls
+        .iter()
+        .position(|c| {
+            c[0] == "hc"
+                && c[1][0] == "send"
+                && c[1][2].as_str().unwrap_or("").contains("'resume' 'saved'")
+        })
+        .unwrap();
+    assert!(label < start);
 }

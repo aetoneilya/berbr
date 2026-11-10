@@ -1,4 +1,5 @@
 //! Stable, read-only data boundary between the Rust model and the native mod.
+use crate::client::agent::AgentKind;
 use crate::client::gitlab::MrState;
 use crate::config::Config;
 use crate::table::{
@@ -6,6 +7,8 @@ use crate::table::{
     view::{self, Kind, Node},
 };
 use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 pub(super) fn snapshot(projects: &[Config], chosen: usize, cached: bool) -> Result<(), String> {
     let config = &projects[chosen];
@@ -22,7 +25,11 @@ pub(super) fn snapshot(projects: &[Config], chosen: usize, cached: bool) -> Resu
             ..Default::default()
         },
     );
-    let rows: Vec<_> = roots.iter().map(|n| row(&table, n, None)).collect();
+    let stopped = stopped_by_tree(&table);
+    let rows: Vec<_> = roots
+        .iter()
+        .map(|n| row_with_history(&table, n, None, &stopped))
+        .collect();
     println!(
         "{}",
         json!({
@@ -38,7 +45,197 @@ pub(super) fn snapshot(projects: &[Config], chosen: usize, cached: bool) -> Resu
     Ok(())
 }
 
+#[cfg(test)]
 fn row(table: &Table, node: &Node, owner: Option<&str>) -> Value {
+    row_with_history(table, node, owner, &stopped_by_tree(table))
+}
+
+/// Saved conversations outlive their terminals. Index once per snapshot, keeping
+/// each conversation under its most recent worktree and omitting live sessions.
+struct AgentHistory {
+    stopped: HashMap<PathBuf, Vec<Value>>,
+    bindings: HashMap<String, String>,
+    uncertain: HashSet<String>,
+}
+
+fn stopped_by_tree(table: &Table) -> AgentHistory {
+    let mut live: HashSet<_> = table
+        .trees
+        .iter()
+        .flat_map(|t| &t.agents)
+        .chain(table.tasks.iter().flat_map(|t| &t.agents))
+        .flat_map(|a| a.session.iter().chain(&a.session_aliases).cloned())
+        .collect();
+    let mut saved = HashMap::new();
+    for task in &table.tasks {
+        for session in task.task.sessions.iter().chain(&task.new_sessions) {
+            let trees: Vec<_> = task
+                .trees
+                .iter()
+                .map(|&i| table.tree(i))
+                .filter(|tree| session.matches_tree(&tree.wt.path))
+                .collect();
+            if trees.len() == 1 {
+                saved.insert(
+                    session.id.clone(),
+                    (trees[0].wt.path.clone(), session.date.clone(), 0),
+                );
+            }
+        }
+    }
+    for session in table.sessions.values() {
+        let tree = session
+            .last_cwd
+            .iter()
+            .map(String::as_str)
+            .chain(session.cwds.iter().map(|(cwd, _)| cwd.as_str()))
+            .find_map(|cwd| {
+                table
+                    .trees
+                    .iter()
+                    .filter(|t| Path::new(cwd).starts_with(&t.wt.path))
+                    .max_by_key(|t| t.wt.path.components().count())
+            });
+        if let Some(tree) = tree {
+            saved.insert(
+                session.id.clone(),
+                (tree.wt.path.clone(), session.date.clone(), session.modified),
+            );
+        }
+    }
+    let mut saved: Vec<_> = saved
+        .into_iter()
+        .filter(|(id, _)| !live.contains(id.as_str()))
+        .collect();
+    saved.sort_by(|(a, (_, ad, am)), (b, (_, bd, bm))| {
+        bm.cmp(am).then_with(|| bd.cmp(ad)).then_with(|| a.cmp(b))
+    });
+    // A fresh CLI has no reported conversation ID. Match the transcript born
+    // when its terminal started, rather than a newer conversation closed later.
+    // Legacy backends lacking birth times retain select's newest-session rule.
+    let mut bindings = HashMap::new();
+    for tree in &table.trees {
+        let mut unknown: Vec<_> = tree.agents.iter().filter(|a| a.session.is_none()).collect();
+        unknown.sort_by_key(|a| std::cmp::Reverse(a.created_ms));
+        for agent in unknown {
+            let candidates: Vec<_> = saved
+                .iter()
+                .filter(|(id, (path, _, _))| {
+                    path == &tree.wt.path
+                        && Some(AgentKind::from_session_key(id)) == agent.kind
+                        && !live.contains(id)
+                })
+                .collect();
+            let chosen = if agent.created_ms == 0 {
+                candidates.first().copied()
+            } else {
+                candidates
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let birth = table.sessions.get(&entry.0)?.created_ms;
+                        (birth > 0
+                            && birth.saturating_add(2000) >= agent.created_ms
+                            && birth <= agent.created_ms.saturating_add(120_000))
+                        .then_some((entry, birth.abs_diff(agent.created_ms)))
+                    })
+                    .min_by_key(|(_, distance)| *distance)
+                    .map(|(entry, _)| entry)
+            };
+            if let Some((id, _)) = chosen {
+                bindings.insert(agent.pane.clone(), id.clone());
+                live.insert(id.clone());
+            }
+        }
+    }
+    let uncertain: HashSet<_> = saved
+        .iter()
+        .filter(|(id, (path, _, modified))| {
+            !live.contains(id)
+                && table
+                    .trees
+                    .iter()
+                    .filter(|tree| &tree.wt.path == path)
+                    .flat_map(|tree| &tree.agents)
+                    .any(|agent| {
+                        agent.session.is_none()
+                            && !bindings.contains_key(&agent.pane)
+                            && agent.kind == Some(AgentKind::from_session_key(id))
+                            && (agent.created_ms == 0
+                                || modified.saturating_mul(1000).saturating_add(1000)
+                                    >= agent.created_ms)
+                    })
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut result: HashMap<PathBuf, Vec<Value>> = HashMap::new();
+    for (id, (path, date, _)) in saved {
+        if live.contains(&id) {
+            continue;
+        }
+        let kind = AgentKind::from_session_key(&id);
+        let short: String = AgentKind::native_id(&id).chars().take(8).collect();
+        result.entry(path.clone()).or_default().push(json!({
+            "id":format!("session:{}:{id}", path.display()), "kind":"agent",
+            "session":id, "agent":kind, "cwd":path, "state":"stopped", "terminal":null,
+            "resume_blocked":uncertain.contains(&id), "label":format!("{kind} · {date} · {short}")
+        }));
+    }
+    AgentHistory {
+        stopped: result,
+        bindings,
+        uncertain,
+    }
+}
+
+pub(crate) fn session_may_be_live(table: &Table, id: &str) -> bool {
+    stopped_by_tree(table).uncertain.contains(id)
+}
+
+pub(crate) fn session_worktree<'a>(
+    table: &'a Table,
+    session: &crate::client::sessions::Session,
+) -> Option<&'a Path> {
+    session
+        .last_cwd
+        .iter()
+        .map(String::as_str)
+        .chain(session.cwds.iter().map(|(cwd, _)| cwd.as_str()))
+        .find_map(|cwd| {
+            table
+                .trees
+                .iter()
+                .filter(|tree| Path::new(cwd).starts_with(&tree.wt.path))
+                .max_by_key(|tree| tree.wt.path.components().count())
+                .map(|tree| tree.wt.path.as_path())
+        })
+}
+
+pub(crate) fn session_terminal(table: &Table, id: &str) -> Option<String> {
+    table
+        .trees
+        .iter()
+        .flat_map(|tree| &tree.agents)
+        .chain(table.tasks.iter().flat_map(|task| &task.agents))
+        .find(|agent| {
+            agent.session.as_deref() == Some(id)
+                || agent.session_aliases.iter().any(|alias| alias == id)
+        })
+        .map(|agent| agent.pane.clone())
+        .or_else(|| {
+            stopped_by_tree(table)
+                .bindings
+                .into_iter()
+                .find(|(_, session)| session == id)
+                .map(|(terminal, _)| terminal)
+        })
+}
+
+fn row_with_history(
+    table: &Table,
+    node: &Node,
+    owner: Option<&str>,
+    stopped: &AgentHistory,
+) -> Value {
     let mut value = json!({"id": node.id,"task":owner});
     match &node.kind {
         Kind::Task(i) => {
@@ -128,6 +325,11 @@ fn row(table: &Table, node: &Node, owner: Option<&str>) -> Value {
             value["label"] = json!(a.name);
             value["state"] = json!(a.status.as_str());
             value["terminal"] = json!(a.pane);
+            value["session"] = json!(a.session.as_ref().or_else(|| stopped.bindings.get(&a.pane)));
+            value["agent"] = json!(a.kind);
+            value["role"] = json!(a.role);
+            value["role_explicit"] = json!(a.role_explicit);
+            value["session_aliases"] = json!(a.session_aliases);
             value["space"] = json!(a.workspace);
             value["tab"] = json!(a.tab);
         }
@@ -140,7 +342,31 @@ fn row(table: &Table, node: &Node, owner: Option<&str>) -> Value {
         }
     }
     let owner = value["task"].as_str();
-    let children: Vec<_> = node.children.iter().map(|n| row(table, n, owner)).collect();
+    let mut children: Vec<_> = node
+        .children
+        .iter()
+        .map(|n| row_with_history(table, n, owner, stopped))
+        .collect();
+    if let Kind::Tree(i) = node.kind {
+        let path = &table.tree(i).wt.path;
+        children.extend(
+            stopped
+                .stopped
+                .get(path)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .map(|mut row| {
+                    row["task"] = json!(owner);
+                    row
+                }),
+        );
+        for child in &mut children {
+            if child["kind"] == "agent" {
+                child["cwd"] = json!(path);
+            }
+        }
+    }
     value["children"] = json!(children);
     value
 }
@@ -463,5 +689,155 @@ mod tests {
         let tree = row(&table, &roots[1], None);
         assert_eq!(tree["mr_state"], Value::Null);
         assert_eq!(tree["merged"], false);
+    }
+    #[test]
+    fn snapshots_keep_all_closed_sessions_and_exclude_live_rollout_aliases() {
+        use crate::client::{herdr::AgentSession, sessions::Session};
+        use crate::table::fixtures;
+        let mut input = fixtures::inputs(
+            vec![task("task", &["DEMO-1"])],
+            vec![],
+            vec![],
+            vec![tree("a", "DEMO-1-a"), tree("b", "DEMO-1-b")],
+        );
+        for (id, tree, modified) in [
+            ("old", "a", 1),
+            ("new", "a", 2),
+            ("newest", "a", 3),
+            ("fork", "a", 4),
+            ("other", "b", 5),
+        ] {
+            let path = format!("{}/{}", fixtures::ROOT, tree);
+            input.sessions.insert(
+                format!("codex:{id}"),
+                Session {
+                    id: format!("codex:{id}"),
+                    date: "2026-11-09".into(),
+                    cwds: vec![(path.clone(), 1)],
+                    first_cwd: Some(path.clone()),
+                    last_cwd: Some(path),
+                    modified,
+                    created_ms: 0,
+                },
+            );
+        }
+        let mut active = fixtures::agent("active", "a", "space");
+        active.extra.insert("agent".into(), json!("codex"));
+        active
+            .extra
+            .insert("session_aliases".into(), json!(["fork"]));
+        active.agent_session = Some(AgentSession {
+            value: "old".into(),
+        });
+        input.agents.push(active);
+        let table = fixtures::assemble(input);
+        let history = stopped_by_tree(&table);
+        let a = PathBuf::from(format!("{}/a", fixtures::ROOT));
+        let b = PathBuf::from(format!("{}/b", fixtures::ROOT));
+        assert_eq!(
+            history.stopped[&a]
+                .iter()
+                .map(|row| row["session"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["codex:newest", "codex:new"]
+        );
+        assert_eq!(history.stopped[&b][0]["session"], "codex:other");
+        assert_eq!(
+            session_terminal(&table, "codex:fork"),
+            Some("space:active".into())
+        );
+        let roots = view::build(
+            &table,
+            &view::Options {
+                all: true,
+                ..Default::default()
+            },
+        );
+        let value = row(&table, &roots[0], None);
+        let tree = value["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["tree"] == "a")
+            .unwrap();
+        let agents: Vec<_> = tree["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["kind"] == "agent")
+            .collect();
+        assert_eq!(agents.len(), 3);
+        assert!(
+            agents
+                .iter()
+                .all(|r| r["cwd"] == json!(a) && r["task"] == "task")
+        );
+        assert_eq!(agents.iter().filter(|r| r["state"] == "stopped").count(), 2);
+    }
+
+    #[test]
+    fn a_fresh_idle_agent_is_bound_by_birth_not_a_newer_closed_conversation() {
+        use crate::client::sessions::Session;
+        use crate::table::fixtures;
+        let mut input = fixtures::inputs(vec![], vec![], vec![], vec![tree("a", "misc")]);
+        let path = format!("{}/a", fixtures::ROOT);
+        for (id, birth, modified) in [("live", 1100, 1), ("closed", 20_000, 999)] {
+            input.sessions.insert(
+                format!("codex:{id}"),
+                Session {
+                    id: format!("codex:{id}"),
+                    date: "2026-11-09".into(),
+                    cwds: vec![(path.clone(), 1)],
+                    first_cwd: Some(path.clone()),
+                    last_cwd: Some(path.clone()),
+                    modified,
+                    created_ms: birth,
+                },
+            );
+        }
+        let mut active = fixtures::agent("active", "a", "space");
+        active.extra.insert("agent".into(), json!("codex"));
+        active.extra.insert("created_ms".into(), json!(1000));
+        input.agents.push(active);
+        let table = fixtures::assemble(input);
+        let history = stopped_by_tree(&table);
+        assert_eq!(history.bindings["space:active"], "codex:live");
+        assert_eq!(
+            history.stopped[&PathBuf::from(path)][0]["session"],
+            "codex:closed"
+        );
+    }
+    #[test]
+    fn a_delayed_unidentified_session_is_not_safe_to_resume_until_its_agent_closes() {
+        use crate::client::sessions::Session;
+        use crate::table::fixtures;
+        let mut input = fixtures::inputs(vec![], vec![], vec![], vec![tree("a", "misc")]);
+        let path = format!("{}/a", fixtures::ROOT);
+        input.sessions.insert(
+            "conversation".into(),
+            Session {
+                id: "conversation".into(),
+                date: "2026-11-09".into(),
+                cwds: vec![(path.clone(), 1)],
+                first_cwd: Some(path.clone()),
+                last_cwd: Some(path),
+                modified: 300,
+                created_ms: 300_000,
+            },
+        );
+        let mut active = fixtures::agent("active", "a", "space");
+        active.extra.insert("agent".into(), json!("claude"));
+        active.extra.insert("created_ms".into(), json!(1000));
+        input.agents.push(active);
+        let mut table = fixtures::assemble(input);
+        assert_eq!(session_terminal(&table, "conversation"), None);
+        assert!(session_may_be_live(&table, "conversation"));
+        let history = stopped_by_tree(&table);
+        assert_eq!(
+            history.stopped.values().next().unwrap()[0]["resume_blocked"],
+            true
+        );
+        table.trees[0].agents.clear();
+        assert!(!session_may_be_live(&table, "conversation"));
     }
 }

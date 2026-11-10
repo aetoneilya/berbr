@@ -331,6 +331,19 @@ pub(super) fn open_agent(
     focus: bool,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
+    open_agent_with_role(kind, space, cwd, label, agent_args, focus, None, ui)
+}
+
+pub(super) fn open_agent_with_role(
+    kind: AgentKind,
+    space: Space<'_>,
+    cwd: &Path,
+    label: &str,
+    agent_args: &[&str],
+    focus: bool,
+    role: Option<&str>,
+    ui: &mut dyn Ui,
+) -> Result<(), String> {
     let note = match space {
         Space::Task(task) => Some(task.note.path.as_path()),
         Space::Label(_) => None,
@@ -347,12 +360,15 @@ pub(super) fn open_agent(
         return Ok(());
     }
     if let Space::Task(task) = space
-        && open_in_project_space(kind, task, cwd, label, agent_args, focus, ui)?.is_some()
+        && open_in_project_space(kind, task, cwd, label, agent_args, focus, role, ui)?.is_some()
     {
         return Ok(());
     }
     let (tab, pane) = open_tab(space, cwd, label, ui)?;
     let agent = free_agent_name(label);
+    if let Some(role) = role {
+        herdr::label_role(&pane, role).map_err(err)?;
+    }
     herdr::start_agent_with_label(kind, &agent, &pane, label, agent_args).map_err(err)?;
     if focus {
         let _ = herdr::focus_tab(&tab);
@@ -430,6 +446,7 @@ fn open_in_project_space(
     label: &str,
     agent_args: &[&str],
     focus: bool,
+    role: Option<&str>,
     ui: &mut dyn Ui,
 ) -> Result<Option<()>, String> {
     if !herdr::nests_worktree_spaces() {
@@ -450,6 +467,9 @@ fn open_in_project_space(
     };
     let pane = herdr::split_pane(terminal, "right", cwd).map_err(err)?;
     herdr::label_task(&pane, &task.name).map_err(err)?;
+    if let Some(role) = role {
+        herdr::label_role(&pane, role).map_err(err)?;
+    }
     let agent = free_agent_name(label);
     herdr::start_agent_with_label(kind, &agent, &pane, label, agent_args).map_err(err)?;
     if focus {
@@ -480,6 +500,8 @@ pub(in crate::cli) fn cli_open(
     config: &crate::config::Config,
     path: &Path,
     shell: bool,
+    resume: Option<&str>,
+    role: Option<&str>,
 ) -> Result<(), String> {
     let ui: &mut dyn Ui = &mut super::common::Terminal;
     let path = path
@@ -491,6 +513,9 @@ pub(in crate::cli) fn cli_open(
             "{} is not the top of a git worktree",
             path.display()
         ));
+    }
+    if let Some(session) = resume {
+        return super::select::resume_in_tree(config, &path, session, role, ui);
     }
     let main = worktree::main_checkout(&path).map_err(err)?;
     let label = worktree::current_branch(&path).unwrap_or_else(|_| {
@@ -513,6 +538,23 @@ pub(in crate::cli) fn cli_open(
         return Ok(());
     }
     let _operation = herdr::operation();
+    if shell {
+        let table = crate::table::build(config, crate::cli::load(config)?, false);
+        if let Some(task) = table
+            .tasks
+            .iter()
+            .find(|row| row.trees.iter().any(|&i| table.tree(i).wt.path == path))
+        {
+            let (tab, _) = open_tab(Space::Task(&task.task), &path, "shell", ui)?;
+            let _ = herdr::focus_tab(&tab);
+            ui.say(format!(
+                "shell → task \"{}\" ({})",
+                task.task.space_name(),
+                path.display()
+            ));
+            return Ok(());
+        }
+    }
     if let Err(e) = ensure_project_space(&main, &config.name, ui) {
         ui.say(format!("  ! no project space: {e}"));
     }
@@ -646,7 +688,7 @@ pub(super) fn close_herdr_views_outside(
     // a tab in the task's workspace: close the tabs whose agents work in the worktree
     let mut tabs: Vec<String> = live_agents()
         .into_iter()
-        .filter(|a| a.runs_in(path) && Some(a.workspace_id.as_str()) != kept)
+        .filter(|a| a.occupies_pane() && a.runs_in(path) && Some(a.workspace_id.as_str()) != kept)
         .map(|a| a.tab_id)
         .collect();
     tabs.dedup();
