@@ -120,7 +120,7 @@ impl Rows<'_> {
                 root: node.kind.clone(),
                 line: Line::from(dim(format!(
                     "── {} ──────────────────────────────",
-                    section.title()
+                    section.title_for(self.table)
                 ))),
                 parent: None,
                 has_children: false,

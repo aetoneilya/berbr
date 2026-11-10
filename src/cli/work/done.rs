@@ -27,7 +27,7 @@ pub(in crate::cli) fn cli_done(config: &Config, args: DoneArgs) -> Result<(), St
             )
         })?;
         if tasks[i].done {
-            return Err(format!("task \"{name}\" is already done"));
+            return cleanup_closed_task(&tasks[i], args);
         }
         let plan = plan_task_with(config, tasks, name, args.force, args.dry_run)?;
         if args.dry_run {
@@ -48,6 +48,72 @@ pub(in crate::cli) fn cli_done(config: &Config, args: DoneArgs) -> Result<(), St
     done_trees(config, args)
 }
 
+/// Recover only the UI tail of a completed task. Never replay worktree,
+/// ticket, or note mutations after completion, even if new work exists there.
+fn cleanup_closed_task(task: &Task, args: DoneArgs) -> Result<(), String> {
+    let mut plan = DonePlan {
+        kind: "task",
+        name: Some(task.name.clone()),
+        note_done: true,
+        cleanup_only: true,
+        ..Default::default()
+    };
+    if !herdr::available() {
+        plan.blockers
+            .push("Herdr unavailable; cannot inspect remaining task panes".into());
+    } else {
+        match herdr::list_agents_fresh() {
+            Ok(agents) => {
+                plan.close_panes = agents
+                    .iter()
+                    .filter(|a| a.task_label() == Some(task.name.as_str()) && a.occupies_pane())
+                    .map(|a| a.pane_id.clone())
+                    .collect();
+                plan.close_panes.sort();
+                plan.close_panes.dedup();
+                if plan.close_panes.iter().any(String::is_empty) {
+                    plan.blockers
+                        .push("a remaining task agent has no pane ID".into());
+                }
+            }
+            Err(error) => plan
+                .blockers
+                .push(format!("cannot inspect remaining task panes: {error}")),
+        }
+    }
+    plan.steps = plan
+        .close_panes
+        .iter()
+        .map(|pane| format!("close remaining task pane {pane}"))
+        .collect();
+    if args.dry_run {
+        return plan.print(args.json);
+    }
+    if !plan.blockers.is_empty() {
+        return Err(not_finished(&task.name, &plan.blockers));
+    }
+    if !plan.close_panes.is_empty() && !args.yes && !confirm("Close remaining task panes?")? {
+        return Ok(());
+    }
+    for pane in &plan.close_panes {
+        // Labels may have changed while the person reviewed the confirmation.
+        // An absent pane is already cleaned up; a reassigned one is not ours.
+        let agents = herdr::list_agents_fresh().map_err(err)?;
+        let Some(agent) = agents.iter().find(|a| a.pane_id == *pane) else {
+            continue;
+        };
+        if agent.task_label() != Some(task.name.as_str()) || !agent.occupies_pane() {
+            return Err(format!("task pane {pane} was reassigned; cleanup stopped"));
+        }
+        herdr::close_pane(pane).map_err(err)?;
+    }
+    println!(
+        "\"{}\" is already done; remaining tagged panes closed",
+        task.name
+    );
+    Ok(())
+}
+
 fn print(line: String) {
     println!("{line}");
 }
@@ -66,6 +132,8 @@ struct DonePlan {
     leave_tickets: Vec<String>,
     note_done: bool,
     close_space: bool,
+    cleanup_only: bool,
+    close_panes: Vec<String>,
     steps: Vec<String>,
     #[serde(skip)]
     trees: Vec<usize>,
@@ -329,6 +397,7 @@ fn plan_task_table(mut table: Table, row: usize, force: bool) -> Result<TaskPlan
         .iter()
         .chain(table.jira.warning.iter())
         .chain(table.gitlab.warning.iter())
+        .chain(table.github.warning.iter())
     {
         if warning.contains(": ambiguous") && !warning.starts_with(&format!("{}:", task.task.name))
         {
@@ -360,7 +429,11 @@ fn plan_task_table(mut table: Table, row: usize, force: bool) -> Result<TaskPlan
             .collect();
         for &m in task.mrs.iter().filter(|m| !held.contains(m)) {
             if table.mr(m).opened() {
-                blockers.push(format!("MR !{} is open", table.mr(m).mr.iid()));
+                blockers.push(format!(
+                    "{} {} is open",
+                    table.mr(m).mr.kind(),
+                    table.mr(m).mr.number_label()
+                ));
             }
         }
     }
@@ -371,10 +444,14 @@ fn plan_task_table(mut table: Table, row: usize, force: bool) -> Result<TaskPlan
             .iter()
             .chain(&task.found_tickets)
             .filter(|k| {
-                table
-                    .tickets
-                    .get(*k)
-                    .is_some_and(|t| t.mine == mine && !t.closed())
+                table.tickets.get(*k).is_some_and(|t| {
+                    !t.closed()
+                        && if crate::client::issue::github_parts(k).is_some() {
+                            !mine
+                        } else {
+                            t.mine == mine
+                        }
+                })
             })
             .cloned()
             .collect()
@@ -522,7 +599,8 @@ fn finish_task_with(
         problems.push(format!("can't close herdr workspace {space}: {e}"));
     }
     // agents labelled with the task in another space: a task without a worktree
-    // runs as a pane in the project's space, which stays
+    // runs as a pane in the project's space. Leave sibling tabs alone; closing
+    // its last pane may also remove an otherwise empty project space.
     if herdr::available() {
         for agent in row
             .agents
@@ -628,7 +706,11 @@ fn trees_for_done_with(
     } else {
         table::build(config, Vec::new(), true)
     };
-    let warning = table.gitlab.warning.clone();
+    let warning = table
+        .gitlab
+        .warning
+        .clone()
+        .or_else(|| table.github.warning.clone());
     if !read_only && let Some(blocker) = tree_data_blocker(&table, force) {
         return Err(blocker);
     }
@@ -636,13 +718,11 @@ fn trees_for_done_with(
 }
 
 fn tree_data_blocker(table: &Table, force: bool) -> Option<String> {
-    table
-        .gitlab
-        .warning
-        .as_ref()
-        .filter(|_| !force && table.gitlab.fresh == Fresh::Missing)
+    [&table.gitlab, &table.github].into_iter()
+        .find(|s| !force && s.fresh == Fresh::Missing && s.warning.is_some())
+        .and_then(|s| s.warning.as_ref())
         .map(|warning| {
-            format!("{warning} — not removing worktrees on partial data; restore GitLab access and retry")
+            format!("{warning} — not removing worktrees on partial data; restore remote access and retry")
         })
 }
 
@@ -734,13 +814,13 @@ fn held(table: &Table, tree: &Tree) -> Vec<String> {
     let mut blockers = Vec::new();
     match (mr_of(table, tree), tree.unpushed) {
         (Some(mr), _) if mr.state() == MrState::Opened => {
-            blockers.push(format!("{wt}: MR !{} is open", mr.iid()))
+            blockers.push(format!("{wt}: {} {} is open", mr.kind(), mr.number_label()))
         }
         // git could not tell: they may be the only copy, MR or not
         (_, None) => blockers.push(format!("{wt}: unpushed commits unknown")),
-        (Some(mr), Some(n)) if !branch_finished(mr, n, tree.head.as_deref()) => {
-            blockers.push(format!("{wt}: commits after MR !{}", mr.iid()))
-        }
+        (Some(mr), Some(n)) if !branch_finished(mr, n, tree.head.as_deref()) => blockers.push(
+            format!("{wt}: commits after {} {}", mr.kind(), mr.number_label()),
+        ),
         (None, Some(n)) if n > 0 => blockers.push(format!("{wt}: unpushed commits and no MR")),
         _ => {}
     }
@@ -860,8 +940,13 @@ pub(crate) fn attach(
     task: Option<String>,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
+    let key = config.issue_key(key)?;
+    let key = key.as_str();
     if !is_ticket_key(key) {
         return Err(format!("\"{key}\" is not a ticket key"));
+    }
+    if crate::client::issue::github_parts(key).is_some() {
+        super::common::fetch_issue(config, key)?;
     }
     let tasks = load(config)?;
     if let Some(i) = find_task(&tasks, key, false)? {
@@ -1142,6 +1227,7 @@ mod regressions {
             name: "demo".into(),
             jira: None,
             gitlab: None,
+            github: None,
             workflow: Default::default(),
             vault: crate::config::VaultConfig {
                 path: temp_dir(),

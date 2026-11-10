@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "berbr", author, version, long_about = None)]
-/// Tasks, Jira tickets, merge requests and worktrees in one table
+/// Tasks, GitHub Issues/PRs, Jira tickets, merge requests and worktrees in one table
 pub struct Cli {
     /// The project; default: the one the current directory is in, else the first
     #[arg(long, short = 'p', global = true)]
@@ -36,12 +36,24 @@ enum CliCommands {
         repo: PathBuf,
         #[arg(long)]
         name: Option<String>,
+        /// Connect GitHub.com using this checkout's origin remote (authenticate with gh).
+        #[arg(long)]
+        github: bool,
     },
     /// Check setup and installed dependencies without changing anything.
     Doctor {},
+    /// Resolve local project/task/worktree context without network or cache writes.
+    /// Unresolved or ambiguous context is reported with candidates, never guessed.
+    Context {
+        #[arg(long)]
+        json: bool,
+        /// Explicit task ID or title within the selected project
+        #[arg(long)]
+        task: Option<String>,
+    },
     /// Read-only JSON board for the native Herdr App mod.
     AppSnapshot {
-        /// Read cached Jira/GitLab data without network calls.
+        /// Read cached GitHub/Jira/GitLab data without network calls.
         #[arg(long)]
         cached: bool,
     },
@@ -78,7 +90,7 @@ enum CliCommands {
     Start(StartArgs),
     /// Open a worktree tab and a new agent in the task's Herdr space. Use --name
     /// for another branch of a ticket already in the task, or --in for a fresh
-    /// agent in an existing worktree (KEY is optional with --in). Without a TTY, never
+    /// agent in an existing worktree. KEY is optional with --name or --in. Without a TTY, never
     /// prompts or focuses the new tab; success prints its path, tab and terminal.
     Add(AddArgs),
     /// Put a ticket into a task without starting work on it (no worktree)
@@ -118,19 +130,36 @@ enum CliCommands {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    /// Print the shared artifact folder of a task, creating it when missing.
+    /// Any files and directories are allowed; --list emits one level as JSON.
+    Artifacts {
+        /// Defaults to the current worktree/workspace's task
+        task: Option<String>,
+        #[arg(long)]
+        list: bool,
+        /// Relative subdirectory to list
+        #[arg(long, requires = "list")]
+        directory: Option<PathBuf>,
+    },
     /// Tasks with their tickets, merge requests, worktrees and agents; then work
     /// that belongs to no task. Updates `state` and `sessions` in task notes.
     Status(StatusArgs),
     /// Start a reviewer agent next to the task's agent
     Review { name: Option<String> },
-    /// Open a worktree that belongs to no task: a new agent (or a shell) in a
-    /// space named after its branch, filed under the project's space
+    /// Open a worktree: a new agent, a shell, or a specific saved conversation,
+    /// in a space named after its branch, filed under the project's space
     Open {
         /// The worktree's folder
         path: PathBuf,
         /// A shell, no agent
         #[arg(long)]
         shell: bool,
+        /// Resume this exact saved conversation in the worktree.
+        #[arg(long, conflicts_with = "shell")]
+        resume: Option<String>,
+        /// Retain the saved conversation's role when resuming it.
+        #[arg(long, requires = "resume", value_parser = ["primary", "helper"])]
+        role: Option<String>,
     },
     /// Close a task: `berbr done "<task>"` (or a ticket of it) removes its finished
     /// worktrees, closes my tickets in Jira and marks the note done. Use --tree
@@ -208,6 +237,14 @@ pub(crate) struct StartArgs {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum TaskCommand {
+    /// List local task IDs/titles without network, cache or task-note writes
+    List {
+        #[arg(long)]
+        json: bool,
+        /// Include closed tasks
+        #[arg(long, short = 'a')]
+        all: bool,
+    },
     /// Show the task as JSON; accepts its stable ID or title
     Show { task: Option<String> },
     /// Update only the supplied fields, preserving the rest of the note
@@ -228,10 +265,10 @@ pub(crate) enum TaskCommand {
 
 #[derive(Args, Debug, Default)]
 pub(crate) struct AddArgs {
-    /// [<task>] [<KEY>]; task defaults to the current worktree/space; KEY is optional only with --in
+    /// [<task>] [<KEY>]; task defaults to the current worktree/space; omit KEY with --name or --in
     #[arg(num_args = 0..=2)]
     pub(crate) args: Vec<String>,
-    /// Run the agent in this existing worktree of the task (stacked MRs)
+    /// Run another agent on the same branch in this existing task worktree
     #[arg(long = "in", conflicts_with = "name")]
     pub(crate) in_tree: Option<String>,
     /// New worktree, branch suffix, tab and agent name; required for an existing key
@@ -330,11 +367,17 @@ pub fn run() -> Result<(), String> {
         std::env::set_current_dir(&dir)
             .map_err(|e| format!("can't enter {}: {e}", dir.display()))?;
     }
-    if let Some(CliCommands::Init { repo, ref name }) = cli.command {
+    if let Some(CliCommands::Init {
+        repo,
+        ref name,
+        github,
+    }) = cli.command
+    {
         let project = crate::config::initialize(
             &repo,
             name.as_deref(),
             cli.agent.unwrap_or(AgentKind::Codex),
+            github,
         )?;
         println!(
             "{}",
@@ -416,6 +459,9 @@ pub fn run() -> Result<(), String> {
         }
         Some(command) => command,
     };
+    if let CliCommands::Context { json, task } = command {
+        return work::cli_context(&projects, cli.project.as_deref(), task.as_deref(), json);
+    }
     let chosen = choose_project(&projects, cli.project.as_deref(), cwd.as_deref())?;
     if let CliCommands::AppSnapshot { cached } = command {
         let _operation = crate::client::herdr::operation();
@@ -425,6 +471,7 @@ pub fn run() -> Result<(), String> {
     let _operation = crate::client::herdr::operation();
     match command {
         CliCommands::Init { .. } | CliCommands::Doctor {} => unreachable!(),
+        CliCommands::Context { .. } => unreachable!(),
         CliCommands::AppSnapshot { .. } => unreachable!(),
         CliCommands::Settings { .. } => unreachable!(),
         CliCommands::Status(args) => table::cli_status(&config, args),
@@ -434,10 +481,20 @@ pub fn run() -> Result<(), String> {
         CliCommands::Note { task, text } => work::cli_note(&config, task, text),
         CliCommands::Rename { args, tab } => work::cli_rename(&config, args, tab),
         CliCommands::Task { command } => work::cli_task(&config, command),
+        CliCommands::Artifacts {
+            task,
+            list,
+            directory,
+        } => work::cli_artifacts(&config, task.as_deref(), list, directory.as_deref()),
         CliCommands::Prepare { spec } => work::cli_prepare(&spec),
         CliCommands::Attach { key, task } => work::cli_attach(&config, &key, task),
         CliCommands::Review { name } => work::cli_review(&config, name),
-        CliCommands::Open { path, shell } => work::cli_open(&config, &path, shell),
+        CliCommands::Open {
+            path,
+            shell,
+            resume,
+            role,
+        } => work::cli_open(&config, &path, shell, resume.as_deref(), role.as_deref()),
         CliCommands::Done(args) => work::cli_done(&config, args),
         CliCommands::Completions { shell } => {
             generate(shell, &mut Cli::command(), "berbr", &mut io::stdout());
@@ -469,12 +526,14 @@ fn changes(command: &CliCommands) -> bool {
         | CliCommands::Prepare { .. }
         | CliCommands::Note { .. }
         | CliCommands::Rename { .. }
-        | CliCommands::Task { .. }
+        | CliCommands::Artifacts { .. }
         | CliCommands::Review { .. }
         | CliCommands::Open { .. } => true,
         CliCommands::Done(args) => !args.dry_run,
+        CliCommands::Task { command } => matches!(command, TaskCommand::Update { .. }),
         CliCommands::Migrate { dry_run } => !dry_run,
-        CliCommands::AppSnapshot { .. }
+        CliCommands::Context { .. }
+        | CliCommands::AppSnapshot { .. }
         | CliCommands::PluginOpen
         | CliCommands::PluginMetadataStart
         | CliCommands::PluginMetadata { .. }

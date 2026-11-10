@@ -87,3 +87,15 @@ class Distribution(unittest.TestCase):
             self.assertEqual((gallery/'LICENSE').read_text(),'MIT License')
             with self.assertRaises(ValueError):
                 packager.package(None,'aarch64-apple-darwin','v0.2.0-preview.1',output,True)
+
+    def test_checked_in_gallery_matches_the_current_source_build(self):
+        actual = packager.ROOT/'gallery/berbr'
+        if not actual.is_dir():
+            self.skipTest('No checked-in gallery yet')
+        version = json.loads((actual/'release.json').read_text())['version']
+        generated = packager.package(None,'aarch64-apple-darwin',version,self.root/'verify',True)
+        expected = {p.relative_to(generated):p.read_bytes() for p in generated.rglob('*') if p.is_file()}
+        published = {p.relative_to(actual):p.read_bytes() for p in actual.rglob('*') if p.is_file()}
+        self.assertEqual(published.keys(),expected.keys(),'Regenerate gallery/berbr before publishing')
+        for path, contents in expected.items():
+            self.assertEqual(published[path],contents,f'Outdated gallery file: {path}')

@@ -62,13 +62,16 @@ fn tokens(table: &Table, row: Option<&TaskRow>, keys: &[String], mrs: &[usize]) 
     out.insert(
         "wt_mr".into(),
         mrs.iter()
-            .map(|m| format!("!{}", m.mr.iid()))
+            .map(|m| m.mr.number_label())
             .collect::<Vec<_>>()
             .join(" "),
     );
     out.insert("wt_ci".into(), pipeline(&mrs).into());
     out.insert("wt_review".into(), attention(&mrs));
-    if table.jira.fresh == Fresh::Cached || table.gitlab.fresh == Fresh::Cached {
+    if table.jira.fresh == Fresh::Cached
+        || table.gitlab.fresh == Fresh::Cached
+        || table.github.fresh == Fresh::Cached
+    {
         out.insert("wt_fresh".into(), "cached".into());
     }
     out
@@ -107,6 +110,9 @@ fn attention(mrs: &[&Mr]) -> String {
     }
     if has("need_rebase") {
         parts.push("↻ нужен rebase".to_string());
+    }
+    if has("changes_requested") {
+        parts.push("changes requested".into());
     }
     let threads: usize = mrs
         .iter()

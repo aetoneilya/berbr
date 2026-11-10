@@ -1,16 +1,27 @@
 name: macOS preview
 on:
+  pull_request:
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      version:
+        description: Release version (defaults to Cargo package version)
+        required: false
+        type: string
   release:
     types: [published]
 permissions:
   contents: read
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -19,17 +30,22 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Test
         run: |
           env -u BERBR_BACKEND cargo test --locked
           node --test --test-concurrency=1 herdr-app/berbr/tests/*.test.mjs
           python3 -m unittest discover -s scripts/tests
+          python3 -m unittest discover -s tests -p 'test*.py'
       - name: Build and package
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.version }}
         run: |
           cargo build --release --locked --target '${{ matrix.target }}'
-          version="${RELEASE_TAG:-preview-${GITHUB_SHA::8}}"
+          package_version="$(python3 -c 'import tomllib; print("v" + tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          version="${RELEASE_TAG:-$package_version}"
           python3 scripts/package-herdr-app.py --binary 'target/${{ matrix.target }}/release/berbr' --target '${{ matrix.target }}' --version "$version"
           python3 scripts/package-herdr-app.py --gallery --version "$version"
       - uses: actions/upload-artifact@v4

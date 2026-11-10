@@ -97,8 +97,10 @@ pub(super) fn from_description(
     let output = child.wait_with_output().map_err(err)?;
     if !output.status.success() {
         return Err(format!(
-            "can't generate a task name: {}; enter a name to continue",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "can't generate a task name ({}; {}): {}; enter a name to continue",
+            workflow.generation_agent.binary(),
+            output.status,
+            failure_detail(&output.stdout, &output.stderr)
         ));
     }
     match workflow.generation_agent {
@@ -119,9 +121,53 @@ fn parse(output: &[u8]) -> Result<Names, String> {
     let result: serde_json::Value = serde_json::from_slice(output)
         .map_err(|e| format!("can't read the generated task name: {e}"))?;
     if result.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
-        return Err("the agent could not generate a task name; enter a name to continue".into());
+        return Err(format!(
+            "the naming agent failed: {}; enter a name to continue",
+            failure_detail(output, &[])
+        ));
     }
     parse_names(result.get("structured_output").cloned().unwrap_or_default())
+}
+
+/// Some CLIs report failures as a JSON result on stdout, leaving stderr empty.
+/// Extract error fields rather than printing the whole result envelope.
+fn failure_detail(stdout: &[u8], stderr: &[u8]) -> String {
+    let structured = serde_json::from_slice::<serde_json::Value>(stdout).ok();
+    let detail = structured.as_ref().and_then(|value| {
+        [
+            value.get("result"),
+            value.get("message"),
+            value.get("error"),
+            value.pointer("/error/message"),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .find(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            value.get("errors")?.as_array().map(|errors| {
+                errors
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+        })
+    });
+    let stderr = String::from_utf8_lossy(stderr);
+    let stdout = String::from_utf8_lossy(stdout);
+    let detail = detail
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| (!stderr.trim().is_empty()).then_some(stderr.trim()))
+        .or_else(|| (structured.is_none() && !stdout.trim().is_empty()).then_some(stdout.trim()))
+        .unwrap_or("no diagnostic output was captured");
+    let mut bounded: String = detail.trim().chars().take(2000).collect();
+    if detail.trim().chars().count() > 2000 {
+        bounded.push('…');
+    }
+    bounded
 }
 
 fn parse_names(result: serde_json::Value) -> Result<Names, String> {
@@ -166,6 +212,28 @@ mod tests {
             });
             assert!(parse(&serde_json::to_vec(&output).unwrap()).is_err());
         }
+    }
+
+    #[test]
+    fn failure_details_extract_error_envelopes_and_bound_plain_output() {
+        for output in [
+            r#"{"is_error":true,"errors":["account unavailable","retry later"],"prompt":"unrelated"}"#,
+            r#"{"error":{"message":"account unavailable; retry later"},"prompt":"unrelated"}"#,
+        ] {
+            assert_eq!(
+                failure_detail(output.as_bytes(), &[]),
+                "account unavailable; retry later"
+            );
+        }
+        assert_eq!(failure_detail(b"{}", b"specific stderr"), "specific stderr");
+        assert_eq!(
+            failure_detail(b"{}", &[]),
+            "no diagnostic output was captured"
+        );
+        let long = "я".repeat(2001);
+        let detail = failure_detail(long.as_bytes(), &[]);
+        assert_eq!(detail.chars().count(), 2001);
+        assert!(detail.ends_with('…'));
     }
 
     #[test]

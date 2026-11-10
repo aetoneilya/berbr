@@ -1,10 +1,24 @@
 //! The agent's brief and first prompt.
 
 use super::common::err;
-use crate::client::jira::JiraIssue;
+use crate::client::issue::Issue;
 use crate::client::worktree;
 use crate::vault::task::Task;
 use std::path::{Path, PathBuf};
+
+const TASK_NOTE_PREFIX: &str =
+    "The task note is the shared context for all of the task's tickets — read it in full: ";
+
+/// A checkout can be reassigned while its old brief is still on disk.
+pub(super) fn belongs_to_task(path: &Path, task: &Task) -> bool {
+    let Some(note) = task.note.path.to_str() else {
+        return false;
+    };
+    std::fs::read_to_string(path).ok().is_some_and(|text| {
+        text.lines()
+            .any(|line| line.strip_prefix(TASK_NOTE_PREFIX) == Some(note))
+    })
+}
 
 const DONE_DEFINITION: &str = "\
 If you change code, you are done when:
@@ -43,38 +57,36 @@ pub(super) fn agent_prompt(
 
 /// The agent's brief: task note, ticket text, what to do, definition of done.
 pub(super) fn brief_text(
+    project: &str,
     tree: &Path,
     branch: &str,
     task: Option<&Task>,
-    issue: Option<&JiraIssue>,
+    issue: Option<&Issue>,
     task_tickets: &[String],
     message: Option<&str>,
 ) -> String {
     let mut brief = String::new();
     match (task, issue) {
         (Some(task), _) => brief.push_str(&format!("# {}\n\n", task.display_name())),
-        (None, Some(issue)) => {
-            brief.push_str(&format!("# {}: {}\n\n", issue.key, issue.fields.summary))
-        }
+        (None, Some(issue)) => brief.push_str(&format!("# {}: {}\n\n", issue.key, issue.summary)),
         (None, None) => {}
     }
     if let Some(task) = task {
-        brief.push_str(&format!(
-            "The task note is the shared context for all of the task's tickets — read it in full: {}\n",
-            task.note.path.display()
-        ));
+        brief.push_str(&format!("{TASK_NOTE_PREFIX}{}\n", task.note.path.display()));
     }
     brief.push_str(&format!(
         "You work in the worktree {}, branch {branch}.\n",
         tree.display()
     ));
     if let Some(issue) = issue {
+        if let Some(url) = crate::client::issue::url(&issue.key) {
+            brief.push_str(&format!("\nIssue: {url}\n"));
+        }
         brief.push_str(&format!(
             "\n## {}: {}\n\n{}\n",
             issue.key,
-            issue.fields.summary,
+            issue.summary,
             issue
-                .fields
                 .description
                 .as_deref()
                 .unwrap_or("(no description)")
@@ -98,37 +110,49 @@ pub(super) fn brief_text(
         (None, None) => "See the task note.",
     };
     brief.push_str(&format!("\n## What is needed\n\n{todo}\n"));
-    if task.is_some() {
-        brief.push_str(
-            "\n## Findings\n\nRecord decisions and non-obvious findings — not progress — with \
-             `berbr note \"<text>\"` from the worktree: it goes to the \"Agent notes\" section of \
-             the task note, which agents on the task's other tickets read.\n",
-        );
-    }
     if let Some(task) = task {
+        brief.push_str(&format!(
+            "\n## Shared artifacts\n\nAll agents of this task share this folder: {}\n\
+             Put plans, pages, data, scripts and other useful files or directories here. \
+             Its contents appear in the task's Artifacts list in Berbr. \
+             Use descriptive names, inspect existing files before editing, and preserve other agents' changes. \
+             These files survive worktree removal and task closing. \
+             Use `berbr artifacts` to get the path from this worktree; outside it, use `berbr -p {} artifacts {}`.\n",
+            crate::artifacts::directory(project, &task.name).display(),
+            crate::client::herdr::shell_quote(project),
+            crate::client::herdr::shell_quote(&task.name),
+        ));
         let id = crate::client::herdr::shell_quote(&task.name);
-        let command = task
-            .note
-            .string("project")
-            .map(|project| {
-                format!(
-                    "berbr -p {} task",
-                    crate::client::herdr::shell_quote(&project)
-                )
-            })
-            .unwrap_or_else(|| "berbr task".into());
+        let command = format!("berbr -p {}", crate::client::herdr::shell_quote(project));
+        brief.push_str(&format!(
+            "\n## Findings\n\nRecord decisions and non-obvious findings — not progress — with \
+             `{command} note --task {id} '<finding>'`: it appends to Agent notes without replacing \
+             requirements. Keep this explicit project/task when working from another checkout.\n"
+        ));
         brief.push_str(&format!(
             "\n## Task tools\n\nThe stable task ID is {id}; its title is separate from its identity. \
              After the first substantive user message (not the startup context prompt), \
-             record a concise task description and, if absent, a title in that message's language. \
-             Do this before implementation, even when you need to agree on a plan first. \
-             Use `{command} show {id}` to inspect it, then \
-             `{command} update {id} --fill-empty --title '<concise title>' --description '<task description>'`. \
+             use `{command} task show {id}` to inspect it. \
+             Before implementation, fill only a missing title or description in that message's language \
+             with `{command} task update {id} --fill-empty --title '<concise title>' --description '<task description>'`. \
+             If both fields are populated, skip the update; do not replace the existing task with a generic follow-up request. \
              For multiline text use `--description-file <UTF-8 file>` or `--description-file -` (stdin). \
              Fill missing fields only; preserve user-supplied titles, description and agent findings. \
              Use the tools to update the note; keep its file, workspace, branch and worktree names stable.\n"
         ));
-        brief.push_str(&format!("For findings outside a recognised worktree/workspace, use `berbr note --task {id} '<finding>'` with this project selected.\n"));
+        brief.push_str(
+            "If a required write is denied by the sandbox, task notes and the shared cache lock may be outside \
+             this worktree. Use the harness's normal scoped-access mechanism or report the blocked write; \
+             do not hand-edit a copy or disable the sandbox. Read full subcommand help when unsure. \
+             Use `app-snapshot --cached` or `status --no-write` for inspection; plain `status` updates notes.\n",
+        );
+        brief.push_str(&format!(
+            "`{command} context --task {id} --json` reports local checkout/task context; \
+             `{command} task list --json` lists stable task IDs without network access. \
+             Check context's status and candidates when unresolved. For another branch in this task \
+             without a ticket, use `{command} add {id} --name '<slug>' --description '<assignment>' --bg`; \
+             `--in` instead shares an existing branch.\n"
+        ));
     }
     brief.push_str(&format!("\n## Done when\n\n{DONE_DEFINITION}\n"));
     brief

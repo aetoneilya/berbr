@@ -150,3 +150,45 @@ fn initialization_preserves_a_symlinked_config() {
     );
     assert!(fs::read_to_string(actual).unwrap().contains("second"));
 }
+
+#[test]
+fn github_setup_uses_origin_and_refuses_other_hosts_without_writing_config() {
+    let s = Setup::new();
+    let repo = s.repo("github");
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["remote", "add", "origin", "git@github.com:Example/Demo.git"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    s.success(&["init", "--repo", repo.to_str().unwrap(), "--github"]);
+    let config = fs::read_to_string(s.root.join("config.toml")).unwrap();
+    let doc: toml::Value = toml::from_str(&config).unwrap();
+    assert_eq!(
+        doc["project"][0]["repo"][0]["github_repo"].as_str(),
+        Some("example/demo")
+    );
+    let t = Setup::new();
+    let other = t.repo("other");
+    assert!(
+        Command::new("git")
+            .current_dir(&other)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@git.example.com:demo/app.git"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        !t.run(&["init", "--repo", other.to_str().unwrap(), "--github"])
+            .status
+            .success()
+    );
+    assert!(!t.root.join("config.toml").exists());
+}

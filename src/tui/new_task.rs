@@ -81,6 +81,7 @@ pub(super) struct Form {
     tickets: Vec<Ticket>,
     /// The project has Jira: else no ticket field.
     has_jira: bool,
+    can_create: bool,
     /// Why the last ⏎ did not start it.
     error: Option<String>,
 }
@@ -97,6 +98,7 @@ impl Form {
             filter: String::new(),
             tickets,
             has_jira,
+            can_create: true,
             error: None,
         }
     }
@@ -146,7 +148,9 @@ impl Form {
                 "create one in Jira".to_string(),
             ),
         ];
-        options.retain(|(_, name, _)| name.contains(&filter));
+        options.retain(|(kind, name, _)| {
+            (self.can_create || *kind != Jira::New) && name.contains(&filter)
+        });
         options.extend(
             self.tickets
                 .iter()
@@ -163,7 +167,8 @@ impl Form {
                     )
                 }),
         );
-        let typed = filter.to_uppercase();
+        let typed =
+            crate::client::issue::github_key(&filter).unwrap_or_else(|| filter.to_uppercase());
         if work::is_ticket_key(&typed) && !self.tickets.iter().any(|t| t.key == typed) {
             options.push((
                 Jira::Existing(typed.clone()),
@@ -258,12 +263,10 @@ impl Form {
 
 impl App {
     pub(super) fn open_new_task(&mut self) {
-        let has_jira = self.config.jira.is_some();
-        self.dialog = Some(Dialog::NewTask(Form::new(
-            has_jira,
-            tickets(&self.table),
-            self.config.workflow.agent,
-        )));
+        let has_jira = self.config.jira.is_some() || self.config.has_github();
+        let mut form = Form::new(has_jira, tickets(&self.table), self.config.workflow.agent);
+        form.can_create = self.config.jira.is_some();
+        self.dialog = Some(Dialog::NewTask(form));
     }
 
     /// A refresh brings the tickets an open form picks from.
@@ -471,7 +474,7 @@ pub(super) fn lines(form: &Form) -> Vec<Line<'static>> {
                     ),
                 };
                 let mut spans = vec![
-                    label(field, "jira"),
+                    label(field, if form.can_create { "ticket" } else { "issue" }),
                     Span::styled(format!("[ {chosen} ▾ ]"), style),
                 ];
                 if let Some(summary) = summary {

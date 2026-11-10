@@ -1,7 +1,8 @@
 //! Small hand-built inputs for the matching and view tests: tasks are real
 //! notes in a temp directory, everything else is built in memory.
 
-use super::matching::{Inputs, assemble};
+use super::matching::Inputs;
+pub(crate) use super::matching::assemble;
 use super::{Category, Fresh, Mr, Source, Table, Ticket, Tree};
 use crate::client::gitlab::MergeRequest;
 use crate::client::herdr;
@@ -136,6 +137,7 @@ pub fn inputs(tasks: Vec<Task>, tickets: Vec<Ticket>, mrs: Vec<Mr>, trees: Vec<T
         complete: true,
         jira: live(),
         gitlab: live(),
+        github: live(),
         warnings: Vec::new(),
         jira_host: "https://jira".to_string(),
     }

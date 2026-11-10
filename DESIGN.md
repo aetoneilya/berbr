@@ -146,6 +146,33 @@ heading (decided 2026-10-09); everything above it is the user's. They do it via
 - the brief tells agents to use it for decisions and non-obvious findings only,
   not progress logs.
 
+### Shared task artifacts
+
+Each task has one directory at
+`$BERBR_HOME/projects/<project>/artifacts/<task-id>/` (default home `~/.berbr`).
+The project and immutable task ID, with unsafe filename bytes percent-encoded,
+isolate tasks without tying files to a repository, worktree, title or note path.
+Long encoded components use a bounded prefix plus SHA-256 of the full identity.
+Managed directories below canonical Berbr home reject symlinks before listing
+or granting agent access. The configured Berbr home itself may be a symlink.
+Closing a task and removing its worktrees do not remove artifacts.
+
+Agents receive the path in their brief and the directory via `--add-dir` on
+Claude/Codex start and resume, including task reviewers. `berbr artifacts`
+resolves tasks like `task show`/`note`, creates the folder idempotently and prints
+its absolute path. `--list [--directory <relative>]` returns one directory as
+JSON, directories first, without reading file contents or following symlinks
+outside the root. It includes hidden files and arbitrary extensions.
+
+App snapshots expose only each task's `artifacts` path; they neither create
+directories nor scan artifacts. The panel loads the expanded task and folders
+on demand, refreshes visible folders every five seconds, and keeps the last
+successful list alongside any refresh error. Markdown uses the existing native
+viewer; other files open through the system, with scripts/executables sent to
+the text editor. Links/special files are revealed in Finder.
+Queued file requests capture their project and launch context before running;
+responses must carry the same project/task identity before entering that cache.
+
 ### Agent sessions
 
 Every claude conversation held in a task's worktrees stays attached to the task

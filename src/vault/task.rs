@@ -12,6 +12,10 @@ static TICKET_KEY: LazyLock<Regex> =
 
 /// Jira keys mentioned in `text`, in order, without duplicates.
 pub fn ticket_keys(text: &str) -> Vec<String> {
+    crate::client::issue::keys(text)
+}
+
+pub fn jira_keys(text: &str) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
     for m in TICKET_KEY.find_iter(text) {
         if !keys.iter().any(|k| k == m.as_str()) {

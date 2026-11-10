@@ -8,7 +8,7 @@ Claude Code or Codex sessions and merge requests. See which agents need you and
 pick up where you left off.
 
 Use it as a native Herdr panel, a TUI or a CLI. Local tasks work without an
-issue tracker; Jira and GitLab integrations add tickets and review state.
+issue tracker; GitHub, Jira and GitLab integrations add tickets and review state.
 See [the macOS preview, installation and gallery preparation](herdr-app/README.md).
 `DESIGN.md` describes the model and decisions.
 
@@ -21,6 +21,44 @@ berbr init --repo /path/to/repository --agent codex
 berbr doctor
 ```
 
+### Agent skill
+
+The portable [Berbr skill](skills/berbr/SKILL.md) ships in this repository, with
+focused [recovery guidance](skills/berbr/references/recovery.md). It works with
+the installed `berbr` and `hc` commands; it does not require personal memory files.
+Install the whole `skills/berbr` directory so relative reference links keep working.
+
+Link or copy it into your agent's skill directory. For example, from this checkout,
+with no existing skill named `berbr` at the destination:
+
+```sh
+# Codex
+mkdir -p ~/.agents/skills
+ln -s "$PWD/skills/berbr" ~/.agents/skills/berbr
+
+# Claude Code
+mkdir -p ~/.claude/skills
+ln -s "$PWD/skills/berbr" ~/.claude/skills/berbr
+```
+
+Choose the command for your agent. If a `berbr` skill already exists, compare it
+before replacing it and preserve local instructions. A symlink follows updates
+to this checkout; a copied skill needs the whole directory refreshed after updates.
+Use a durable checkout for a symlink, not a temporary task worktree. Reload skills
+or start a fresh agent session after installation. CLI/mod installation does not
+automatically install the skill or change existing agent permissions.
+
+The optional [Done skill](skills/done/SKILL.md) lands a completed task through
+its PR/MR or an established direct-to-main workflow, reports CI/approval blockers,
+and closes the exact Berbr task through a guarded runner. Install the whole
+`skills/done` directory the same way as `skills/berbr`. Invoke it with `/done`
+in Claude Code, or `$done` / the `/skills` picker in Codex. Creating or installing
+the skill does not run cleanup. Its runner needs Python 3 and a stable directory
+outside the task worktrees for its final receipt and log.
+
+The [agent workflow investigation](docs/agent-workflows.md) maps the instructions
+and CLI fixes to observed failures and records remaining limitations.
+
 ## Where things live
 
 Like `~/.claude`, berbr keeps its own folder, `~/.berbr` (`BERBR_HOME` overrides):
@@ -31,6 +69,7 @@ Like `~/.claude`, berbr keeps its own folder, `~/.berbr` (`BERBR_HOME` overrides
   logs/berbr.log
   projects/<project>/tasks/*.md        open tasks
   projects/<project>/tasks/done/*.md   closed ones, moved there by `berbr done`
+  projects/<project>/artifacts/<task-id>/   shared task files and folders
 ```
 
 Task notes are plain Markdown with YAML frontmatter; `o` in the TUI and the
@@ -93,6 +132,73 @@ appends a `[[project]]` here. `[` `]` and Tab switch at once.
 Tokens come from `JIRA_TOKEN` and `GITLAB_TOKEN`. `BERBR_TRACE=1` prints how long
 each fetch, the matching and the rendering took to stderr.
 
+### GitHub.com
+
+GitHub works without Jira or GitLab. Configure the repository whose issues and
+PRs you want to see, and its local checkout:
+
+```toml
+[[project]]
+name = "demo"
+github = { repo = "example/demo" }
+
+[[project.repo]]
+path = "~/code/demo"
+```
+
+Authenticate with `gh auth login --hostname github.com` (Berbr reads its saved
+token), or set `GH_TOKEN` / `GITHUB_TOKEN`. Precedence is `GH_TOKEN`, then
+`GITHUB_TOKEN`, then `gh auth token --hostname github.com`. The token must have
+access to the configured repositories. A classic token needs `repo` for private
+repositories; a fine-grained token needs read access to repository metadata,
+Issues, Pull requests, Commit statuses and Checks. Organization SSO may also
+need authorization. Berbr only reads GitHub; it never creates/closes issues or
+publishes/merges PRs. GitHub Enterprise is outside this release.
+
+The CLI, TUI's new-task ticket picker, and Herdr's **GitHub** tab list open
+issues, including unassigned ones. In the CLI, use:
+
+```sh
+berbr start example/demo#42
+berbr start https://github.com/example/demo/issues/42
+berbr attach example/demo#42 demo-0
+berbr add demo-0 example/demo#42 --name followup
+berbr select example/demo#42
+```
+
+Quote `'#42'` to use a number when the project has exactly one configured GitHub
+repository. With multiple repositories use `owner/repo#42`. Task notes store
+`github.com/owner/repo#42`, so equal issue numbers in different repositories are
+distinct. GitHub issue branches use `issue-42-<name>`; the saved checkout path
+keeps the task binding. The agent's brief includes the issue title and body.
+
+For several checkouts, set `github_repo = "owner/repo"` in each
+`[[project.repo]]`. A repository can select GitHub or GitLab; a project may use
+both, alongside Jira. An explicit repository setting overrides the project
+default. To work in a fork, keep the upstream in `github.repo` and put the fork
+in the checkout's `github_repo`. Berbr also discovers a fork's upstream from
+GitHub repository metadata. PRs match the source repository **and** branch,
+while PR numbers and issue references belong to the target repository. Only
+API-confirmed issues from configured repositories are added to task notes;
+references to other PRs or unconfigured upstream issues are excluded. Jira keys
+in GitHub branches and PRs keep their existing task-matching behavior.
+
+PR discovery includes open PRs and recently updated merged/closed PRs (90 days),
+plus older PRs for local checkout branches. Tasks without issues match their PRs
+through their saved worktrees. The panel shows draft, checks, approvals, review
+decision, unresolved threads and conflicts, with GitHub links and PR labels.
+Ready requires complete current review data, successful checks for the current
+head, a clean merge verdict, and no draft, conflict or unresolved thread.
+Unknown checks, changed heads, incomplete reviews and cached data never show
+ready. Missing credentials, access failures, rate limits and network failures
+show a warning and reuse the last successful cache for the configured set of
+repositories. `app-snapshot --cached` makes no remote requests.
+
+Snapshot v3 retains `kind: "mr"` for compatibility. GitHub rows add
+`provider: "github"`, qualified `repository` / `head_repository`, and
+`review_decision`; open PRs use `state: "open"` and labels `#42`. The `sources`
+object adds `github`. Closing a Berbr task leaves its GitHub issues open.
+
 Commands that change something (start, select, done, rename, …) are logged with
 their arguments, folder, time and error to `~/.berbr/logs/berbr.log`
 (`BERBR_LOG_DIR` overrides); the Herdr.app mod
@@ -109,11 +215,16 @@ resumes and launches after worktree preparation, so each pane owns its runtime.
 
 ```
 berbr                         the TUI (also `berbr tui`)
+berbr context [--json] [--task <id>]   local project/task/checkout context, with candidates
+berbr task list [--json] [--all]      local IDs/titles; includes closed tasks with --all
 berbr start [<task|KEY>]      new task: note, herdr workspace, worktree tab with claude
-berbr add [<task>] [<KEY>]    new agent tab; KEY is optional only with --in <tree>
+berbr add [<task>] [<KEY>]    new agent tab; omit KEY with --name <name> or --in <tree>
 berbr attach <KEY> [<task>]   put a ticket into a task without a worktree
 berbr select [<task|KEY>]     go back to a task: its agent, or claude resuming its session; a task with nothing yet gets its first worktree
 berbr note "<text>"           (for agents) append a finding to the note's "Agent notes"
+berbr artifacts [<task>]      print/create the task's shared artifact folder
+berbr artifacts [<task>] --list [--directory <relative-path>]
+                           list one folder as JSON, without scanning its children
 berbr status                  the table in plain text; updates `state` and `sessions` in notes
 berbr review [<worktree>]     start a reviewer agent next to the worktree's agent
 berbr done [<task>] [--tree <name-or-path> [--repo <path>]] [--merged] [-y] [--dry-run [--json]]
@@ -137,6 +248,26 @@ keep their current sandbox permissions until restarted or granted access.
 An inherited `WORKTABLE_CONFIG` still selects that explicit configuration;
 after migration, remove the stale override or point it to `~/.berbr/config.toml`.
 
+Every task has a shared artifact folder under
+`~/.berbr/projects/<project>/artifacts/<task-id>/` (`BERBR_HOME` overrides).
+It accepts any files and folders: plans, HTML pages, CSV data, scripts, images,
+and other outputs. The path depends on the project and stable task ID, so agents
+in different repositories/worktrees of the same task share it. Renaming a task,
+removing worktrees and closing the task preserve its artifacts. Legacy note names
+are encoded as a single folder name; titles never determine the path.
+
+Fresh agents get the path and usage instructions in their brief; Claude and
+Codex launches/resumes receive `--add-dir` for that task's artifact folder.
+Already-running agents retain their permissions until restarted or granted
+access. `berbr artifacts` uses the same task resolution and ambiguity checks as
+`task show` and `note`; pass a task explicitly and select its project with `-p`
+when outside its worktree. The native panel shows an **Artifacts** tree in the
+expanded task, including closed tasks. It refreshes visible folders every five
+seconds and offers manual refresh and **Open artifact folder**. Markdown opens
+inside Berbr; ordinary files open in their default app, scripts/executables in
+the text editor. Symlinks and special files are shown and revealed in Finder.
+Listing a folder never runs scripts or recursively follows symlinks.
+
 `done --dry-run` prints the same plan without changing Jira, notes, worktrees,
 branches, herdr or caches. Add `--json` for one plan object, including blockers,
 removals, kept trees and ticket actions. Blockers still exit 0 in dry-run; the
@@ -156,6 +287,30 @@ and Herdr space open for retry; successful prior steps remain completed.
 Unknown inspection counts are JSON `null`.
 
 `berbr <command> --help` lists the options.
+
+### Local commands for agents
+
+`berbr context --json` reports the current project, repository, checkout, branch,
+task, brief path and resolution source. It uses local Git and saved task
+references, without querying Jira, GitLab or live Herdr or writing caches/notes.
+It recognizes linked checkouts outside the main repository folder. Ambiguity is
+an inspection result (exit 0), with `task: null` and candidates; inspect `status`
+before using the result. Unlike commands with a default project, it does not
+silently choose the first project when the directory is unrelated.
+
+```sh
+berbr context --json
+berbr -p demo task list --json
+berbr -p demo context --task demo-0 --json
+berbr -p demo add demo-0 --name parser-followup --description 'Inspect parser ordering' --bg
+```
+
+`task list` is also local and read-only, and returns stable IDs directly. New
+ticketless checkouts created by `add --name` are saved in the task's `worktrees`
+bindings; later context lookups do not need a ticket or an active agent. On a
+partial failure after checkout creation, `add` reports the path that remains;
+inspect it before retrying. JSON fields and resolution limits are described in
+[the agent CLI contract](docs/agent-cli.md).
 
 ## TUI
 
@@ -232,7 +387,24 @@ ticket requires `--name` for a new worktree or `--in <tree>` to reuse one; an
 existing path requires `--in`. Without Jira, supply `--name` or `--in`.
 With `--in`, the key is optional: `berbr add [<task>] --in <tree>` starts a fresh
 agent briefed from the task without changing its tickets. The panel's worktree
-menu uses this for **New agent**; **Resume agent** continues the last session.
+menu uses this for **New agent**. Primary agents stay below their worktree,
+including dimmed stopped agents; **stopped** resumes that specific session.
+Child agents and explicitly marked reviewers stay out of the normal list,
+attention status and jump search. The worktree menu opens **Service sessions…**
+when they are needed. Their role is based on actual parent/launch metadata and
+remembered locally with the session, never inferred from its name. A remembered
+service role survives resuming in a top-level terminal; the panel passes
+`--role helper` to keep CLI navigation consistent. Older sessions
+whose role is unknown are available from the worktree context menu →
+**Session history…**, keeping the branch list compact.
+The worktree's terminal button opens a shell in its directory. An agent's context
+menu can start a new agent on the branch or remove that conversation from the
+panel, retaining its transcript and worktree. Removing a live agent first confirms
+that its terminal will be stopped. Hidden conversations stay hidden across panel
+reloads; explicitly resuming a hidden conversation brings it back. If a running
+agent's session cannot be identified, an ambiguous saved row shows **unknown**
+and cannot be resumed until that agent closes. `berbr open <path> --resume <session-id>` also resumes one exact conversation,
+using its owning CLI and refusing sessions unrelated to that worktree.
 Without a TTY, `add` never prompts and automatically behaves like `--bg`, keeping
 the caller's focus. It waits for worktree creation and the agent launch request,
 then prints one line with the path, tab and terminal IDs. Errors exit nonzero

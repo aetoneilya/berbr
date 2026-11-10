@@ -48,6 +48,23 @@ pub enum Section {
 }
 
 impl Section {
+    pub fn title_for(self, table: &Table) -> &'static str {
+        if self == Self::Assigned
+            && table
+                .tickets
+                .keys()
+                .any(|k| crate::client::issue::github_parts(k).is_some())
+        {
+            if table.jira_host.is_empty() {
+                "GitHub issues"
+            } else {
+                "open tickets"
+            }
+        } else {
+            self.title()
+        }
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             Section::NoTask => "no task",
@@ -156,7 +173,7 @@ pub fn build(table: &Table, options: &Options) -> Vec<Node> {
                 for m in mrs {
                     if !lifted.contains(&m) {
                         lifted.push(m);
-                        children.push(mr_node(m));
+                        children.push(mr_node(table, m));
                     }
                 }
                 continue;
@@ -164,7 +181,7 @@ pub fn build(table: &Table, options: &Options) -> Vec<Node> {
             children.push(Node {
                 id: format!("ticket:{}:{key}", row.task.name),
                 kind: Kind::Ticket(key.clone()),
-                children: mrs.map(mr_node).collect(),
+                children: mrs.map(|m| mr_node(table, m)).collect(),
             });
         }
         children.extend(
@@ -179,7 +196,7 @@ pub fn build(table: &Table, options: &Options) -> Vec<Node> {
                         .any(|k| row.tickets().any(|t| t == k))
                         && free_mr(m)
                 })
-                .map(mr_node),
+                .map(|m| mr_node(table, m)),
         );
         children.extend(trees);
         if !hide.trees {
@@ -236,7 +253,9 @@ pub fn build(table: &Table, options: &Options) -> Vec<Node> {
         let open = loose.mrs.iter().any(|&m| table.mr(m).opened());
         let closed = ticket.is_some_and(|t| t.closed());
         let worked_on = live || (open && !closed);
-        let mine = ticket.is_some_and(|t| t.mine);
+        let mine = ticket.is_some_and(|t| {
+            t.mine || (crate::client::issue::github_parts(&t.key).is_some() && !t.closed())
+        });
         if !worked_on && !mine && !all && !(options.all && (!loose.trees.is_empty() || open)) {
             continue;
         }
@@ -255,7 +274,7 @@ pub fn build(table: &Table, options: &Options) -> Vec<Node> {
             .iter()
             .copied()
             .filter(|&m| !hide.mrs && !held.contains(&m) && (all || table.mr(m).opened()))
-            .map(mr_node)
+            .map(|m| mr_node(table, m))
             .collect();
         children.extend(trees);
         let node = Node {
@@ -284,7 +303,7 @@ pub fn build(table: &Table, options: &Options) -> Vec<Node> {
     if options.all && !hide.mrs {
         for &m in &table.other_mrs {
             if keep(table.mr(m).mr.title().to_string()) {
-                no_task.push(mr_node(m));
+                no_task.push(mr_node(table, m));
             }
         }
     }
@@ -316,8 +335,14 @@ fn branches(table: &Table, trees: &[usize]) -> String {
         .join(" ")
 }
 
-fn mr_node(m: usize) -> Node {
-    Node::leaf(format!("mr:{m}"), Kind::Mr(m))
+fn mr_node(table: &Table, m: usize) -> Node {
+    let mr = table.mr(m);
+    let id = if mr.mr.github {
+        format!("mr:{}#{}", mr.project, mr.mr.iid())
+    } else {
+        format!("mr:{m}")
+    };
+    Node::leaf(id, Kind::Mr(m))
 }
 
 /// Worktrees with agents first, then by changed files, then by name; finished
@@ -354,7 +379,7 @@ fn tree_nodes(
             let mr = tree
                 .mr
                 .filter(|&m| !hide.mrs && (all_mrs || table.mr(m).opened()))
-                .map(mr_node);
+                .map(|m| mr_node(table, m));
             let agents = (0..tree.agents.len()).map(|a| {
                 Node::leaf(
                     format!("agent:{}:{a}", tree.wt.path.display()),

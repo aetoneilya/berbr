@@ -1,0 +1,4 @@
+interface:
+  display_name: "Done"
+  short_description: "Merge finished work and close its Berbr task"
+  default_prompt: "Use $done to merge the completed task and close it through Berbr."

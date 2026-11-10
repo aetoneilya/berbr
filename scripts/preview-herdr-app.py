@@ -22,9 +22,14 @@ def snapshot():
     t1['children']=[row('agent','worker','Codex',terminal='worker',state='working')]
     t2 = row('tree','upload-tree','upload-retry',tree='upload-retry',branch='fix/upload-retry',cwd='/home/demo/work/upload-retry')
     t2['children']=[row('agent','waiting','Claude Code',terminal='waiting',state='blocked')]
-    mr=row('mr','mr-42','!42  Keep settings across restarts',state='opened',url='https://git.example.com/demo/app/-/merge_requests/42',
+    mr=row('mr','mr-42','#42  Keep settings across restarts',state='opened',provider='github',repository='example/demo',url='https://github.com/example/demo/pull/42',
            branch='fix/settings',ci='success',approvals=1,unresolved=0,draft=False,conflict=False,merge_status='mergeable',ready=True)
+    retry=dict(mr,id='mr-43',label='#43  Retry interrupted uploads',url='https://github.com/example/demo/pull/43',
+        branch='fix/upload-retry',ci='failed',approvals=0,merge_status='ci_must_pass',ready=False)
+    shortcuts=dict(mr,id='mr-44',label='#44  Add keyboard shortcuts',url='https://github.com/example/demo/pull/44',
+        branch='feat/shortcuts',ci='pending',draft=True,approvals=0,merge_status='draft_status',ready=False)
     return {'version':3,'project':'Demo workspace','projects':[{'name':'Demo workspace','agent':'codex'}],
+        'merge_requests':[mr,retry,shortcuts],
         'rows':[task('demo-1','Isolate the cache per project','active',[t1]),task('demo-2','Retry interrupted uploads','active',[t2]),
                 task('demo-3','Keep settings across restarts','review',[mr]),task('demo-4','Add keyboard shortcuts','idea',[])],
         'warnings':[],'store':'berbr','settings':{'agent':'codex','generation_agent':'codex','generation_model':''}}
@@ -34,7 +39,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',type=Path,default=ROOT/'herdr-app/preview.png')
     parser.add_argument('--setup',action='store_true')
-    parser.add_argument('--screen',choices=['tasks','new','details'],default='tasks')
+    parser.add_argument('--screen',choices=['tasks','mrs','new','details'],default='tasks')
     args=parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='berbr-shot-', dir='/tmp') as tmp:
         home=Path(tmp)
@@ -59,6 +64,9 @@ export const hc = async () => ({code:0,stdout:'{}',stderr:""});
         if args.screen == 'details':
             p=mod/'main.js'
             p.write_text(p.read_text().replace('this.expanded = null;', 'this.expanded = "demo-3";'))
+        if args.screen == 'mrs':
+            p=mod/'main.js'
+            p.write_text(p.read_text().replace('return localStorage.getItem(`berbr.view.${project}`) === "mrs" ? "mrs" : "tasks";', 'return "mrs";'))
         panel_props = {'form':'new','project':'Demo workspace','projects':['Demo workspace'],
             'prefill':{'description':'Add retries for interrupted uploads and keep progress visible.'}} if args.screen == 'new' else {}
         (home/'layouts').mkdir()
@@ -69,8 +77,9 @@ export const hc = async () => ({code:0,stdout:'{}',stderr:""});
         version=subprocess.check_output(['herdr-app','--version'],text=True).strip().split()[-1]
         (home/'update-notes.json').write_text(json.dumps({'last_run':version,'presented':[version]}))
         (home/'settings.json').write_text(json.dumps({'appearance':'dark','sounds':{'enabled':False},'zoom':1}))
-        env=dict(os.environ,HERDR_APP_HOME=str(home),HC_SOCKET=str(home/'core.sock'),HC_SESSION='berbr-preview',XDG_STATE_HOME=str(home/'state'),HERDR_APP_NO_SOUND='1')
-        for name in ['HC_TERMINAL_ID','HERDR_WORKSPACE_ID','HERDR_TAB_ID','HERDR_PANE_ID']:
+        env=dict(os.environ,HERDR_APP_HOME=str(home),HC_SOCKET=str(home/'core.sock'),HC_SESSION='berbr-preview',
+            XDG_STATE_HOME=str(home/'state'),XDG_CONFIG_HOME=str(home/'config'),XDG_DATA_HOME=str(home/'data'),HERDR_APP_NO_SOUND='1')
+        for name in ['HC_TERMINAL_ID','HC_TERMINAL_SOCKET','HERDR_PLUGIN_CONTEXT_JSON','HERDR_PLUGIN_ROOT','HERDR_ENV','HERDR_WORKSPACE_ID','HERDR_TAB_ID','HERDR_PANE_ID']:
             env.pop(name,None)
         # Only the temporary home and explicit socket created here are controlled.
         with (home/'app.log').open('w') as log:

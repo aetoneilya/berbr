@@ -71,7 +71,7 @@ def install(source, home, binary, activate=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--activate', action='store_true', help='Open Berbr after installation')
+    parser.add_argument('--activate', action='store_true', help='Toggle the Berbr overlay after installation (Herdr mod.open)')
     parser.add_argument('--binary', type=Path, help='A built backend; release archives include it')
     args = parser.parse_args()
     source = source_root()

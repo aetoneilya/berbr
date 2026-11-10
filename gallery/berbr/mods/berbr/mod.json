@@ -1,0 +1,11 @@
+{
+  "place": "right",
+  "title": "Berbr",
+  "focusable": true,
+  "overlay": {
+    "kind": "dialog",
+    "width": 1160,
+    "height": 0.88
+  },
+  "size": 420
+}

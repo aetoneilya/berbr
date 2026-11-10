@@ -31,10 +31,12 @@ def package(binary, target, version, output, gallery=False):
         (stage/'mods/berbr/mod.json').write_text(json.dumps(manifest, indent=2)+'\n')
         shutil.copy2(ROOT/'herdr-app/RECIPE.md', stage/'RECIPE.md')
         shutil.copy2(preview, stage/'preview.png')
+        if (ROOT/'herdr-app/preview-reviews.png').is_file():
+            shutil.copy2(ROOT/'herdr-app/preview-reviews.png', stage/'preview-reviews.png')
         shutil.copy2(ROOT/'LICENSE', stage/'LICENSE')
         shutil.copy2(ROOT/'scripts/install-herdr-app.py', stage/'install.py')
-        if (ROOT/'skills/berbr/SKILL.md').is_file():
-            shutil.copytree(ROOT/'skills/berbr', stage/'skills/berbr')
+        if (ROOT/'skills').is_dir():
+            shutil.copytree(ROOT/'skills', stage/'skills', ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
         if not gallery:
             if not binary or not binary.is_file():
                 raise ValueError('Pass --binary <release backend>.')
