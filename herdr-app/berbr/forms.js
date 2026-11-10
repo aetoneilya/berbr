@@ -2,7 +2,7 @@ import { div } from "gpui-kit";
 import { h_flex, v_flex, Popup, TextView, EditorState, Editor } from "gpui-base";
 import { props, closeOverlay, readTextFile, writeTextFile, watchFolder, settings } from "herdr";
 import { exists } from "fs/promises";
-import { parseFrontmatter, transformWikilinks, wikiTargets, wikiPath, obsidianUri, treeMarks, newTaskArgs, targetHint } from "./model.js";
+import { forgeName, changeKind, changeNumber, parseFrontmatter, transformWikilinks, wikiTargets, wikiPath, obsidianUri, treeMarks, newTaskArgs, targetHint } from "./model.js";
 import { icon, iconButton, button, chip, segmented, kbd, worktreeSwitch, keyboardControl } from "./ui.js";
 
 function reloadNote(view, cx, {discard = false, links = false} = {}) {
@@ -345,23 +345,28 @@ function namingSettings(view, t) {
 function newForm(view, t) {
   const p = props() ?? {};
   const projects = (p.projects?.length ? p.projects : [view.project].filter(Boolean)).map(name => [name, name]);
-  const tickets = view.newTaskTickets();
+  const integrations = p.integrations?.[view.project];
+  const tabsForProject = sources.filter(([id]) => id !== "jira" || integrations?.jira !== false);
+  if (integrations?.github) tabsForProject.splice(1, 0, ["github", "GitHub", "file-text"]);
+  const issueSource = ["jira", "github"].includes(view.source);
+  const tickets = view.newTaskTickets().filter(ticket => view.source === "github" ? ticket.key.startsWith("github.com/") : !ticket.key.startsWith("github.com/"));
   const generate = view.source === "smart";
   const text = generate ? "" : view.values.title?.trim() ?? "";
   const plan = newTaskArgs({source:view.source, text, ticket:view.ticket, agent:view.agent, worktree:view.worktree,
-    newTicket:view.newTicket, description:view.values.description});
-  const neutralHint = {jira:"Pick a ticket below or paste a key or link",
+    newTicket:(integrations?.jira ?? true) && view.newTicket, description:view.values.description});
+  const neutralHint = {github:"Pick an issue or paste owner/repo#number or an issue URL", jira:"Pick a ticket below or paste a key or link",
     branch:"The branch is checked out if it exists, else created from origin.",
     name:targetHint({kind:"empty"})};
   const hint = plan.error ? neutralHint[view.source] : targetHint(plan.target, tickets, view.values.description);
   const setSource = (source, cx) => {
     if (view.busy) return;
+    const changed = source !== view.source;
     view.source = source; view.error = null; view.choosing = null;
-    if (source !== "jira") view.ticket = null;
+    if (changed || !["jira", "github"].includes(source)) view.ticket = null;
     view.inputs[source === "smart" ? "description" : "title"].focus(); cx.notify();
   };
   const tabs = h_flex().gap(16).items_center().border_b_1().border_color(t.border)
-    .children(sources.map(([id, label, glyph]) => keyboardControl(h_flex().id(`source-${id}`), cx => setSource(id, cx), view.busy)
+    .children(tabsForProject.map(([id, label, glyph]) => keyboardControl(h_flex().id(`source-${id}`), cx => setSource(id, cx), view.busy)
       .h(32).flex_none().gap(6).items_center().cursor_pointer().border_b_2()
       .opacity(view.busy ? 0.4 : 1)
       .border_color(view.source === id ? t.foreground : t.popover)
@@ -369,10 +374,10 @@ function newForm(view, t) {
       .on_click((_event, cx) => setSource(id, cx))
       .child(icon(glyph, 13)).child(div().text_size(13).child(label))));
   const needle = text.toLowerCase();
-  const shown = view.source === "jira"
+  const shown = issueSource
     ? tickets.filter(ticket => !needle || ticket.key.toLowerCase().includes(needle) || ticket.title.toLowerCase().includes(needle))
     : [];
-  const ticketList = view.source !== "jira" ? null : v_flex().id("new-tickets").flex_none()
+  const ticketList = !issueSource ? null : v_flex().id("new-tickets").flex_none()
     .h(Math.min(Math.max(shown.length, 1), 5) * 30).overflow_y_scrollbar().gap(2)
     .children(shown.map(ticket => keyboardControl(h_flex().id(`new-ticket-${ticket.key}`), cx => {
       view.ticket = view.ticket === ticket.key ? null : ticket.key; view.error = null; cx.notify();
@@ -387,7 +392,7 @@ function newForm(view, t) {
     .child(worktreeSwitch(t, value, (next, cx) => { if (!view.busy) { flip(next); view.error = null; cx.notify(); } }, view.busy, id)
       .tab_index(0).tab_stop(!view.busy).accessibility_label(label))
     .child(div().text_size(12).text_color(t.foreground).child(label));
-  const scrollBody = view.source === "jira" || (generate && view.namingExpanded);
+  const scrollBody = issueSource || (generate && view.namingExpanded);
   const body = v_flex().id("new-body").min_h(0).gap(12)
     .when(scrollBody, el => el.flex_1().overflow_y_scrollbar())
     .when(!scrollBody, el => el.flex_none())
@@ -408,7 +413,7 @@ function newForm(view, t) {
       .child(view.input("description").id("description")))
     .child(h_flex().id("new-options").flex_none().gap(16).items_center()
       .child(toggle("new-worktree", view.worktree, "Worktree", next => { view.worktree = next; }))
-      .when(view.source !== "jira", el => el.child(toggle("new-jira-ticket", view.newTicket, "New Jira ticket", next => { view.newTicket = next; })))
+      .when(!issueSource && integrations?.jira !== false, el => el.child(toggle("new-jira-ticket", view.newTicket, "New Jira ticket", next => { view.newTicket = next; })))
       .when(Boolean(view.error) || view.created, el => el.child(div().id("new-status").flex_1().min_w(0).h(16)
         .when(Boolean(view.error), el => el.child(errorLine(view, t).truncate().tooltip(view.error)))
         .when(!view.error && view.created, el => el.child(div().text_size(12).text_color(t.done).child("Task created."))))))
@@ -425,12 +430,13 @@ function newForm(view, t) {
         .child(div().flex_1())
         .child(cancel(view, t))
         .child(button(t, "create", view.busyAction === "start" && plan.target?.kind === "empty" && view.values.description?.trim() ? "Naming…" : "Create task", cx => view.submitNew(cx), "primary", view.busy, view.busyAction === "start")
-          .child(kbd(t, "⌘↵").px(4).py(2).rounded(4).border_1().border_color(t.border).text_color(t.solid_foreground)))));
+          .child(kbd(t, "⌘↵").px(4).py(2).rounded(4).border_1().border_color(t.border).text_color(t.solid_foreground)
+            .when(view.busyAction === "start", el => el.invisible())))));
 }
 
 function ticketForm(view, t, p) {
   return v_flex().size_full().min_h(0).p(24).gap(10).bg(t.popover).text_color(t.foreground)
-    .child(div().text_size(15).font_semibold().child("Add a Jira ticket"))
+    .child(div().text_size(15).font_semibold().child("Add a ticket or GitHub issue"))
     .child(div().text_size(12).text_color(t.dim).truncate().child(p.title ?? p.task ?? ""))
     .child(view.input("ticket"))
     .child(v_flex().id("ticket-worktree").flex_1().min_h(0).gap(6).overflow_y_scrollbar()
@@ -462,13 +468,13 @@ function doneForm(view, t, p) {
   if (view.planLoading) body.child(h_flex().gap(6).items_center().text_color(t.dim)
     .child(icon("spinner", 11).spin(900)).child(div().text_size(12).child("Checking close plan…")));
   section("Will be kept", (plan.keep ?? []).map(tree => row("git-branch", `${tree.tree} — ${tree.reason}`)));
-  section("Left open in Jira", (plan.leave ?? []).map(key => row("file-text", key)));
+  section("Left open", (plan.leave ?? []).map(key => row("file-text", key)));
   section("Will be removed", plan.removals.map(tree => row("git-branch",
     `${tree.name}${tree.path ? ` · ${tree.path}` : ""}${tree.changes ? ` — WARNING: deletes ${tree.changes} uncommitted file(s)` : ""}`, tree.changes ? t.blocked : t.foreground)));
   section("Jira", plan.jira.length ? [row("file-text", `Closes your open tickets: ${plan.jira.join(", ")}`),
     div().text_size(12).text_color(t.dim).whitespace_normal().child("Tickets assigned to someone else stay open.")] : []);
   section("Also", plan.also.map(text => row(text.includes("space") ? "monitor" : "file-text", text)));
-  section("Proof", plan.proof.count ? [row("circle-check", `${plan.proof.count} MRs merged`, t.dim),
+  section("Proof", plan.proof.count ? [row("circle-check", `${plan.proof.count} ${changeKind(plan.proof.latest)}s merged`, t.dim),
     view.externalLink(t, "close-proof", plan.proof.latest).text_size(13).text_color(t.dim)
       .child(div().min_w(0).truncate().child(plan.proof.latest.label))] : [], t.dim);
   const blocked = plan.blockers.length > 0;
@@ -481,7 +487,7 @@ function doneForm(view, t, p) {
     .child(body.when(Boolean(view.error), el => el.child(errorLine(view, t).whitespace_normal())))
     .child(h_flex().pt(12).gap(8).items_center().border_t_1().border_color(t.border)
       .child(div().flex_1().min_w(0).text_size(11).text_color(t.dim).whitespace_normal()
-        .child("Berbr re-checks Jira and GitLab before closing."))
+        .child(plan.proof.latest && forgeName(plan.proof.latest) === "GitHub" ? "Berbr re-checks GitHub before closing; issues stay open." : "Berbr re-checks Jira and GitLab before closing."))
       .child(cancel(view, t))
       .when(blocked, el => el.child(button(t, "done-force", "Close anyway",
         cx => view.perform(cx, ["done", p.task, "--yes", "--force"], {close:true, action:"done-force"}), "ghost",
@@ -514,23 +520,25 @@ function removeMergedForm(view, t) {
 }
 
 function removeTreeForm(view, t, p) {
-  const key = p.mr?.label?.match(/!\d+/)?.[0] ?? "";
+  const key = p.mr ? changeNumber(p.mr) : "";
+  const kind = p.mr ? changeKind(p.mr) : "MR";
+  const service = p.mr ? forgeName(p.mr) : "GitLab";
   const state = p.mr?.state?.toLowerCase();
-  const summary = p.mr ? `Its MR${key ? ` ${key}` : ""} is ${state}. ` : "";
+  const summary = p.mr ? `Its ${kind}${key ? ` ${key}` : ""} is ${state}. ` : "";
   const marks = treeMarks(p.tree);
   // known blockers, or the CLI refused: the person may still choose to lose them
-  const forceable = marks.changes > 0 || state === "opened" || p.tree?.mr_state === "opened" || Boolean(view.error);
+  const forceable = marks.changes > 0 || ["open", "opened"].includes(state) || ["open", "opened"].includes(p.tree?.mr_state) || Boolean(view.error);
   return v_flex().size_full().min_h(0).p(24).gap(12).bg(t.popover).text_color(t.foreground)
     .child(div().text_size(15).font_semibold().child(`Remove worktree “${p.tree?.tree ?? "unknown"}”?`))
     .child(v_flex().flex_1().min_h(0).gap(12).overflow_y_scrollbar()
       .child(div().text_size(13).text_color(t.muted).whitespace_normal()
         .child(`${summary}Deletes the checkout folder, its Herdr tabs, and the local branch when safe. Remove never discards uncommitted files.`))
       .child(div().text_size(12).text_color(t.muted).whitespace_normal()
-        .child("Berbr refuses uncommitted changes, an open MR, unknown unpushed commits, or local commits not covered by a merged/closed MR. Unmerged commits already pushed to origin can be removed locally; the remote branch remains. Git and GitLab are checked again before removal."))
+        .child(`Berbr refuses uncommitted changes, an open ${kind}, unknown unpushed commits, or local commits not covered by a merged/closed ${kind}. Unmerged commits already pushed to origin can be removed locally; the remote branch remains. Git and ${service} are checked again before removal.`))
       .when(marks.changes > 0, el => el.child(div().text_size(12).text_color(t.blocked).whitespace_normal()
         .child(`Removal will be refused: ${marks.changes} uncommitted change(s) in the snapshot.`)))
-      .when(state === "opened" || p.tree?.mr_state === "opened", el => el.child(div().text_size(12).text_color(t.blocked)
-        .child("Removal will be refused: the MR is open.")))
+      .when(["open", "opened"].includes(state) || ["open", "opened"].includes(p.tree?.mr_state), el => el.child(div().text_size(12).text_color(t.blocked)
+        .child(`Removal will be refused: the ${kind} is open.`)))
       .when(Boolean(view.error), el => el.child(errorLine(view, t).whitespace_normal()))
       .when(forceable, el => el.child(div().text_size(12).text_color(t.blocked).whitespace_normal()
         .child(`Delete anyway skips these checks: ${marks.changes > 0 ? `${marks.changes} uncommitted change(s) are lost for good. ` : ""}`
@@ -568,13 +576,14 @@ function renameForm(view, t) {
 
 function stopAgentForm(view, t, p) {
   return v_flex().size_full().min_h(0).p(24).gap(12).bg(t.popover).text_color(t.foreground)
-    .child(div().text_size(15).font_semibold().child("Stop agent?"))
+    .child(div().text_size(15).font_semibold().child(p.remove ? "Remove agent from branch?" : "Stop agent?"))
     .child(div().text_size(13).text_color(t.muted).whitespace_normal()
-      .child(`Stops terminal ${p.terminal ?? "unknown"}. Work in progress in this agent will be interrupted.`))
+      .child(p.remove ? "Stops this agent and removes it from this branch’s list. The saved conversation is kept."
+        : `Stops terminal ${p.terminal ?? "unknown"}. Work in progress in this agent will be interrupted.`))
     .when(Boolean(view.error), el => el.child(errorLine(view, t).whitespace_normal()))
     .child(div().flex_1())
     .child(h_flex().gap(8).justify_end().child(cancel(view, t))
-      .child(button(t, "stop-agent", "Stop agent", cx => view.submitStopAgent(cx), "primary", view.busy)));
+      .child(button(t, "stop-agent", p.remove ? "Remove agent" : "Stop agent", cx => view.submitStopAgent(cx), "primary", view.busy)));
 }
 
 // A popup is as tall as its content: a list that only grows (flex_1) gets no
@@ -611,7 +620,7 @@ function jumpForm(view, t) {
         .on_click((_event, cx) => view.chooseJump(cx, item))
         .child(icon({task:"circle-check", tree:"git-branch", agent:"terminal", ticket:"file-text", mr:"git-compare", project:"folder"}[item.kind], 12).text_color(t.dim))
         .child(div().flex_1().min_w(0).truncate().text_size(12).tooltip(item.title).child(item.title))
-        .child(div().flex_none().text_size(11).text_color(t.dim).child(names[item.kind])))))
+        .child(div().flex_none().text_size(11).text_color(t.dim).child(item.kind === "mr" ? changeKind(item.row) : names[item.kind])))))
     .when(!matches.length, el => el.child(div().p(10).text_size(12).text_color(t.dim).child("No matches")))
     .child(kbd(t, "↑↓ move · ⏎ jump · esc close"));
 }
@@ -635,9 +644,27 @@ function attachTaskForm(view, t, p) {
     .child(kbd(t, "↑↓ move · ⏎ attach · esc close"));
 }
 
+function sessionsForm(view, t, p) {
+  const history = view.form === "session-history";
+  const prefix = history ? "history-session" : "service";
+  const entries = (p.entries ?? []).filter(entry => view.agentVisible(entry.row, entry.tree));
+  return v_flex().size_full().min_h(0).p(20).gap(12).bg(t.popover).text_color(t.foreground)
+    .child(h_flex().gap(8).items_center()
+      .child(div().flex_1().text_size(15).font_semibold().child(history ? "Session history" : "Service sessions"))
+      .child(iconButton(t, `${prefix}-close`, "x", "Close", () => closeOverlay(p.overlay))))
+    .child(v_flex().id(`${prefix}-sessions-list`).flex_1().min_h(0).overflow_y_scrollbar()
+      .when(!entries.length, el => el.child(div().text_size(13).text_color(t.dim).child(history ? "No saved sessions" : "No service sessions")))
+      .children(entries.map(entry => {
+        const current = view.liveAgent(entry.row);
+        return view.detailRow(t, {id:`${prefix}/${entry.row.id}`, kind:"detail", type:"agent", ...entry,
+          live:current, status:current?.status ?? "stopped", action:cx => view.open(entry.row, cx)});
+      })));
+}
+
 export function formView(view, t) {
   const p = props() ?? {};
   if (view.form === "menu") return menuForm(view, t);
+  if (["service-sessions", "session-history"].includes(view.form)) return sessionsForm(view, t, p);
   if (view.form === "rename") return renameForm(view, t);
   if (view.form === "stop-agent") return stopAgentForm(view, t, p);
   if (view.form === "note") return noteForm(view, t, p);

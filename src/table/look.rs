@@ -144,7 +144,7 @@ pub fn ticket(key: &str, ticket: Option<&Ticket>) -> Vec<Piece> {
 /// `!iid` in blue; `by_state` paints a merged or closed one in its state's
 /// color, for rows that don't show the state.
 pub fn mr_iid(mr: &Mr, by_state: bool) -> Piece {
-    let iid = format!("!{}", mr.mr.iid());
+    let iid = mr.mr.number_label();
     match mr.mr.state() {
         MrState::Opened => Piece::new(iid, Tone::Blue),
         _ if !by_state => Piece::new(iid, Tone::Blue),
@@ -155,7 +155,14 @@ pub fn mr_iid(mr: &Mr, by_state: bool) -> Piece {
 /// `opened`, `merged`, … colored.
 pub fn mr_state(mr: &Mr) -> Piece {
     let state = mr.mr.state();
-    Piece::new(state.as_str(), mr_state_tone(state))
+    Piece::new(
+        if mr.mr.github && state == MrState::Opened {
+            "open"
+        } else {
+            state.as_str()
+        },
+        mr_state_tone(state),
+    )
 }
 
 fn mr_state_tone(state: MrState) -> Tone {
@@ -207,6 +214,8 @@ pub fn review(mr: &Mr) -> Vec<Piece> {
         n => pieces.push(Piece::new(format!(" {n} threads"), Tone::Yellow)),
     }
     match mr.mr.detailed_merge_status.as_deref() {
+        Some("changes_requested") => pieces.push(Piece::new(" changes requested", Tone::Red)),
+        Some("not_approved") if mr.mr.github => pieces.push(Piece::dim(" review required")),
         Some("conflict") => pieces.push(Piece::new(" conflict", Tone::Red)),
         Some("need_rebase") => pieces.push(Piece::new(" rebase", Tone::Red)),
         _ => {}

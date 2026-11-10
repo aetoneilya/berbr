@@ -27,13 +27,15 @@ export function iconButton(t, id, name, label, action, { disabled = false, spinn
 
 export function button(t, id, label, action, variant = "ghost", disabled = false, spinning = false) {
   const primary = variant === "primary";
-  return keyboardControl(h_flex().id(id), action, disabled).h(30).px(10).gap(6).items_center().justify_center().rounded(6)
+  return keyboardControl(h_flex().id(id), action, disabled).relative().h(30).px(10).gap(6).items_center().justify_center().rounded(6)
+    .accessibility_label(label)
     .text_size(12).text_color(primary ? t.solid_foreground : t.muted)
     .when(primary, el => el.bg(t.solid)).cursor_pointer().opacity(disabled && !spinning ? 0.4 : 1)
     .hover(el => primary ? el.opacity(disabled && !spinning ? 0.4 : 0.85) : el.bg(t.hover).text_color(t.foreground))
-    .on_click((_event, cx) => { cx.stop_propagation(); if (!disabled) action(cx); }).child(label)
-    .child(div().size(11).flex_none().when(!spinning, el => el.invisible())
-      .child(icon("spinner", 11).when(spinning, el => el.spin(900))));
+    .on_click((_event, cx) => { cx.stop_propagation(); if (!disabled) action(cx); })
+    .child(div().when(spinning, el => el.invisible()).child(label))
+    .when(spinning, el => el.child(h_flex().absolute().inset_0().items_center().justify_center()
+      .child(icon("spinner", 11).spin(900))));
 }
 
 // Plain elements need both a tab stop and keyboard activation in this runtime.

@@ -23,6 +23,9 @@ pub struct Session {
     /// from the file, not cached with the parsed transcript.
     #[serde(skip)]
     pub modified: u64,
+    /// Filesystem birth time, used to match a fresh terminal before it reports a session ID.
+    #[serde(skip)]
+    pub created_ms: u64,
 }
 
 impl Session {
@@ -132,6 +135,15 @@ impl Cache {
     fn session(&mut self, file: &Path, kind: AgentKind) -> Option<Session> {
         let mut input = std::fs::File::open(file).ok()?;
         let meta = input.metadata().ok()?;
+        let created_ms = meta
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |t| t.as_millis() as u64);
+        let with_birth = |mut s: Session| {
+            s.created_ms = created_ms;
+            s
+        };
         let len = meta.len();
         let mtime = meta
             .modified()
@@ -150,7 +162,10 @@ impl Cache {
             {
                 self.bytes_read = 0;
             }
-            return entry.aggregate.session(kind, mtime / 1_000_000_000);
+            return entry
+                .aggregate
+                .session(kind, mtime / 1_000_000_000)
+                .map(with_birth);
         }
         let previous = self.entries.remove(&key).filter(|entry| {
             entry.identity == file_id
@@ -173,7 +188,9 @@ impl Cache {
         #[cfg(not(test))]
         let _ = read_bytes;
         let hash = fingerprint(&mut input, offset).ok()?;
-        let session = aggregate.session(kind, mtime / 1_000_000_000);
+        let session = aggregate
+            .session(kind, mtime / 1_000_000_000)
+            .map(with_birth);
         self.entries.insert(
             key,
             Entry {
@@ -353,6 +370,7 @@ impl Aggregate {
             first_cwd: self.first_cwd.clone(),
             last_cwd: self.last_cwd.clone(),
             modified,
+            created_ms: 0,
         })
     }
 }
@@ -452,6 +470,7 @@ mod tests {
             first_cwd: None,
             last_cwd: None,
             modified: 0,
+            created_ms: 0,
         };
         assert_eq!(
             session.worktrees_under(Path::new("/r/.claude/worktrees")),

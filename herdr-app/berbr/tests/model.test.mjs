@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { taskSpace, taskSpaceMatches, walk, groupSections, taskSignals, PanelModel, visibleRows, parseMrFlags,
   normalizeTicketState, isClosedTicket, cleanObsidian, parseFrontmatter, obsidianUri, ticketTitle, taskDetail, looseReason, worktreeNameCollision, cleanCliText, parseTreeMarks, looseWhy,
-  agentActivity, formatElapsed, classifyBlocked, closePlan, rowMenu, smartTarget, targetHint, newTaskArgs, freeTickets } from "../model.js";
+  agentActivity, agentRole, treeFocusTarget, jumpItems, formatElapsed, classifyBlocked, closePlan, rowMenu, smartTarget, targetHint, newTaskArgs, freeTickets } from "../model.js";
 
 const snapshot = JSON.parse(await readFile(new URL("../fixtures/sample-snapshot.json", import.meta.url)));
 const section = (sections, id) => sections.find(item => item.id === id);
@@ -21,13 +21,17 @@ test("task menu offers a live space instead of starting work and hides unavailab
 test("active, merged and loose worktrees all offer removal with a danger separator", () => {
   const mr = {kind:"mr", url:"https://gitlab.example/demo/-/merge_requests/1", state:"opened"};
   const tree = {kind:"tree", tree:"demo", task:"task", branch:"demo-branch", cwd:"/home/dev/demo", repo:"/home/dev/repo", children:[mr]};
-  assert.deepEqual(rowMenu(tree).map(item => item.id), ["resume", "new-agent", "review", "mr", "copy-path", "copy-branch", "remove-tree"]);
+  assert.deepEqual(rowMenu(tree).map(item => item.id), ["new-agent", "open-shell", "review", "mr", "copy-path", "copy-branch", "remove-tree"]);
   assert.deepEqual(rowMenu(tree).at(-1), {id:"remove-tree", label:"Remove worktree…", danger:true, separatorBefore:true});
   assert.ok(rowMenu({...tree, merged:true}).some(item => item.id === "remove-tree"));
   assert.deepEqual(rowMenu({...tree, task:null}).map(item => item.id),
-    ["open-agent", "open-shell", "mr", "copy-path", "copy-branch", "remove-tree"]);
+    ["open-shell", "open-agent", "mr", "copy-path", "copy-branch", "remove-tree"]);
   assert.deepEqual(rowMenu({kind:"tree", tree:"loose", body:"/home/dev/loose\n +2"}).map(item => item.id),
-    ["open-agent", "open-shell", "copy-path", "remove-tree"]);
+    ["open-shell", "open-agent", "copy-path", "remove-tree"]);
+  assert.ok(rowMenu({...tree, children:[{kind:"agent", role:"helper"}]}).some(item => item.id === "service-sessions"));
+  const old={kind:"agent",session:"codex:old",state:"stopped"};
+  assert.ok(rowMenu({...tree,children:[old]}).some(item=>item.id==="session-history"));
+  assert.ok(!rowMenu({...tree,children:[old]},{hasHistory:false}).some(item=>item.id==="session-history"));
   // nowhere to open: no path known
   assert.ok(!rowMenu({kind:"tree", tree:"loose"}).some(item => ["copy-path", "open-agent", "open-shell"].includes(item.id)));
   assert.ok(rowMenu({kind:"tree", tree:"demo"}, {mr}).some(item => item.id === "mr"));
@@ -821,4 +825,21 @@ test("the Jira tab lists open tickets with no task once each", () => {
   ]};
   assert.deepEqual(freeTickets(snapshot), [{key:"DEMO-1", title:"Summary DEMO-1"}]);
   assert.deepEqual(freeTickets(null), []);
+});
+
+
+test("helper attention and jump entries stay out of the main task UI regardless of title", () => {
+  const helper={kind:"agent",id:"helper",role:"helper",terminal:"helper",label:"Implement feature"};
+  const primary={kind:"agent",id:"primary",role:"primary",terminal:"primary",label:"Review changes"};
+  const old={kind:"agent",id:"old",terminal:null,session:"old",state:"stopped"};
+  const tree={kind:"tree",id:"tree",cwd:"/work",children:[helper,primary,old]};
+  const task={kind:"task",id:"task",children:[tree]};
+  const agents=[{address:"primary",status:"idle"},{address:"helper",status:"blocked",seq:99}];
+  assert.equal(taskSignals(task,agents).status,"open");
+  assert.deepEqual(taskSignals(task,agents).agents.map(a=>a.address),["primary"]);
+  const jumps=jumpItems({rows:[task]},agents).filter(item=>item.kind==="agent");
+  assert.deepEqual(jumps.map(item=>item.row.id),["primary"]);
+  assert.equal(agentRole(old),"unknown");
+  assert.equal(treeFocusTarget(tree,agents,[{terminal:"helper",cwd:"/work",focused:true}]).terminal,"primary");
+  assert.equal(treeFocusTarget({...tree,children:[helper]},[agents[1]],[{terminal:"helper",cwd:"/work"}]),null);
 });

@@ -111,6 +111,7 @@ mod tests {
             name: "demo".into(),
             jira: None,
             gitlab: None,
+            github: None,
             workflow: Default::default(),
             repos: vec![],
             vault: VaultConfig {

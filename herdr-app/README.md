@@ -13,7 +13,7 @@ attention. Click a task to select its Herdr space; the separate `⋯` button
 opens its note and related tickets, merge requests, worktrees and agents.
 Tasks without a live space open details with an explicit Start work action.
 
-MR shows a flat list of your GitLab merge requests across the project's configured
+MR shows a flat list of your GitLab merge requests and GitHub pull requests across the selected projects' configured
 repositories, including MRs without a task or local checkout. Each MR appears once,
 with its repository, associated tasks, CI, approvals, unresolved discussions,
 draft/conflict and merge readiness. Click or press Enter to open it in the browser;
@@ -28,7 +28,15 @@ full title, repository, ticket keys and task associations, independently of tree
 presentation. Older backends fall back to the MRs present in the task tree.
 Unavailable CI is shown as unknown. Cached results and source warnings follow the
 same refresh behavior as Tasks. `berbr.tasks` and `berbr.mrs` can also be bound as
-Herdr commands. GitHub PRs depend on the separate GitHub integration.
+Herdr commands. GitHub PRs use the configured GitHub integration.
+
+Expanded tasks also show **Artifacts**, a shared tree of any files and folders.
+Folders load on expansion; only visible directories refresh every five seconds.
+The header can refresh them manually or open the root folder in Finder.
+Markdown uses Berbr's note viewer/editor, other files their default app, and
+scripts/executables the text editor. Symlinks are revealed rather than traversed.
+Artifacts live under Berbr's home, outside worktrees and task-note directories,
+and remain available for closed tasks.
 
 The existing Rust model owns Jira, GitLab, notes, worktrees and Claude/Codex
 history. The mod consumes `berbr app-snapshot` JSON. It launches the backend through

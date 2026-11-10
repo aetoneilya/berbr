@@ -153,22 +153,182 @@ fn agents() -> Result<Vec<Value>> {
                 tabs(space).flat_map(move |tab| {
                     terminals(tab)
                         .filter(|t| t["app"].as_str().is_some())
-                        .map(move |term| (space, tab, term))
+                        .map(move |term| (space.clone(), tab.clone(), term.clone()))
                 })
             })
             .collect();
+        let jobs = match read("hc", &["ls", "--json"]) {
+            Ok(inventory) => with_child_agents(jobs, &inventory),
+            Err(_) => jobs,
+        };
         super::super::parallel(&jobs, 8, |(space, tab, term)| {
             let address = text(term, "terminal");
             let detail = read("hc", &["get", address, "--json"])?;
+            let sessions = open_codex_sessions(&detail, text(term, "app"));
             Ok(json!({
                 "name": detail["labels"]["berbr.name"].as_str().or(detail["name"].as_str()),
                 "agent_status": term["status"], "cwd": detail["foreground"]["cwd"].as_str().or(detail["cwd"].as_str()),
                 "pane_id": address, "tab_id": tab["id"], "workspace_id": space["id"],
-                "agent": term["app"], "agent_session": null,
+                "agent": term["app"], "agent_session": session_arg(&detail).or_else(|| sessions.first().cloned()).map(|id| json!({"value":id})),
+                "session_aliases":sessions,
+                "created_ms":detail["created_ms"],
+                "role":terminal_role(&detail), "parent":detail["parent"],
+                "role_explicit":matches!(detail["labels"]["berbr.role"].as_str(), Some("primary" | "helper" | "reviewer" | "temporary")),
+                "has_pane":term["_berbr_child"] != true,
                 "berbr_task": detail["labels"]["berbr.task"]
             }))
-        }).into_iter().map(|result| result.unwrap_or_else(|| Err(HerdrError::NonZeroExit("hc detail read panicked".into())))).collect()
+        }).into_iter().zip(&jobs).filter_map(|(result, (_, _, term))| {
+            let result = result.unwrap_or_else(|| Err(HerdrError::NonZeroExit("hc detail read panicked".into())));
+            if term["_berbr_child"] == true && result.is_err() { None } else { Some(result) }
+        }).collect()
     })
+}
+
+/// Child terminals may have no pane of their own. Keep their real ancestry so
+/// sessions can be classified without using their title or agent name.
+fn with_child_agents(
+    mut jobs: Vec<(Value, Value, Value)>,
+    inventory: &Value,
+) -> Vec<(Value, Value, Value)> {
+    let mut places: std::collections::HashMap<String, (Value, Value)> = jobs
+        .iter()
+        .map(|(space, tab, term)| {
+            (
+                text(term, "terminal").to_string(),
+                (space.clone(), tab.clone()),
+            )
+        })
+        .collect();
+    loop {
+        let mut added = false;
+        for child in inventory["terminals"].as_array().into_iter().flatten() {
+            let address = text(child, "address");
+            if address.is_empty()
+                || places.contains_key(address)
+                || child["state"] != "live"
+                || !matches!(
+                    child["agent"].as_str(),
+                    Some("claude" | "claude-code" | "codex")
+                )
+            {
+                continue;
+            }
+            let Some((space, tab)) = places.get(text(child, "parent")).cloned() else {
+                continue;
+            };
+            places.insert(address.into(), (space.clone(), tab.clone()));
+            jobs.push((
+                space,
+                tab,
+                json!({"terminal":address, "app":child["agent"],
+                "status":child["status"], "_berbr_child":true}),
+            ));
+            added = true;
+        }
+        if !added {
+            return jobs;
+        }
+    }
+}
+
+fn terminal_role(detail: &Value) -> Option<&'static str> {
+    match detail["labels"]["berbr.role"].as_str() {
+        Some("primary") => return Some("primary"),
+        Some("helper" | "reviewer" | "temporary") => return Some("helper"),
+        _ => {}
+    }
+    if detail["parent"]
+        .as_str()
+        .is_some_and(|parent| !parent.is_empty())
+    {
+        Some("helper")
+    } else if detail.get("parent").is_some_and(Value::is_null) {
+        Some("primary")
+    } else {
+        None
+    }
+}
+
+/// Resumed conversations name their exact ID in the owning CLI's argv. Fresh
+/// agents without an ID are reconciled with their worktree's recent sessions.
+fn session_arg(detail: &Value) -> Option<String> {
+    if let Some(id) = detail["labels"]["berbr.session"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+    {
+        return Some(crate::client::agent::AgentKind::native_id(id).into());
+    }
+    let args = detail["foreground"]["argv"]
+        .as_array()
+        .or_else(|| detail["argv"].as_array())?;
+    args.windows(2).find_map(|pair| {
+        let flag = pair[0].as_str()?;
+        let id = pair[1].as_str()?;
+        (["--resume", "-r", "--session-id", "resume"].contains(&flag)
+            && !id.is_empty()
+            && !id.starts_with('-'))
+        .then(|| id.to_string())
+    })
+}
+
+/// Codex --no-daemon keeps its rollout files open. Compaction can change the
+/// rollout ID without restarting the terminal, so retain all runtime aliases.
+fn open_codex_sessions(detail: &Value, app: &str) -> Vec<String> {
+    use std::io::{BufRead, Read};
+    if app != "codex" {
+        return vec![];
+    }
+    let Some(pid) = detail["foreground"]["pid"].as_u64() else {
+        return vec![];
+    };
+    let root = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|p| p.join(".codex")))
+        .map(|p| p.join("sessions"));
+    let Some(root) = root else {
+        return vec![];
+    };
+    let Ok(output) = Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-Fn"])
+        .output()
+    else {
+        return vec![];
+    };
+    let mut ids = vec![];
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(path) = line
+            .strip_prefix('n')
+            .map(std::path::Path::new)
+            .filter(|path| {
+                path.starts_with(&root) && path.extension().is_some_and(|ext| ext == "jsonl")
+            })
+        else {
+            continue;
+        };
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        let mut first = String::new();
+        if std::io::BufReader::new(file)
+            .take(65_536)
+            .read_line(&mut first)
+            .is_err()
+        {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&first) else {
+            continue;
+        };
+        if value["type"] != "session_meta" {
+            continue;
+        }
+        if let Some(id) = value["payload"]["id"].as_str()
+            && !ids.iter().any(|known| known == id)
+        {
+            ids.push(id.to_string());
+        }
+    }
+    ids
 }
 
 /// Where each space is now, as the app's sidebar sees it: the live folder of
@@ -255,11 +415,20 @@ fn create(command: &str, args: Value) -> Result<Value> {
     let before = read("herdr-app", &["status"])?;
     let result = act(command, args)?;
     if before["space"].as_str().is_some() {
-        act("space.select", json!({"id": before["space"]}))?;
-        act("tab.select", json!({"id": before["tab"]}))?;
-        if before["focused_pane"].as_str().is_some() {
-            act("pane.focus", json!({"pane": before["focused_pane"]}))?;
-        }
+        let restore = || -> Result<()> {
+            act("space.select", json!({"id": before["space"]}))?;
+            act("tab.select", json!({"id": before["tab"]}))?;
+            if before["focused_pane"].as_str().is_some() {
+                act("pane.focus", json!({"pane": before["focused_pane"]}))?;
+            }
+            Ok(())
+        };
+        restore().map_err(|e| {
+            HerdrError::NonZeroExit(format!(
+                "created tab: {}; terminal: {}; could not restore caller: {e}",
+                result["tab"], result["terminal"]
+            ))
+        })?;
     }
     Ok(result)
 }
@@ -436,5 +605,71 @@ mod inventory_tests {
         })
         .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+    #[test]
+    fn explicit_resume_ids_come_from_the_foreground_cli_or_a_saved_label() {
+        use serde_json::json;
+        assert_eq!(
+            super::session_arg(
+                &json!({"foreground":{"argv":["codex","--no-daemon","resume","old-id"]}})
+            ),
+            Some("old-id".into())
+        );
+        assert_eq!(
+            super::session_arg(&json!({"argv":["claude","--resume","specific-id"]})),
+            Some("specific-id".into())
+        );
+        assert_eq!(
+            super::session_arg(&json!({"argv":["codex","resume","--last"]})),
+            None
+        );
+        assert_eq!(
+            super::session_arg(&json!({"labels":{"berbr.session":"codex:known"}})),
+            Some("known".into())
+        );
+    }
+    #[test]
+    fn roles_use_parent_and_explicit_metadata_never_the_title() {
+        use serde_json::json;
+        assert_eq!(
+            super::terminal_role(&json!({"parent":"root","title":"Implement feature"})),
+            Some("helper")
+        );
+        assert_eq!(
+            super::terminal_role(&json!({"parent":null,"title":"Review changes"})),
+            Some("primary")
+        );
+        assert_eq!(
+            super::terminal_role(&json!({"parent":null,"labels":{"berbr.role":"reviewer"}})),
+            Some("helper")
+        );
+        assert_eq!(
+            super::terminal_role(&json!({"parent":"root","labels":{"berbr.role":"primary"}})),
+            Some("primary")
+        );
+        assert_eq!(super::terminal_role(&json!({"title":"reviewer"})), None);
+    }
+
+    #[test]
+    fn child_inventory_keeps_ancestry_but_not_unrelated_or_finished_terminals() {
+        use serde_json::json;
+        let jobs = vec![(
+            json!({"id":"space"}),
+            json!({"id":"tab"}),
+            json!({"terminal":"root","app":"codex"}),
+        )];
+        let all = json!({"terminals":[
+            {"address":"grandchild","parent":"child","state":"live","agent":"codex","status":"idle"},
+            {"address":"child","parent":"root","state":"live","agent":"claude-code","status":"working"},
+            {"address":"unrelated","parent":"other","state":"live","agent":"codex"},
+            {"address":"finished","parent":"root","state":"finished","agent":"codex"}]});
+        let jobs = super::with_child_agents(jobs, &all);
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[1].2["terminal"], "child");
+        assert_eq!(jobs[2].2["terminal"], "grandchild");
+        assert!(
+            jobs.iter()
+                .all(|(space, tab, _)| space["id"] == "space" && tab["id"] == "tab")
+        );
     }
 }

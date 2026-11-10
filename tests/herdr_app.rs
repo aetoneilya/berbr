@@ -83,14 +83,22 @@ if kind=='herdr-app':
  elif a[:2]==['do','space.new']: out={'space':'sp-created','tab':'tb-created','terminal':'t7'}
  elif a[:2]==['do','tab.new']: out={'tab':'tb-created','terminal':'t7'}
  elif a[:2]==['do','pane.split']: out={'terminal':'t7'}
+ elif a[:2]==['do','space.select'] and os.environ.get('BERBR_TEST_RESTORE_FAIL'):
+  print('restore denied',file=sys.stderr);sys.exit(1)
  else: out={'ok':True}
 else:
- if a[:1]==['get']:
+ if a[:1]==['label'] and os.environ.get('BERBR_TEST_LABEL_FAIL'):
+  print('fixture label failure',file=sys.stderr);sys.exit(1)
+ if a[:1]==['ls'] and os.environ.get('BERBR_TEST_CHILD_CWD'):
+  out={'terminals':[{'address':'child','parent':'t1','state':'live','agent':'codex','status':'working'}]}
+ elif a[:1]==['get']:
   busy=os.environ.get('BERBR_TEST_BUSY') and a[1]=='t7'
   starting=False
   if os.environ.get('BERBR_TEST_STARTING') and a[1]=='t7':
    count=r/'ready-count'; n=int(count.read_text()) if count.exists() else 0; count.write_text(str(n+1)); starting=n==0
   out={'address':a[1],'cwd':os.environ.get('BERBR_TEST_AGENT_CWD',str(r/'repo')),'foreground':None if starting else {'name':'codex' if busy else 'zsh','cwd':os.environ.get('BERBR_TEST_AGENT_CWD',str(r/'repo'))},'labels':{},'status':'working' if busy else None}
+  if a[1]=='child' and os.environ.get('BERBR_TEST_CHILD_CWD'):
+   out.update({'cwd':os.environ['BERBR_TEST_CHILD_CWD'],'foreground':{'name':'codex','cwd':os.environ['BERBR_TEST_CHILD_CWD']},'parent':'t1'})
  else: out={}
 print(json.dumps(out))
 "#;
@@ -113,6 +121,7 @@ print(json.dumps(out))
                 ),
             )
             .env("HOME", self.root.join("home"))
+            .env("BERBR_HOME", self.root.join("home/.berbr"))
             .env("XDG_CACHE_HOME", self.root.join("cache"))
             .env("BERBR_CONFIG", self.root.join("config.toml"))
             .env("BERBR_BACKEND", "herdr-app")
@@ -142,6 +151,278 @@ fn success(out: Output) -> Value {
         String::from_utf8_lossy(&out.stderr)
     );
     serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn task_artifacts_list_any_files_and_folders_and_survive_renaming_and_closing() {
+    let f = Fixture::new();
+    let root = f.root.join("home/.berbr/projects/test/artifacts/test-0");
+    let before = fs::read(f.root.join("vault/tasks/test-0.md")).unwrap();
+    let list = success(
+        f.command()
+            .args(["artifacts", "test-0", "--list"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(list["path"], root.to_str().unwrap());
+    assert_eq!(list["entries"], serde_json::json!([]));
+    fs::create_dir(root.join("folder with spaces")).unwrap();
+    for name in [
+        "plan.md",
+        "page.html",
+        "data.csv",
+        "script.sh",
+        "unknown.xyz",
+        ".hidden",
+    ] {
+        fs::write(root.join(name), "content").unwrap();
+    }
+    fs::write(root.join("folder with spaces/данные.csv"), "a,b").unwrap();
+    let list = success(
+        f.command()
+            .args(["artifacts", "test-0", "--list"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(list["entries"].as_array().unwrap().len(), 7);
+    assert_eq!(list["entries"][0]["kind"], "directory");
+    let nested = success(
+        f.command()
+            .args([
+                "artifacts",
+                "test-0",
+                "--list",
+                "--directory",
+                "folder with spaces",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        nested["entries"][0]["relative"],
+        "folder with spaces/данные.csv"
+    );
+    assert_eq!(
+        fs::read(f.root.join("vault/tasks/test-0.md")).unwrap(),
+        before
+    );
+    for directory in ["../", root.to_str().unwrap()] {
+        assert!(
+            !f.command()
+                .args(["artifacts", "test-0", "--list", "--directory", directory])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    success(
+        f.command()
+            .args(["task", "update", "test-0", "--title", "A different title"])
+            .output()
+            .unwrap(),
+    );
+    // The normal close operation moves the note to done/. Artifact identity
+    // must depend on neither its title nor its note's current directory.
+    let note = f.root.join("vault/tasks/test-0.md");
+    let text = fs::read_to_string(&note)
+        .unwrap()
+        .replace("id: test-0", "id: test-0\ndone: true");
+    fs::create_dir(f.root.join("vault/tasks/done")).unwrap();
+    fs::write(f.root.join("vault/tasks/done/test-0.md"), text).unwrap();
+    fs::remove_file(note).unwrap();
+    let out = f.command().args(["artifacts", "test-0"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        root.to_str().unwrap()
+    );
+    assert!(root.join("plan.md").exists());
+}
+
+#[test]
+fn artifact_paths_in_snapshots_are_read_only_and_project_scoped() {
+    let f = Fixture::new();
+    let snapshot = success(
+        f.command()
+            .args(["app-snapshot", "--cached"])
+            .output()
+            .unwrap(),
+    );
+    fn task(rows: &[Value]) -> &Value {
+        for row in rows {
+            if row["kind"] == "task" {
+                return row;
+            }
+            if row["children"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty())
+            {
+                return task(row["children"].as_array().unwrap());
+            }
+        }
+        panic!("no task");
+    }
+    let expected = f.root.join("home/.berbr/projects/test/artifacts/test-0");
+    assert_eq!(
+        task(snapshot["rows"].as_array().unwrap())["artifacts"],
+        expected.to_str().unwrap()
+    );
+    assert!(!expected.exists());
+    let config = f.root.join("config.toml");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("\n[[project]]\nname = 'other'\ntask_dirs = ['tasks']\n");
+    fs::write(config, text).unwrap();
+    let other = success(
+        f.command()
+            .args(["-p", "other", "artifacts", "test-0", "--list"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        other["path"],
+        f.root
+            .join("home/.berbr/projects/other/artifacts/test-0")
+            .to_str()
+            .unwrap()
+    );
+    assert!(!expected.exists());
+}
+
+#[test]
+fn agents_in_different_worktrees_resolve_one_shared_artifact_folder() {
+    let f = Fixture::new();
+    let repo = f.root.join("repo");
+    let trees = [
+        repo.join(".herdr/worktrees/first"),
+        repo.join(".herdr/worktrees/second"),
+    ];
+    for (i, tree) in trees.iter().enumerate() {
+        f.git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                &format!("tree-{i}"),
+                tree.to_str().unwrap(),
+            ],
+        );
+        fs::create_dir(tree.join("subdir")).unwrap();
+    }
+    fs::write(
+        f.root.join("vault/tasks/test-0.md"),
+        format!(
+            "---\nid: test-0\nworktrees: [{:?}, {:?}]\n---\nContext\n",
+            trees[0], trees[1]
+        ),
+    )
+    .unwrap();
+    let first = success(
+        f.command()
+            .current_dir(trees[0].join("subdir"))
+            .args(["artifacts", "--list"])
+            .output()
+            .unwrap(),
+    );
+    let root = PathBuf::from(first["path"].as_str().unwrap());
+    fs::write(root.join("plan.md"), "Shared plan").unwrap();
+    let second = success(
+        f.command()
+            .current_dir(&trees[1])
+            .args(["artifacts", "--list"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(first["path"], second["path"]);
+    assert_eq!(second["entries"][0]["name"], "plan.md");
+    fs::write(
+        f.root.join("vault/tasks/other.md"),
+        "---\nid: other\n---\nOther task\n",
+    )
+    .unwrap();
+    let other = success(
+        f.command()
+            .args(["artifacts", "other", "--list"])
+            .output()
+            .unwrap(),
+    );
+    assert_ne!(first["path"], other["path"]);
+    assert_eq!(other["entries"], serde_json::json!([]));
+    // Both context tools must refuse conflicting explicit bindings.
+    fs::write(
+        f.root.join("vault/tasks/other.md"),
+        format!("---\nid: other\nworktrees: [{:?}]\n---\n", trees[0]),
+    )
+    .unwrap();
+    let out = f
+        .command()
+        .current_dir(&trees[0])
+        .args(["artifacts"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("belongs to several tasks"));
+}
+
+#[test]
+fn artifacts_reject_symlinks_in_every_managed_namespace_component() {
+    use std::os::unix::fs::symlink;
+    for relative in [
+        "projects",
+        "projects/test",
+        "projects/test/artifacts",
+        "projects/test/artifacts/test-0",
+    ] {
+        let f = Fixture::new();
+        let home = f.root.join("home/.berbr");
+        let link = home.join(relative);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let foreign = f.root.join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("keep.txt"), "Other task").unwrap();
+        symlink(&foreign, &link).unwrap();
+        let out = f
+            .command()
+            .args(["artifacts", "test-0", "--list"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "accepted symlink: {relative}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("symlink"));
+        assert!(link.symlink_metadata().unwrap().is_symlink());
+        assert_eq!(fs::read_dir(foreign).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn artifacts_support_long_legacy_names_without_colliding() {
+    let f = Fixture::new();
+    let mut paths = Vec::new();
+    for suffix in ["a", "b"] {
+        let name = format!("{}{suffix}", "я".repeat(120));
+        fs::write(
+            f.root.join("vault/tasks").join(format!("{name}.md")),
+            "---\n---\nLegacy\n",
+        )
+        .unwrap();
+        let result = success(
+            f.command()
+                .args(["artifacts", &name, "--list"])
+                .output()
+                .unwrap(),
+        );
+        let path = PathBuf::from(result["path"].as_str().unwrap());
+        assert!(path.is_dir());
+        assert!(path.file_name().unwrap().to_str().unwrap().len() <= 200);
+        paths.push(path);
+    }
+    assert_ne!(paths[0], paths[1]);
+    fs::write(paths[0].join("private.txt"), "First task").unwrap();
+    assert_eq!(fs::read_dir(&paths[1]).unwrap().count(), 0);
 }
 
 #[test]
@@ -402,7 +683,8 @@ fn add_existing_key_creates_named_worktree_without_prompts_or_focus() {
         for args in [vec!["add"], vec!["add", "test-0"]] {
             let error = f.command().args(args).output().unwrap();
             assert!(!error.status.success());
-            assert!(String::from_utf8_lossy(&error.stderr).contains("berbr add [<task>] <KEY>"));
+            let error = String::from_utf8_lossy(&error.stderr);
+            assert!(error.contains("berbr add") && error.contains("--name"));
         }
         // Missing current context must return an error instead of opening a picker.
         let error = f
@@ -450,6 +732,28 @@ fn add_reports_checkout_and_launch_failures_to_the_caller() {
     assert!(!out.status.success());
     assert!(out.stdout.is_empty());
     assert!(String::from_utf8_lossy(&out.stderr).contains("not an available shell"));
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains(f.root.join("repo/.herdr/worktrees/busy").to_str().unwrap()));
+    assert!(error.contains("tb-created") && error.contains("t7"));
+    let out = f
+        .command()
+        .env("BERBR_TEST_RESTORE_FAIL", "1")
+        .args(["add", "test-0", "--name", "restore-failure", "--bg"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        error.contains("restore denied") && error.contains("tb-created") && error.contains("t7")
+    );
+    assert!(
+        error.contains(
+            f.root
+                .join("repo/.herdr/worktrees/restore-failure")
+                .to_str()
+                .unwrap()
+        )
+    );
 }
 
 #[test]
@@ -825,6 +1129,483 @@ fn start_uses_title_slug_and_claude_display_name_in_prepare_and_main_checkout() 
             assert_eq!(spec["branch"], "parser-repeated-calls-with");
         }
     }
+}
+
+#[test]
+fn add_cannot_steal_a_name_reserved_by_an_asynchronous_start() {
+    let f = Fixture::new();
+    let before = fs::read(f.root.join("vault/tasks/test-0.md")).unwrap();
+    let out = f
+        .command()
+        .args(["start", "Async task", "--name", "shared", "--bg"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let tree = f.root.join("repo/.herdr/worktrees/shared");
+    assert!(
+        !tree.exists(),
+        "prepare is captured, so the checkout is still pending"
+    );
+    let owner = fs::read_to_string(f.root.join("vault/tasks/test-1.md")).unwrap();
+    assert!(owner.contains(tree.to_str().unwrap()));
+    let out = f
+        .command()
+        .args(["add", "test-0", "--name", "shared", "--bg"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("reserved"));
+    assert!(!tree.exists());
+    assert_eq!(
+        fs::read(f.root.join("vault/tasks/test-0.md")).unwrap(),
+        before
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("vault/tasks/test-1.md")).unwrap(),
+        owner
+    );
+}
+
+#[test]
+fn explicit_context_does_not_return_a_brief_with_ambiguous_inferred_ownership() {
+    for by_ticket in [true, false] {
+        let f = Fixture::new();
+        let repo = f.root.join("repo");
+        f.git(&repo, &["branch", "-m", "TEST-1-parser"]);
+        for id in ["test-0", "test-1"] {
+            let reference = if by_ticket {
+                "tickets: [TEST-1]".to_string()
+            } else {
+                format!(
+                    "sessions: [{:?}]",
+                    format!("old {} 2026-11-01", repo.display())
+                )
+            };
+            fs::write(
+                f.root.join(format!("vault/tasks/{id}.md")),
+                format!("---\nid: {id}\n{reference}\n---\nRequirements\n"),
+            )
+            .unwrap();
+        }
+        let note = f.root.join("vault/tasks/test-0.md");
+        fs::write(repo.join(".git/task.md"), format!("# test-0\nThe task note is the shared context for all of the task's tickets — read it in full: {}\n", note.display())).unwrap();
+        let data = success(f.command().args(["context", "--json"]).output().unwrap());
+        assert_eq!(data["status"], "ambiguous");
+        let data = success(
+            f.command()
+                .args(["context", "--task", "test-0", "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(data["task"]["id"], "test-0");
+        assert!(data["brief"].is_null());
+    }
+}
+
+#[test]
+fn task_list_is_local_read_only_and_reports_skipped_notes() {
+    let f = Fixture::new();
+    let note = f.root.join("vault/tasks/test-0.md");
+    let before = fs::read(&note).unwrap();
+    fs::write(
+        f.root.join("vault/tasks/closed.md"),
+        "---\nid: closed\ndone: true\n---\nClosed\n",
+    )
+    .unwrap();
+    fs::write(
+        f.root.join("vault/tasks/broken.md"),
+        "---\ntitle: [broken\n---\n",
+    )
+    .unwrap();
+    for cache in ["home/Library/Caches/berbr", "cache/berbr"] {
+        fs::create_dir_all(f.root.join(cache).join("lock")).unwrap();
+    }
+    let list = success(
+        f.command()
+            .args(["task", "list", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(list["project"], "test");
+    assert_eq!(list["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(list["tasks"][0]["id"], "test-0");
+    assert_eq!(list["warnings"].as_array().unwrap().len(), 1);
+    let list = success(
+        f.command()
+            .args(["task", "list", "--all", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(list["tasks"].as_array().unwrap().len(), 2);
+    assert_eq!(fs::read(note).unwrap(), before);
+    assert!(
+        !f.root.join("calls.jsonl").exists(),
+        "list must not query Herdr/hc"
+    );
+}
+
+#[test]
+fn context_resolves_an_external_worktree_offline_and_returns_its_brief() {
+    let f = Fixture::new();
+    let tree = f.root.join("external/parser");
+    f.git(
+        &f.root.join("repo"),
+        &["worktree", "add", "-qb", "parser", tree.to_str().unwrap()],
+    );
+    fs::create_dir(tree.join("src")).unwrap();
+    let git_dir = f.git(&tree, &["rev-parse", "--absolute-git-dir"]);
+    let brief = PathBuf::from(git_dir).join("task.md");
+    let note = f.root.join("vault/tasks/test-0.md");
+    fs::write(&brief, format!("# test-0\n\nThe task note is the shared context for all of the task's tickets — read it in full: {}\n", note.display())).unwrap();
+    fs::write(
+        &note,
+        format!("---\nid: test-0\ntitle: Parser\nworktrees: [{tree:?}]\n---\nRequirements\n"),
+    )
+    .unwrap();
+    let before = fs::read(&note).unwrap();
+    let data = success(
+        f.command()
+            .current_dir(tree.join("src"))
+            .env("BERBR_TEST_DOWN", "1")
+            .args(["context", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(data["status"], "resolved");
+    assert_eq!(data["project"], "test");
+    assert_eq!(data["task"]["id"], "test-0");
+    assert_eq!(data["source"], "binding");
+    assert_eq!(data["worktree"], tree.to_str().unwrap());
+    assert_eq!(data["branch"], "parser");
+    assert_eq!(data["brief"], brief.to_str().unwrap());
+    fs::write(&brief, "# unrelated\n\nThe task note is the shared context for all of the task's tickets — read it in full: /home/dev/other/task.md\n").unwrap();
+    let data = success(
+        f.command()
+            .current_dir(&tree)
+            .args(["context", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(data["task"]["id"], "test-0");
+    assert!(
+        data["brief"].is_null(),
+        "a stale brief for another task must not be returned"
+    );
+    assert_eq!(fs::read(note).unwrap(), before);
+    assert!(
+        !f.root.join("calls.jsonl").exists(),
+        "context must not query Herdr/hc"
+    );
+    assert!(
+        !f.root.join("cache").exists(),
+        "context must not write caches"
+    );
+}
+
+#[test]
+fn context_returns_candidates_on_conflicting_bindings_and_allows_an_explicit_task() {
+    let f = Fixture::new();
+    let repo = f.root.join("repo");
+    for id in ["test-0", "test-1"] {
+        fs::write(
+            f.root.join(format!("vault/tasks/{id}.md")),
+            format!("---\nid: {id}\nworktrees: [{repo:?}]\n---\nRequirements\n"),
+        )
+        .unwrap();
+    }
+    let data = success(f.command().args(["context", "--json"]).output().unwrap());
+    assert_eq!(data["status"], "ambiguous");
+    assert!(data["task"].is_null());
+    assert_eq!(data["candidates"].as_array().unwrap().len(), 2);
+    let data = success(
+        f.command()
+            .args(["context", "--json", "--task", "test-1"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(data["status"], "resolved");
+    assert_eq!(data["task"]["id"], "test-1");
+    assert!(
+        data["brief"].is_null(),
+        "ambiguous ownership must not expose another task's brief"
+    );
+    assert!(!f.root.join("calls.jsonl").exists());
+}
+
+#[test]
+fn context_does_not_fall_back_to_the_first_project_or_guess_between_projects() {
+    let f = Fixture::new();
+    let data = success(
+        f.command()
+            .current_dir(f.root.join("home"))
+            .args(["context", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(data["status"], "no_project");
+    assert!(data["project"].is_null());
+    assert_eq!(data["project_candidates"][0], "test");
+    let data = success(
+        f.command()
+            .current_dir(f.root.join("home"))
+            .args(["-p", "test", "context", "--json", "--task", "test-0"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(data["task"]["id"], "test-0");
+    assert!(data["brief"].is_null());
+    let config = f.root.join("config.toml");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "\n[[project]]\nname = \"other\"\ntask_dirs = [\"other\"]\n[[project.repo]]\npath = {:?}\n",
+        f.root.join("repo")
+    ));
+    fs::write(config, text).unwrap();
+    let data = success(f.command().args(["context", "--json"]).output().unwrap());
+    assert_eq!(data["status"], "ambiguous_project");
+    assert!(data["task"].is_null());
+    assert_eq!(data["project_candidates"].as_array().unwrap().len(), 2);
+    let data = success(
+        f.command()
+            .args(["-p", "test", "context", "--task", "test-0", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(data["task"]["id"], "test-0");
+}
+
+#[test]
+fn ticketless_add_reports_a_created_checkout_if_binding_fails_and_does_not_launch() {
+    let f = Fixture::new();
+    for cache in ["home/Library/Caches/berbr", "cache/berbr"] {
+        fs::create_dir_all(f.root.join(cache).join("lock")).unwrap();
+    }
+    let note = f.root.join("vault/tasks/test-0.md");
+    let before = fs::read(&note).unwrap();
+    let out = f
+        .command()
+        .args(["add", "test-0", "--name", "pending-binding", "--bg"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let tree = f.root.join("repo/.herdr/worktrees/pending-binding");
+    assert!(tree.is_dir());
+    assert!(String::from_utf8_lossy(&out.stderr).contains(tree.to_str().unwrap()));
+    assert_eq!(fs::read(note).unwrap(), before);
+    assert!(
+        !f.calls()
+            .iter()
+            .any(|c| c[0] == "herdr-app" && c[1][0] == "do" && c[1][1] == "tab.new")
+    );
+}
+
+#[test]
+fn ticketless_add_persists_ownership_and_can_extend_the_same_task_again() {
+    let f = Fixture::new();
+    let note = f.root.join("vault/tasks/test-0.md");
+    fs::write(&note, "---\nid: test-0\ntitle: Parser\ntickets: [TEST-1]\n---\nKeep requirements\n\n## Agent notes\nKeep finding\n").unwrap();
+    let out = f
+        .command()
+        .args([
+            "add",
+            "test-0",
+            "--name",
+            "side-branch",
+            "--description",
+            "Inspect parser",
+            "--bg",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let tree = f.root.join("repo/.herdr/worktrees/side-branch");
+    assert_eq!(f.git(&tree, &["branch", "--show-current"]), "side-branch");
+    let context = success(
+        f.command()
+            .current_dir(&tree)
+            .env_remove("HERDR_WORKSPACE_ID")
+            .args(["context", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(context["task"]["id"], "test-0");
+    let out = f
+        .command()
+        .current_dir(&tree)
+        .env_remove("HERDR_WORKSPACE_ID")
+        .args([
+            "add",
+            "--name",
+            "second-branch",
+            "--description",
+            "Inspect ordering",
+            "--bg",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = fs::read_to_string(note).unwrap();
+    assert!(text.contains(tree.to_str().unwrap()));
+    assert!(text.contains("second-branch"));
+    assert!(
+        text.contains("TEST-1")
+            && text.contains("Keep requirements")
+            && text.contains("Keep finding")
+    );
+    assert!(!text.contains("TEST-2"));
+    let tabs = f
+        .calls()
+        .iter()
+        .filter(|c| c[0] == "herdr-app" && c[1][0] == "do" && c[1][1] == "tab.new")
+        .count();
+    assert_eq!(tabs, 2);
+    let out = f
+        .command()
+        .args(["add", "test-0", "--name", "side-branch"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a duplicate checkout must not be replaced"
+    );
+}
+
+#[test]
+fn generated_brief_note_command_works_outside_the_project_for_a_legacy_note() {
+    let f = Fixture::new();
+    let repo = f.root.join("repo");
+    let tree = repo.join(".herdr/worktrees/followup");
+    f.git(
+        &repo,
+        &["worktree", "add", "-qb", "followup", tree.to_str().unwrap()],
+    );
+    let note = f.root.join("vault/tasks/test-0.md");
+    fs::write(
+        &note,
+        format!(
+            "---\nid: test-0\ntitle: Human title\nworktrees: [{tree:?}]\n---\nKeep requirements\n"
+        ),
+    )
+    .unwrap();
+    let out = f
+        .command()
+        .args(["add", "test-0", "--in", tree.to_str().unwrap(), "--bg"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let git_dir = f.git(&tree, &["rev-parse", "--absolute-git-dir"]);
+    let brief = fs::read_to_string(PathBuf::from(git_dir).join("task.md")).unwrap();
+    let command = brief
+        .split('`')
+        .find(|s| s.starts_with("berbr ") && s.contains(" note "))
+        .unwrap();
+    let command = command
+        .replace("'<finding>'", "'Finding from brief'")
+        .replacen(
+            "berbr",
+            &format!("'{}'", env!("CARGO_BIN_EXE_berbr").replace('\'', "'\\''")),
+            1,
+        );
+    // Give the default project a same-ID task, so an omitted -p silently targets
+    // the wrong note rather than merely causing a lookup error.
+    let config = f.root.join("config.toml");
+    let text = fs::read_to_string(&config).unwrap().replace(
+        "[[project]]\nname = \"test\"",
+        "[[project]]\nname = \"other\"\ntask_dirs = [\"other\"]\n[[project]]\nname = \"test\"",
+    );
+    fs::write(config, text).unwrap();
+    fs::create_dir_all(f.root.join("vault/other")).unwrap();
+    let other = f.root.join("vault/other/test-0.md");
+    fs::write(&other, "---\nid: test-0\n---\nDo not change\n").unwrap();
+    let untouched = fs::read(&other).unwrap();
+    let env = f.command();
+    let mut shell = Command::new("/bin/sh");
+    for (key, value) in env.get_envs() {
+        match value {
+            Some(value) => {
+                shell.env(key, value);
+            }
+            None => {
+                shell.env_remove(key);
+            }
+        }
+    }
+    let out = shell
+        .current_dir(f.root.join("home"))
+        .env_remove("HERDR_WORKSPACE_ID")
+        .args(["-c", &command])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let updated = fs::read_to_string(note).unwrap();
+    assert!(updated.contains("Keep requirements") && updated.contains("Finding from brief"));
+    assert_eq!(fs::read(other).unwrap(), untouched);
+}
+
+#[test]
+fn unchanged_task_update_needs_no_note_write_lock() {
+    let f = Fixture::new();
+    let path = f.root.join("vault/tasks/test-0.md");
+    let original = fs::read(&path).unwrap();
+    // An unavailable write lock must not prevent an update that changes nothing.
+    for cache in ["home/Library/Caches/berbr", "cache/berbr"] {
+        fs::create_dir_all(f.root.join(cache).join("lock")).unwrap();
+    }
+    for args in [
+        vec![
+            "--fill-empty",
+            "--title",
+            "Replacement",
+            "--description",
+            "Replacement",
+        ],
+        vec![
+            "--title",
+            "Task \"quotes\"",
+            "--description",
+            " Description with Unicode: задача \n",
+        ],
+    ] {
+        let out = f
+            .command()
+            .args(["task", "update", "test-0"])
+            .args(args)
+            .output()
+            .unwrap();
+        let task = success(out);
+        assert_eq!(task["title"], "Task \"quotes\"");
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+    let out = f
+        .command()
+        .args(["task", "update", "test-0", "--title", "Changed"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a real update still requires the lock"
+    );
+    assert_eq!(fs::read(path).unwrap(), original);
 }
 
 #[test]
@@ -1703,6 +2484,7 @@ print(json.dumps({'spaces':[{'id':'space','name':'test-0','machine':None,'tabs':
 import os,sys,json,time,fcntl
 from pathlib import Path
 root=Path(os.environ['BERBR_TEST_ROOT']); path=root/'detail-pool.json'
+if sys.argv[1]=='ls': print(json.dumps({'terminals':[]})); sys.exit(0)
 def update(delta):
  with path.open('a+') as f:
   fcntl.flock(f,fcntl.LOCK_EX); f.seek(0)
@@ -1855,4 +2637,404 @@ fn migrate_copies_tasks_out_of_the_vault_and_berbr_then_reads_its_own_folder() {
     // a second run copies nothing over what is there
     let out = fixture.command().arg("migrate").output().unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("Copied 0 task(s)"));
+}
+
+#[test]
+fn task_worktree_shell_uses_its_task_space_even_when_the_first_terminal_is_elsewhere() {
+    let f = Fixture::new();
+    let main = f.root.join("repo");
+    let a = main.join(".herdr/worktrees/a");
+    let b = main.join(".herdr/worktrees/b");
+    f.git(
+        &main,
+        &["worktree", "add", "-qb", "branch-a", a.to_str().unwrap()],
+    );
+    f.git(
+        &main,
+        &["worktree", "add", "-qb", "branch-b", b.to_str().unwrap()],
+    );
+    fs::create_dir_all(a.join("src")).unwrap();
+    fs::write(
+        f.root.join("vault/tasks/test-0.md"),
+        format!(
+            "---\nid: test-0\nworktrees: [{:?}, {:?}]\n---\nTask\n",
+            a, b
+        ),
+    )
+    .unwrap();
+    let out = f
+        .command()
+        .env("BERBR_TEST_AGENT_CWD", a.join("src"))
+        .args(["open", b.to_str().unwrap(), "--shell"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = f.calls();
+    let new_tab = calls
+        .iter()
+        .find(|c| c[0] == "herdr-app" && c[1][0] == "do" && c[1][1] == "tab.new")
+        .unwrap();
+    let args: Value = serde_json::from_str(new_tab[1][2].as_str().unwrap()).unwrap();
+    assert_eq!(args["space"], "sp-local");
+    assert_eq!(args["folder"], b.to_string_lossy().as_ref());
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c[0] == "herdr-app" && c[1][1] == "space.new")
+    );
+}
+
+#[test]
+fn removing_worktree_with_a_child_agent_keeps_the_coordinators_tab() {
+    let f = Fixture::new();
+    let repo = f.root.join("repo");
+    let tree = repo.join(".claude/worktrees/work");
+    f.git(
+        &repo,
+        &["worktree", "add", "-qb", "work", tree.to_str().unwrap()],
+    );
+    f.git(&repo, &["update-ref", "refs/remotes/origin/HEAD", "HEAD"]);
+    let out = f
+        .command()
+        .env("BERBR_TEST_CHILD_CWD", &tree)
+        .args(["done", "--tree", "work", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!tree.exists());
+    let calls = f.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c[0] == "hc" && c[1][0] == "get" && c[1][1] == "child")
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c[0] == "herdr-app" && c[1][0] == "do" && c[1][1] == "tab.close")
+    );
+}
+
+#[test]
+fn resuming_service_conversation_labels_it_before_starting_the_agent() {
+    let f = Fixture::new();
+    let repo = f.root.join("repo");
+    let tree = repo.join(".claude/worktrees/work");
+    f.git(
+        &repo,
+        &["worktree", "add", "-qb", "work", tree.to_str().unwrap()],
+    );
+    let sessions = f.root.join("codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("rollout-saved.jsonl"),
+        serde_json::json!({
+            "type":"session_meta", "timestamp":"2026-11-09T10:00:00Z",
+            "payload":{"id":"saved", "cwd":tree, "source":"cli"}
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+    let out = f
+        .command()
+        .args([
+            "open",
+            tree.to_str().unwrap(),
+            "--resume",
+            "codex:saved",
+            "--role",
+            "helper",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = f.calls();
+    let label = calls
+        .iter()
+        .position(|c| {
+            c[0] == "hc"
+                && c[1][0] == "label"
+                && c[1]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|arg| arg == "berbr.role=helper")
+        })
+        .unwrap();
+    let start = calls
+        .iter()
+        .position(|c| {
+            c[0] == "hc"
+                && c[1][0] == "send"
+                && c[1][2].as_str().unwrap_or("").contains("'resume' 'saved'")
+        })
+        .unwrap();
+    assert!(label < start);
+}
+
+#[test]
+fn github_only_cached_board_needs_no_auth_and_missing_auth_keeps_local_tasks_visible() {
+    let f = Fixture::new();
+    let path = f.root.join("config.toml");
+    let config = fs::read_to_string(&path).unwrap().replace(
+        "task_dirs =",
+        "github = { repo = \"demo/repo\" }\ntask_dirs =",
+    );
+    fs::write(&path, config).unwrap();
+    let gh = f.root.join("bin/gh");
+    fs::write(&gh, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let before = fs::read(f.root.join("vault/tasks/test-0.md")).unwrap();
+    let snapshot = success(
+        f.command()
+            .args(["app-snapshot", "--cached"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        snapshot["projects"][0]["integrations"],
+        serde_json::json!({"jira":false,"github":true})
+    );
+    assert_eq!(snapshot["sources"]["github"], "Missing");
+    assert!(
+        snapshot["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["task"] == "test-0")
+    );
+    assert!(
+        !snapshot["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().starts_with("GitHub:"))
+    );
+    let online = success(
+        f.command()
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .arg("app-snapshot")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(online["sources"]["github"], "Missing");
+    assert!(online["warnings"].as_array().unwrap().iter().any(|w| {
+        w.as_str()
+            .unwrap()
+            .contains("GitHub authentication missing")
+    }));
+    assert!(
+        online["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["task"] == "test-0")
+    );
+    assert_eq!(
+        fs::read(f.root.join("vault/tasks/test-0.md")).unwrap(),
+        before
+    );
+    let out = f
+        .command()
+        .args(["start", "Local GitHub task", "--no-agent", "--no-worktree"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn github_ticket_arguments_are_validated_before_creating_a_note_without_worktree_or_agent() {
+    let f = Fixture::new();
+    let path = f.root.join("config.toml");
+    let config = fs::read_to_string(&path).unwrap().replace(
+        "task_dirs =",
+        "github = { repo = \"demo/repo\" }\ntask_dirs =",
+    );
+    fs::write(&path, config).unwrap();
+    let gh = f.root.join("bin/gh");
+    fs::write(&gh, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let notes = || {
+        fs::read_dir(f.root.join("vault/tasks"))
+            .unwrap()
+            .map(|p| p.unwrap().path())
+            .collect::<Vec<_>>()
+    };
+    let before = notes();
+    for first in ["demo/repo#1", "DEMO-1"] {
+        let out = f
+            .command()
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .args([
+                "start",
+                "Unvalidated links",
+                "--ticket",
+                first,
+                "--ticket",
+                "demo/repo#2",
+                "--no-agent",
+                "--no-worktree",
+            ])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("GitHub authentication missing"));
+        assert_eq!(
+            notes(),
+            before,
+            "failed validation must create no task note"
+        );
+    }
+    for key in ["#2", "demo/repo#2", "https://github.com/demo/repo/issues/2"] {
+        let out = f
+            .command()
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env("HERDR_WORKSPACE_ID", "sp-local")
+            .args(["add", key, "--name", "github-followup", "--bg"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("GitHub authentication missing"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !f.root
+                .join("repo/.herdr/worktrees/github-followup")
+                .exists()
+        );
+        assert_eq!(notes(), before);
+    }
+}
+
+#[test]
+fn resume_and_shell_refuse_ambiguous_task_ownership_before_creating_a_pane() {
+    let f = Fixture::new();
+    let repo = f.root.join("repo");
+    let tree = repo.join(".herdr/worktrees/work");
+    f.git(
+        &repo,
+        &["worktree", "add", "-qb", "work", tree.to_str().unwrap()],
+    );
+    for (file, id) in [("test-0.md", "test-0"), ("other.md", "other")] {
+        fs::write(
+            f.root.join("vault/tasks").join(file),
+            format!("---\nid: {id}\nworktrees: [{tree:?}]\n---\nTask\n"),
+        )
+        .unwrap();
+    }
+    for args in [vec!["--shell"], vec!["--resume", "codex:old"]] {
+        let out = f
+            .command()
+            .args(["open", tree.to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("belongs to several tasks"));
+    }
+    assert!(
+        !f.calls()
+            .iter()
+            .any(|c| c[0] == "herdr-app" && c[1][0] == "do")
+    );
+    fs::write(
+        f.root.join("vault/tasks/other.md"),
+        format!("---\nid: other\ndone: true\nworktrees: [{tree:?}]\n---\nClosed predecessor\n"),
+    )
+    .unwrap();
+    fs::write(f.root.join("vault/tasks/test-0.md"), format!("---\nid: test-0\nworktrees: [{tree:?}]\nsessions: [\"codex:old work 2026-11-10\"]\n---\nActive task\n")).unwrap();
+    for args in [vec!["--shell"], vec!["--resume", "codex:old"]] {
+        let out = f
+            .command()
+            .args(["open", tree.to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let calls = f.calls();
+    for call in calls
+        .iter()
+        .filter(|c| c[0] == "herdr-app" && c[1][1] == "tab.new")
+    {
+        let args: Value = serde_json::from_str(call[1][2].as_str().unwrap()).unwrap();
+        assert_eq!(args["space"], "sp-local");
+    }
+    let launch = calls
+        .iter()
+        .find(|c| c[0] == "hc" && c[1][0] == "send")
+        .unwrap();
+    assert!(
+        launch[1][2].as_str().unwrap().contains(
+            f.root
+                .join("home/.berbr/projects/test/artifacts/test-0")
+                .to_str()
+                .unwrap()
+        )
+    );
+    assert!(
+        !f.root
+            .join("home/.berbr/projects/test/artifacts/other")
+            .exists()
+    );
+}
+
+#[test]
+fn role_label_failure_reports_the_created_terminal_without_starting_an_agent() {
+    let f = Fixture::new();
+    let repo = f.root.join("repo");
+    let tree = repo.join(".herdr/worktrees/work");
+    f.git(
+        &repo,
+        &["worktree", "add", "-qb", "work", tree.to_str().unwrap()],
+    );
+    let sessions = f.root.join("codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(sessions.join("rollout-saved.jsonl"),serde_json::json!({"type":"session_meta", "timestamp":"2026-11-10T10:00:00Z", "payload":{"id":"saved","cwd":tree,"source":"cli"}}).to_string()+"\n").unwrap();
+    let out = f
+        .command()
+        .env("BERBR_TEST_LABEL_FAIL", "1")
+        .args([
+            "open",
+            tree.to_str().unwrap(),
+            "--resume",
+            "codex:saved",
+            "--role",
+            "helper",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        error.contains("terminal t7") && error.contains("remains available"),
+        "{error}"
+    );
+    assert!(!f.calls().iter().any(|c| c[0] == "hc" && c[1][0] == "send"));
 }

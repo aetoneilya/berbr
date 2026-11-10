@@ -329,6 +329,7 @@ fn plan_task_table(mut table: Table, row: usize, force: bool) -> Result<TaskPlan
         .iter()
         .chain(table.jira.warning.iter())
         .chain(table.gitlab.warning.iter())
+        .chain(table.github.warning.iter())
     {
         if warning.contains(": ambiguous") && !warning.starts_with(&format!("{}:", task.task.name))
         {
@@ -360,7 +361,11 @@ fn plan_task_table(mut table: Table, row: usize, force: bool) -> Result<TaskPlan
             .collect();
         for &m in task.mrs.iter().filter(|m| !held.contains(m)) {
             if table.mr(m).opened() {
-                blockers.push(format!("MR !{} is open", table.mr(m).mr.iid()));
+                blockers.push(format!(
+                    "{} {} is open",
+                    table.mr(m).mr.kind(),
+                    table.mr(m).mr.number_label()
+                ));
             }
         }
     }
@@ -371,10 +376,14 @@ fn plan_task_table(mut table: Table, row: usize, force: bool) -> Result<TaskPlan
             .iter()
             .chain(&task.found_tickets)
             .filter(|k| {
-                table
-                    .tickets
-                    .get(*k)
-                    .is_some_and(|t| t.mine == mine && !t.closed())
+                table.tickets.get(*k).is_some_and(|t| {
+                    !t.closed()
+                        && if crate::client::issue::github_parts(k).is_some() {
+                            !mine
+                        } else {
+                            t.mine == mine
+                        }
+                })
             })
             .cloned()
             .collect()
@@ -628,7 +637,11 @@ fn trees_for_done_with(
     } else {
         table::build(config, Vec::new(), true)
     };
-    let warning = table.gitlab.warning.clone();
+    let warning = table
+        .gitlab
+        .warning
+        .clone()
+        .or_else(|| table.github.warning.clone());
     if !read_only && let Some(blocker) = tree_data_blocker(&table, force) {
         return Err(blocker);
     }
@@ -636,13 +649,11 @@ fn trees_for_done_with(
 }
 
 fn tree_data_blocker(table: &Table, force: bool) -> Option<String> {
-    table
-        .gitlab
-        .warning
-        .as_ref()
-        .filter(|_| !force && table.gitlab.fresh == Fresh::Missing)
+    [&table.gitlab, &table.github].into_iter()
+        .find(|s| !force && s.fresh == Fresh::Missing && s.warning.is_some())
+        .and_then(|s| s.warning.as_ref())
         .map(|warning| {
-            format!("{warning} — not removing worktrees on partial data; restore GitLab access and retry")
+            format!("{warning} — not removing worktrees on partial data; restore remote access and retry")
         })
 }
 
@@ -734,13 +745,13 @@ fn held(table: &Table, tree: &Tree) -> Vec<String> {
     let mut blockers = Vec::new();
     match (mr_of(table, tree), tree.unpushed) {
         (Some(mr), _) if mr.state() == MrState::Opened => {
-            blockers.push(format!("{wt}: MR !{} is open", mr.iid()))
+            blockers.push(format!("{wt}: {} {} is open", mr.kind(), mr.number_label()))
         }
         // git could not tell: they may be the only copy, MR or not
         (_, None) => blockers.push(format!("{wt}: unpushed commits unknown")),
-        (Some(mr), Some(n)) if !branch_finished(mr, n, tree.head.as_deref()) => {
-            blockers.push(format!("{wt}: commits after MR !{}", mr.iid()))
-        }
+        (Some(mr), Some(n)) if !branch_finished(mr, n, tree.head.as_deref()) => blockers.push(
+            format!("{wt}: commits after {} {}", mr.kind(), mr.number_label()),
+        ),
         (None, Some(n)) if n > 0 => blockers.push(format!("{wt}: unpushed commits and no MR")),
         _ => {}
     }
@@ -860,8 +871,13 @@ pub(crate) fn attach(
     task: Option<String>,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
+    let key = config.issue_key(key)?;
+    let key = key.as_str();
     if !is_ticket_key(key) {
         return Err(format!("\"{key}\" is not a ticket key"));
+    }
+    if crate::client::issue::github_parts(key).is_some() {
+        super::common::fetch_issue(config, key)?;
     }
     let tasks = load(config)?;
     if let Some(i) = find_task(&tasks, key, false)? {
@@ -1142,6 +1158,7 @@ mod regressions {
             name: "demo".into(),
             jira: None,
             gitlab: None,
+            github: None,
             workflow: Default::default(),
             vault: crate::config::VaultConfig {
                 path: temp_dir(),

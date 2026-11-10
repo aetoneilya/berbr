@@ -61,6 +61,14 @@ fn checked(response: Response) -> Result<Response> {
 }
 
 impl JiraClient {
+    #[cfg(test)]
+    pub(crate) fn fixture(base_url: String) -> Self {
+        Self {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base_url,
+        }
+    }
+
     /// The token is trimmed: one read from a file or a shell often ends in a newline.
     pub fn new(base_url: impl Into<String>, token: &str) -> Result<Self> {
         let mut headers = HeaderMap::new();

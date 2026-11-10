@@ -137,21 +137,45 @@ impl App {
                 Kind::Loose(i) if self.table.loose[*i].state.is_none() => {
                     keys.push(("⏎", "start task".into()));
                     keys.push(("a", "attach to task".into()));
-                    keys.push(("b", "jira".into()));
+                    keys.push((
+                        "b",
+                        if self.config.has_github() {
+                            "issue"
+                        } else {
+                            "jira"
+                        }
+                        .into(),
+                    ));
                 }
                 Kind::Loose(_) => {
                     keys.push(("⏎", "open".into()));
                     keys.push(("a", "attach to task".into()));
-                    keys.push(("b", "jira".into()));
+                    keys.push((
+                        "b",
+                        if self.config.has_github() {
+                            "issue"
+                        } else {
+                            "jira"
+                        }
+                        .into(),
+                    ));
                     keys.push(("s", "start".into()));
                     keys.push(("c", "sessions".into()));
                 }
                 Kind::Ticket(_) => {
                     keys.push(("⏎", "open".into()));
-                    keys.push(("b", "jira".into()));
+                    keys.push((
+                        "b",
+                        if self.config.has_github() {
+                            "issue"
+                        } else {
+                            "jira"
+                        }
+                        .into(),
+                    ));
                     keys.push(("s", "start".into()));
                 }
-                Kind::Mr(_) => keys.push(("⏎", "open MR".into())),
+                Kind::Mr(i) => keys.push(("⏎", format!("open {}", self.table.mr(*i).mr.kind()))),
                 Kind::Header(_) => {}
                 Kind::NewTask => keys.push(("⏎", "new task".into())),
                 Kind::Tree(t) => {
@@ -162,7 +186,13 @@ impl App {
                         keys.push(("⏎", "resume session".into()));
                     }
                     if has_url {
-                        keys.push(("b", if tree.mr.is_some() { "MR" } else { "jira" }.into()));
+                        keys.push((
+                            "b",
+                            tree.mr
+                                .map(|i| self.table.mr(i).mr.kind())
+                                .unwrap_or("ticket")
+                                .into(),
+                        ));
                     }
                     keys.push(("R", "review".into()));
                     keys.push(("d", "done".into()));
@@ -261,7 +291,12 @@ impl App {
         let mut spans = vec![self.dropdown()];
         spans.extend([
             Span::styled(
-                if self.config.jira.is_some() {
+                if self.config.has_github() {
+                    format!(
+                        "  {} task(s) · {} without a task · {} issues / tickets",
+                        counts[0], counts[1], counts[2]
+                    )
+                } else if self.config.jira.is_some() {
                     format!(
                         "  {} task(s) · {} without a task · {} assigned to me",
                         counts[0], counts[1], counts[2]
@@ -306,14 +341,15 @@ impl App {
         } else {
             Span::raw("")
         });
-        let remote = self.config.jira.is_some() || self.config.gitlab.is_some();
+        let remote =
+            self.config.jira.is_some() || self.config.gitlab.is_some() || self.config.has_github();
         if !self.online && remote {
             let cached = !self.table.tickets.is_empty() || !self.table.mrs.is_empty();
             spans.push(Span::styled(
                 if cached {
                     "  cached"
                 } else {
-                    "  without Jira and GitLab"
+                    "  remote data unavailable"
                 },
                 Style::default().fg(Color::DarkGray),
             ));

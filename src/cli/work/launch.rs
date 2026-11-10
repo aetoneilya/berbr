@@ -14,14 +14,14 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy)]
 pub(super) enum Space<'a> {
-    Task(&'a Task),
+    Task(&'a Task, &'a str),
     Label(&'a str),
 }
 
 impl fmt::Display for Space<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Task(task) => f.write_str(&task.space_name()),
+            Self::Task(task, _) => f.write_str(&task.space_name()),
             Self::Label(label) => f.write_str(label),
         }
     }
@@ -36,20 +36,32 @@ pub(super) struct Context<'a> {
 
 /// The task directory is needed for atomic note replacement; the cache holds
 /// the shared note-write lock. Do not grant access to the entire vault/home.
-fn task_agent_args(
+pub(super) fn task_agent_args(
     kind: AgentKind,
-    note: Option<&Path>,
+    space: Space<'_>,
     args: &[&str],
 ) -> Result<Vec<String>, String> {
     let mut result = Vec::new();
+    let Space::Task(task, project) = space else {
+        return Ok(args.iter().map(|s| (*s).to_string()).collect());
+    };
     if kind == AgentKind::Codex
-        && let Some(parent) = note.and_then(Path::parent)
+        && let Some(parent) = task.note.path.parent()
     {
         let cache = crate::config::cache_dir();
         std::fs::create_dir_all(&cache).map_err(err)?;
         for dir in [parent, cache.as_path()] {
             let dir = dir.canonicalize().map_err(err)?;
             result.extend(["--add-dir".into(), dir.to_string_lossy().into_owned()]);
+        }
+    }
+    let artifacts = crate::artifacts::ensure(project, &task.name)?;
+    match kind {
+        // Claude's spaced form is variadic and would consume a following
+        // positional prompt. The equals form consumes exactly this value.
+        AgentKind::Claude => result.push(format!("--add-dir={}", artifacts.display())),
+        AgentKind::Codex => {
+            result.extend(["--add-dir".into(), artifacts.to_string_lossy().into_owned()])
         }
     }
     result.extend(args.iter().map(|s| (*s).to_string()));
@@ -67,7 +79,13 @@ pub(super) fn launch(
     focus: bool,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
-    let prompt = agent_prompt(context.note, context.brief, context.description);
+    let mut prompt = agent_prompt(context.note, context.brief, context.description);
+    if let Space::Task(task, project) = space {
+        prompt.get_or_insert_with(String::new).push_str(&format!(
+            " Shared artifacts for all agents of this task: {}.",
+            crate::artifacts::directory(project, &task.name).display()
+        ));
+    }
     let mut args: Vec<&str> = prompt.as_deref().into_iter().collect();
     if kind == AgentKind::Claude
         && let Some(name) = context.display_name
@@ -80,6 +98,7 @@ pub(super) fn launch(
 /// How `open_work` opens the worktree: with an agent or a shell only, and
 /// whether its tab is focused.
 pub(super) struct Open {
+    pub(super) project: String,
     pub(super) directory: PathBuf,
     pub(super) agent: bool,
     pub(super) kind: AgentKind,
@@ -155,7 +174,10 @@ pub(super) fn open_work(
             note.save().map_err(err)?;
         }
     }
-    let (space, note) = (Space::Task(task), Some(task.note.path.as_path()));
+    let (space, note) = (
+        Space::Task(task, &open.project),
+        Some(task.note.path.as_path()),
+    );
     let dir = worktree::worktree_dir(main, &directory, name);
     if !herdr::available() {
         let dir = worktree::create_new_worktree(main, &directory, name, branch).map_err(err)?;
@@ -163,7 +185,7 @@ pub(super) fn open_work(
         let brief = write_brief(&dir, &brief)?;
         if agent {
             let prompt = agent_prompt(note, &brief, description.as_deref()).unwrap_or_default();
-            let args = task_agent_args(kind, note, &[&prompt])?;
+            let args = task_agent_args(kind, space, &[&prompt])?;
             let args: Vec<_> = args.iter().map(String::as_str).collect();
             ui.say(format!(
                 "not in herdr — run it yourself: cd {} && {}",
@@ -205,7 +227,7 @@ pub(super) fn open_work(
         dir = shell_quote(&dir.to_string_lossy()),
     );
     if agent.is_some() {
-        let args = task_agent_args(kind, note, &[])?;
+        let args = task_agent_args(kind, space, &[])?;
         let args: Vec<_> = args.iter().map(String::as_str).collect();
         command.push_str(&format!(
             " && {agent_command} \"$(cat {prompt}; rm -f {prompt})\"",
@@ -240,14 +262,20 @@ pub(super) fn open_added_work(
 ) -> Result<(), String> {
     let brief = write_brief(dir, &brief)?;
     let prompt = agent_prompt(Some(&task.note.path), &brief, open.description.as_deref());
-    let (tab, pane) = open_tab(Space::Task(task), dir, name, ui)?;
+    let space = Space::Task(task, &open.project);
+    let (tab, pane) = open_tab(space, dir, name, ui)?;
     let agent = free_agent_name(name);
     let prompt_args: Vec<&str> = prompt.as_deref().into_iter().collect();
-    let args = task_agent_args(open.kind, Some(&task.note.path), &prompt_args)?;
+    let partial = |e: String| {
+        format!("tab: {tab}; terminal: {pane}; agent: {agent}; launch may be partial: {e}")
+    };
+    let args = task_agent_args(open.kind, space, &prompt_args).map_err(&partial)?;
     let args: Vec<_> = args.iter().map(String::as_str).collect();
-    herdr::start_agent_with_label(open.kind, &agent, &pane, name, &args).map_err(err)?;
+    herdr::start_agent_with_label(open.kind, &agent, &pane, name, &args)
+        .map_err(err)
+        .map_err(&partial)?;
     if open.focus {
-        herdr::focus_tab(&tab).map_err(err)?;
+        herdr::focus_tab(&tab).map_err(err).map_err(partial)?;
     }
     ui.say(format!(
         "worktree: {}; tab: {tab}; terminal: {pane}; agent: {agent}",
@@ -331,11 +359,20 @@ pub(super) fn open_agent(
     focus: bool,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
-    let note = match space {
-        Space::Task(task) => Some(task.note.path.as_path()),
-        Space::Label(_) => None,
-    };
-    let args = task_agent_args(kind, note, agent_args)?;
+    open_agent_with_role(kind, space, cwd, label, agent_args, focus, None, ui)
+}
+
+pub(super) fn open_agent_with_role(
+    kind: AgentKind,
+    space: Space<'_>,
+    cwd: &Path,
+    label: &str,
+    agent_args: &[&str],
+    focus: bool,
+    role: Option<&str>,
+    ui: &mut dyn Ui,
+) -> Result<(), String> {
+    let args = task_agent_args(kind, space, agent_args)?;
     let agent_args: Vec<_> = args.iter().map(String::as_str).collect();
     let agent_args = agent_args.as_slice();
     if !herdr::available() {
@@ -346,13 +383,16 @@ pub(super) fn open_agent(
         ));
         return Ok(());
     }
-    if let Space::Task(task) = space
-        && open_in_project_space(kind, task, cwd, label, agent_args, focus, ui)?.is_some()
+    if let Space::Task(task, _) = space
+        && open_in_project_space(kind, task, cwd, label, agent_args, focus, role, ui)?.is_some()
     {
         return Ok(());
     }
     let (tab, pane) = open_tab(space, cwd, label, ui)?;
     let agent = free_agent_name(label);
+    if let Some(role) = role {
+        herdr::label_role(&pane, role).map_err(err)?;
+    }
     herdr::start_agent_with_label(kind, &agent, &pane, label, agent_args).map_err(err)?;
     if focus {
         let _ = herdr::focus_tab(&tab);
@@ -430,6 +470,7 @@ fn open_in_project_space(
     label: &str,
     agent_args: &[&str],
     focus: bool,
+    role: Option<&str>,
     ui: &mut dyn Ui,
 ) -> Result<Option<()>, String> {
     if !herdr::nests_worktree_spaces() {
@@ -450,6 +491,9 @@ fn open_in_project_space(
     };
     let pane = herdr::split_pane(terminal, "right", cwd).map_err(err)?;
     herdr::label_task(&pane, &task.name).map_err(err)?;
+    if let Some(role) = role {
+        herdr::label_role(&pane, role).map_err(err)?;
+    }
     let agent = free_agent_name(label);
     herdr::start_agent_with_label(kind, &agent, &pane, label, agent_args).map_err(err)?;
     if focus {
@@ -480,6 +524,8 @@ pub(in crate::cli) fn cli_open(
     config: &crate::config::Config,
     path: &Path,
     shell: bool,
+    resume: Option<&str>,
+    role: Option<&str>,
 ) -> Result<(), String> {
     let ui: &mut dyn Ui = &mut super::common::Terminal;
     let path = path
@@ -491,6 +537,9 @@ pub(in crate::cli) fn cli_open(
             "{} is not the top of a git worktree",
             path.display()
         ));
+    }
+    if let Some(session) = resume {
+        return super::select::resume_in_tree(config, &path, session, role, ui);
     }
     let main = worktree::main_checkout(&path).map_err(err)?;
     let label = worktree::current_branch(&path).unwrap_or_else(|_| {
@@ -513,6 +562,21 @@ pub(in crate::cli) fn cli_open(
         return Ok(());
     }
     let _operation = herdr::operation();
+    if shell {
+        let table = crate::table::build(config, crate::cli::load(config)?, false);
+        if let Some(tree) = table.trees.iter().position(|tree| tree.wt.path == path)
+            && let Some(task) = super::task::worktree_owner(&table, tree)?
+        {
+            let (tab, _) = open_tab(Space::Task(&task.task, &config.name), &path, "shell", ui)?;
+            let _ = herdr::focus_tab(&tab);
+            ui.say(format!(
+                "shell → task \"{}\" ({})",
+                task.task.space_name(),
+                path.display()
+            ));
+            return Ok(());
+        }
+    }
     if let Err(e) = ensure_project_space(&main, &config.name, ui) {
         ui.say(format!("  ! no project space: {e}"));
     }
@@ -560,7 +624,7 @@ fn open_tab(
 ) -> Result<(String, String), String> {
     let spaces = herdr::list_workspaces().map_err(err)?;
     let existing = match space {
-        Space::Task(task) => task_space(task, &spaces)?,
+        Space::Task(task, _) => task_space(task, &spaces)?,
         Space::Label(label) => {
             let matches: Vec<_> = spaces
                 .iter()
@@ -576,14 +640,16 @@ fn open_tab(
     match existing {
         Some(ws) => herdr::create_tab(&ws.workspace_id, cwd, label).map_err(err),
         None => {
-            if let Space::Task(task) = space
+            if let Space::Task(task, _) = space
                 && let Ok(main) = worktree::main_checkout(cwd)
                 && let Err(e) = ensure_project_space(&main, &project_label(task, &main), ui)
             {
                 ui.say(format!("  ! no project space: {e}"));
             }
             let (tab, pane) = herdr::create_workspace(&space.to_string(), cwd).map_err(err)?;
-            herdr::rename_tab(&tab, label).map_err(err)?;
+            herdr::rename_tab(&tab, label).map_err(|e| {
+                format!("tab: {tab}; terminal: {pane}; could not label new tab: {e}")
+            })?;
             Ok((tab, pane))
         }
     }
@@ -646,7 +712,7 @@ pub(super) fn close_herdr_views_outside(
     // a tab in the task's workspace: close the tabs whose agents work in the worktree
     let mut tabs: Vec<String> = live_agents()
         .into_iter()
-        .filter(|a| a.runs_in(path) && Some(a.workspace_id.as_str()) != kept)
+        .filter(|a| a.occupies_pane() && a.runs_in(path) && Some(a.workspace_id.as_str()) != kept)
         .map(|a| a.tab_id)
         .collect();
     tabs.dedup();

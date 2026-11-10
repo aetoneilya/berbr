@@ -28,6 +28,7 @@ pub struct Inputs {
     pub complete: bool,
     pub jira: Source,
     pub gitlab: Source,
+    pub github: Source,
     pub warnings: Vec<String>,
     pub jira_host: String,
 }
@@ -46,6 +47,7 @@ pub fn assemble(inputs: Inputs) -> Table {
         complete,
         jira,
         gitlab,
+        github,
         mut warnings,
         jira_host,
     } = inputs;
@@ -59,8 +61,18 @@ pub fn assemble(inputs: Inputs) -> Table {
             .enumerate()
             .filter(|(_, m)| Some(m.mr.source_branch()) == branch)
             // the same branch name in another repo is another branch
-            .filter(|(_, m)| tree.project.as_deref() == Some(m.project.as_str()))
-            .max_by_key(|(_, m)| m.mr.iid())
+            .filter(|(_, m)| tree.project.as_deref() == Some(m.source_project()))
+            .max_by_key(|(_, m)| {
+                if m.mr.github {
+                    (
+                        m.opened(),
+                        m.mr.created_at.as_deref().unwrap_or_default(),
+                        m.mr.iid(),
+                    )
+                } else {
+                    (false, "", m.mr.iid())
+                }
+            })
             .map(|(i, _)| i);
         // a branch named without a ticket key still carries one in its MR title
         if tree.keys.is_empty()
@@ -176,7 +188,10 @@ pub fn assemble(inputs: Inputs) -> Table {
         .filter(|m| m.opened())
         .flat_map(|m| &m.keys)
         .for_each(&mut push_key);
-    let mut mine: Vec<&Ticket> = tickets.values().filter(|t| t.mine).collect();
+    let mut mine: Vec<&Ticket> = tickets
+        .values()
+        .filter(|t| t.mine || (crate::client::issue::github_parts(&t.key).is_some() && !t.closed()))
+        .collect();
     mine.sort_by(|a, b| a.key.cmp(&b.key));
     mine.into_iter().for_each(|t| push_key(&t.key));
 
@@ -212,7 +227,7 @@ pub fn assemble(inputs: Inputs) -> Table {
         .filter(|&i| {
             mrs[i].opened()
                 && mrs[i].keys.is_empty()
-                && !tree_branches.contains(&(mrs[i].project.as_str(), mrs[i].mr.source_branch()))
+                && !tree_branches.contains(&(mrs[i].source_project(), mrs[i].mr.source_branch()))
         })
         .collect();
 
@@ -247,6 +262,7 @@ pub fn assemble(inputs: Inputs) -> Table {
         sessions,
         jira,
         gitlab,
+        github,
         warnings,
         jira_host,
     }
@@ -254,8 +270,13 @@ pub fn assemble(inputs: Inputs) -> Table {
 
 pub(super) fn task_trees(task: &Task, trees: &[Tree], space: Option<&str>) -> Vec<usize> {
     let has_key = |keys: &[String]| keys.iter().any(|k| task.tickets.contains(k));
-    let in_space =
-        |tree: &Tree| space.is_some_and(|s| tree.agents.iter().any(|a| a.workspace == s));
+    let in_space = |tree: &Tree| {
+        space.is_some_and(|s| {
+            tree.agents
+                .iter()
+                .any(|a| a.workspace == s && a.role.as_deref() != Some("helper"))
+        })
+    };
     let from_session = |tree: &Tree| {
         task.sessions
             .iter()
@@ -296,7 +317,7 @@ fn task_row(
     let row_mrs: Vec<usize> = (0..mrs.len())
         .filter(|&i| {
             has_key(&mrs[i].keys)
-                || branches.contains(&(mrs[i].project.as_str(), mrs[i].mr.source_branch()))
+                || branches.contains(&(mrs[i].source_project(), mrs[i].mr.source_branch()))
         })
         .collect();
     // keys on its worktrees and MRs that no note lists are the task's too
@@ -699,6 +720,31 @@ mod tests {
     }
 
     #[test]
+    fn helper_inherited_space_does_not_reassign_another_tasks_worktree() {
+        let mut input = inputs(
+            vec![
+                task("coordinator", &[]),
+                task_note("owner", "worktrees: [owner]", "2026-10-01"),
+            ],
+            vec![],
+            vec![],
+            vec![tree("owner", "feature")],
+        );
+        input.workspaces = vec![workspace("w1", "coordinator")];
+        let mut helper = agent("helper", "owner", "w1");
+        helper
+            .extra
+            .insert("role".into(), serde_json::json!("helper"));
+        input.agents = vec![helper];
+        let table = assemble(input);
+        assert!(table.task_row("coordinator").trees.is_empty());
+        assert_eq!(
+            table.task_row("owner").trees,
+            vec![table.tree_index("owner")]
+        );
+    }
+
+    #[test]
     fn an_agent_outside_the_worktrees_stays_with_the_task_of_its_workspace() {
         let mut inputs = inputs(
             vec![task("video", &[]), task("a2i", &["DEMO-1"])],
@@ -1025,6 +1071,7 @@ mod tests {
             first_cwd: None,
             last_cwd: None,
             modified: 0,
+            created_ms: 0,
         };
         for s in [
             session("s0", "gone"),
@@ -1068,6 +1115,7 @@ mod tests {
                     first_cwd: None,
                     last_cwd: None,
                     modified: 1,
+                    created_ms: 0,
                 },
             );
             let table = assemble(input);
@@ -1102,6 +1150,7 @@ mod tests {
                 first_cwd: None,
                 last_cwd: None,
                 modified: 0,
+                created_ms: 0,
             },
         );
         let mut table = assemble(inputs);
@@ -1271,6 +1320,7 @@ mod scoped_identity_tests {
                     first_cwd: None,
                     last_cwd: None,
                     modified: 0,
+                    created_ms: 0,
                 },
             );
         }
@@ -1279,5 +1329,109 @@ mod scoped_identity_tests {
         assert_eq!(row.trees, [0]);
         assert_eq!(row.new_sessions.len(), 1);
         assert_eq!(row.new_sessions[0].id, "own");
+    }
+}
+
+#[cfg(test)]
+mod github_tests {
+    use super::*;
+    use crate::table::fixtures::{mr, table, task, task_note, ticket, tree};
+    use crate::table::{Category, view};
+
+    fn pull(n: u64, target: &str, head: &str, key: &str, state: &str) -> Mr {
+        let mut m = mr(n, "same", "Synthetic pull", state);
+        m.project = format!("github.com/{target}");
+        m.mr.github = true;
+        m.mr.head_repo = Some(format!("github.com/{head}"));
+        m.keys = if key.is_empty() {
+            vec![]
+        } else {
+            vec![key.into()]
+        };
+        m
+    }
+
+    #[test]
+    fn issue_numbers_branches_and_fork_pull_numbers_never_cross_repositories() {
+        let key_a = "github.com/owner/one#1";
+        let key_b = "github.com/owner/two#1";
+        let mut a = tree("a", "same");
+        a.project = Some("github.com/owner/one".into());
+        let mut b = tree("b", "same");
+        b.project = Some("github.com/owner/two".into());
+        let mut fork = tree("fork", "same");
+        fork.project = Some("github.com/fork/one".into());
+        let table = table(
+            vec![task("first", &[key_a]), task("second", &[key_b])],
+            vec![],
+            vec![
+                pull(7, "owner/one", "owner/one", key_a, "opened"),
+                pull(7, "owner/two", "owner/two", key_b, "opened"),
+                pull(3, "owner/one", "fork/one", key_a, "opened"),
+            ],
+            vec![a, b, fork],
+        );
+        assert_eq!(table.trees[0].mr, Some(0));
+        assert_eq!(table.trees[1].mr, Some(1));
+        assert_eq!(table.trees[2].mr, Some(2));
+        assert_eq!(table.task_row("first").mrs, [0, 2]);
+        assert_eq!(table.task_row("second").mrs, [1]);
+        assert!(table.conflicts.is_empty());
+        let rows = view::build(
+            &table,
+            &view::Options {
+                all: true,
+                ..Default::default()
+            },
+        );
+        fn ids(rows: &[view::Node]) -> Vec<String> {
+            rows.iter()
+                .flat_map(|n| std::iter::once(n.id.clone()).chain(ids(&n.children)))
+                .collect()
+        }
+        let ids = ids(&rows);
+        assert!(ids.contains(&"mr:github.com/owner/one#7".into()));
+        assert!(ids.contains(&"mr:github.com/owner/two#7".into()));
+    }
+
+    #[test]
+    fn task_without_issue_keeps_fork_pull_and_terminal_state_via_saved_checkout() {
+        let note = task_note(
+            "local",
+            "worktrees: [/r/.claude/worktrees/fork]",
+            "2026-11-01",
+        );
+        let mut fork = tree("fork", "same");
+        fork.project = Some("github.com/fork/one".into());
+        let table = table(
+            vec![note],
+            vec![],
+            vec![pull(3, "owner/one", "fork/one", "", "merged")],
+            vec![fork],
+        );
+        assert_eq!(table.task_row("local").mrs, [0]);
+        assert_eq!(table.task_row("local").trees, [0]);
+        assert!(table.trees[0].finished);
+    }
+
+    #[test]
+    fn unassigned_open_github_issues_are_available_in_the_picker() {
+        let key = "github.com/owner/one#1";
+        let table = table(
+            vec![],
+            vec![ticket(key, Category::New, false)],
+            vec![],
+            vec![],
+        );
+        assert_eq!(table.loose.len(), 1);
+        let nodes = view::build(
+            &table,
+            &view::Options {
+                all: true,
+                active_loose: true,
+                ..Default::default()
+            },
+        );
+        assert!(nodes.iter().any(|n| matches!(n.kind, view::Kind::Loose(_))));
     }
 }

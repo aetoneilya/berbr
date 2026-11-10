@@ -156,7 +156,7 @@ impl App {
                 }
                 if let Some(m) = tree.mr {
                     let mr = &table.mr(m).mr;
-                    let text = format!("  !{} {}", mr.iid(), mr.state().as_str());
+                    let text = format!("  {} {}", mr.number_label(), mr.state().as_str());
                     state.push(Piece::new(text, Tone::Blue));
                 }
                 lines.push(Line::from(spans(state)));
@@ -310,14 +310,16 @@ fn display_path(path: &Path) -> String {
 /// agent's recent screen.
 fn load_detail(config: &Config, detail: &Detail) -> String {
     match detail {
-        Detail::Description(key) => match config
-            .jira_client()
-            .and_then(|c| c.get_issue_by_key(key).map_err(|e| e.to_string()))
-        {
+        Detail::Description(key) => match crate::cli::work::fetch_issue(config, key) {
             Ok(issue) => issue
-                .fields
                 .description
-                .map(|d| jira_text(&d))
+                .map(|d| {
+                    if crate::client::issue::github_parts(key).is_some() {
+                        d
+                    } else {
+                        jira_text(&d)
+                    }
+                })
                 .unwrap_or_else(|| "(no description)".to_string()),
             Err(e) => format!("! {e}"),
         },

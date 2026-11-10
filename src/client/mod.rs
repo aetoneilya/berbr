@@ -1,9 +1,13 @@
 pub mod agent;
+pub mod github;
 pub mod gitlab;
 pub mod herdr;
 pub(crate) mod http;
+pub mod issue;
 pub mod jira;
 pub mod sessions;
+#[cfg(test)]
+pub(crate) mod test_http;
 pub mod worktree;
 
 /// `f` of every item on at most `limit` threads, in the items' order; None for

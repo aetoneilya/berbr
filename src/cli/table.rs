@@ -143,7 +143,7 @@ fn print_status(table: &Table, tag: Option<&str>, all: bool) {
             Kind::Header(section) => {
                 rows.push(Default::default());
                 rows.push([
-                    Cell::styled(format!("── {}", section.title()), Tone::Dim),
+                    Cell::styled(format!("── {}", section.title_for(table)), Tone::Dim),
                     Cell::default(),
                     Cell::default(),
                     Cell::default(),
