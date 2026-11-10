@@ -41,6 +41,14 @@ Use a durable checkout for a symlink, not a temporary task worktree. Reload skil
 or start a fresh agent session after installation. CLI/mod installation does not
 automatically install the skill or change existing agent permissions.
 
+The optional [Done skill](skills/done/SKILL.md) lands a completed task through
+its PR/MR or an established direct-to-main workflow, reports CI/approval blockers,
+and closes the exact Berbr task through a guarded runner. Install the whole
+`skills/done` directory the same way as `skills/berbr`. Invoke it with `/done`
+in Claude Code, or `$done` / the `/skills` picker in Codex. Creating or installing
+the skill does not run cleanup. Its runner needs Python 3 and a stable directory
+outside the task worktrees for its final receipt and log.
+
 The [agent workflow investigation](docs/agent-workflows.md) maps the instructions
 and CLI fixes to observed failures and records remaining limitations.
 
