@@ -183,7 +183,7 @@ fn agents() -> Result<Vec<Value>> {
             let sessions = open_codex_sessions(&detail, text(term, "app"));
             Ok(json!({
                 "name": detail["labels"]["berbr.name"].as_str().or(detail["name"].as_str()),
-                "agent_status": term["status"], "cwd": detail["foreground"]["cwd"].as_str().or(detail["cwd"].as_str()),
+                "agent_status": term["status"].as_str().unwrap_or("unknown"), "cwd": detail["foreground"]["cwd"].as_str().or(detail["cwd"].as_str()),
                 "pane_id": address, "tab_id": tab["id"], "workspace_id": space["id"],
                 "agent": term["app"], "agent_session": session_arg(&detail).or_else(|| sessions.first().cloned()).map(|id| json!({"value":id})),
                 "session_aliases":sessions,

@@ -2032,6 +2032,61 @@ fn native_snapshot_must_report_hc_failure() {
 }
 
 #[test]
+fn agents_without_a_status_report_remain_live_and_focusable() {
+    for status in [",'status':None", ""] {
+        let f = Fixture::new();
+        let repo = f.root.join("repo");
+        let tree = repo.join(".herdr/worktrees/work");
+        f.git(
+            &repo,
+            &["worktree", "add", "-qb", "work", tree.to_str().unwrap()],
+        );
+        fs::write(
+            f.root.join("vault/tasks/test-0.md"),
+            format!(
+                "---\nid: test-0\nworktrees: [{}]\n---\nContext\n",
+                serde_json::json!(tree)
+            ),
+        )
+        .unwrap();
+        let path = f.root.join("bin/herdr-app");
+        let script = fs::read_to_string(&path).unwrap();
+        fs::write(&path, script.replace(",'status':'idle'", status)).unwrap();
+        let snapshot = success(
+            f.command()
+                .env("BERBR_TEST_AGENT_CWD", &tree)
+                .args(["app-snapshot", "--cached"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(snapshot["warnings"], serde_json::json!([]));
+        let output = f
+            .command()
+            .env("BERBR_TEST_AGENT_CWD", &tree)
+            .args(["select", "test-0"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let calls = f.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call[0] == "herdr-app" && call[1][1] == "agent.focus")
+        );
+        assert!(!calls.iter().any(|call| {
+            call[0] == "herdr-app"
+                && ["tab.new", "space.new", "pane.split"]
+                    .iter()
+                    .any(|action| call[1][1] == *action)
+        }));
+    }
+}
+
+#[test]
 fn snapshot_must_warn_about_skipped_malformed_notes() {
     let f = Fixture::new();
     fs::write(
