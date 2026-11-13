@@ -101,6 +101,9 @@ if args[:2] == ['pane', 'label']:
     sys.exit(2) # The classic backend does not support pane labels.
 with open(os.environ['BERBR_TEST_CAPTURE'], 'a') as f:
     f.write(json.dumps(args) + '\n')
+if args[:2] == ['agent', 'list'] and os.environ.get('BERBR_TEST_AGENTS_FAIL'):
+    print('agent inventory unavailable', file=sys.stderr)
+    sys.exit(1)
 result = {'agents': [], 'workspaces': []}
 if args[:2] == ['agent', 'list'] and os.path.exists(os.environ['BERBR_TEST_AGENTS']):
     with open(os.environ['BERBR_TEST_AGENTS']) as f:
@@ -1197,4 +1200,122 @@ fn opening_a_saved_agent_resumes_that_exact_session_instead_of_the_latest() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("does not belong"));
+}
+
+#[test]
+fn resuming_refuses_to_launch_when_the_live_agent_inventory_is_unavailable() {
+    let fixture = Fixture::new("");
+    let tree = fixture.tree();
+    fixture.sessions(&tree, false);
+    for args in [
+        vec!["open", tree.to_str().unwrap(), "--resume", "codex:shared"],
+        vec!["select", "task", "--bg"],
+    ] {
+        let _ = fs::remove_file(&fixture.capture);
+        let output = fixture
+            .command(env!("CARGO_BIN_EXE_berbr"))
+            .env("BERBR_TEST_AGENTS_FAIL", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "resume must fail without an inventory"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("agent inventory unavailable"));
+        assert!(fixture.commands().iter().all(|args| {
+            ![
+                ["workspace", "create"],
+                ["tab", "create"],
+                ["pane", "split"],
+                ["pane", "send"],
+            ]
+            .iter()
+            .any(|prefix| args.starts_with(&prefix.map(String::from)))
+        }));
+    }
+}
+
+#[test]
+fn opening_an_already_live_saved_agent_only_focuses_its_terminal() {
+    let fixture = Fixture::new("");
+    let tree = fixture.tree();
+    fixture.sessions(&tree, false);
+    fixture.live_agent("codex", &tree);
+    let commands = fixture.run(&["open", tree.to_str().unwrap(), "--resume", "codex:shared"]);
+    assert!(
+        commands
+            .iter()
+            .any(|args| args == &["agent", "focus", "old-pane"])
+    );
+    assert!(commands.iter().all(|args| {
+        ![
+            ["workspace", "create"],
+            ["tab", "create"],
+            ["pane", "split"],
+            ["pane", "send"],
+        ]
+        .iter()
+        .any(|prefix| args.starts_with(&prefix.map(String::from)))
+    }));
+}
+
+#[test]
+fn select_without_saved_sessions_requires_a_working_agent_inventory() {
+    let fixture = Fixture::new("");
+    let tree = fixture.tree();
+    fs::write(
+        fixture.root.join("vault/tasks/task.md"),
+        format!("---\nworktrees: [{}]\n---\nContext\n", json!(tree)),
+    )
+    .unwrap();
+    fixture.live_agent("codex", &tree);
+    let output = fixture
+        .command(env!("CARGO_BIN_EXE_berbr"))
+        .env("BERBR_TEST_AGENTS_FAIL", "1")
+        .args(["select", "task", "--bg"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "select must not start a duplicate agent"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("agent inventory unavailable"));
+    assert!(fixture.commands().iter().all(|args| {
+        ![
+            ["workspace", "create"],
+            ["tab", "create"],
+            ["pane", "split"],
+            ["pane", "send"],
+        ]
+        .iter()
+        .any(|prefix| args.starts_with(&prefix.map(String::from)))
+    }));
+}
+
+#[test]
+fn resume_outside_herdr_keeps_the_manual_command_without_querying_agents() {
+    let fixture = Fixture::new("");
+    let tree = fixture.tree();
+    fixture.sessions(&tree, false);
+    let output = fixture
+        .command(env!("CARGO_BIN_EXE_berbr"))
+        .env_remove("HERDR_ENV")
+        .env_remove("HC_TERMINAL_SOCKET")
+        .env("BERBR_TEST_AGENTS_FAIL", "1")
+        .args(["open", tree.to_str().unwrap(), "--resume", "codex:shared"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("not in herdr — run it yourself"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("'resume' 'shared'"), "{stdout}");
+    assert!(fixture.commands().is_empty());
 }

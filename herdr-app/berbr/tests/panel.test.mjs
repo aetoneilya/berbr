@@ -3938,6 +3938,57 @@ test("every saved conversation stays under its worktree; clicking stopped resume
   assert.ok(!state.calls.some(call=>call[0]==="agent.focus"));
 });
 
+test("an open pane remains focusable while its agent report is missing", () => {
+  for (const inventory of [true, false]) for (const ambiguous of [true, false]) {
+    const {view,cx,jobs}=setup({props:{overlay:"details"}});
+    state.panes=[{pane:"existing-pane",terminal:"existing",tab:"existing-tab"}];
+    if (inventory) state.terminals=[{address:"existing",parent:null,state:"live",status:null}];
+    const row={id:"live",kind:"agent",terminal:"existing",session:"codex:live",cwd:"/work",scope_space_ambiguous:ambiguous};
+    view.open(row,cx);
+    view.open(row,cx);
+    assert.equal(jobs.length,0,"must not schedule open --resume");
+    assert.equal(view.error,null);
+    assert.deepEqual(state.calls,Array.from({length:2},()=>[
+      ["tab.select",{id:"existing-tab"}], ["pane.focus",{terminal:"existing"}], ["closeOverlay","details"]
+    ]).flat());
+  }
+});
+
+test("a live terminal without a pane is peeked, including parked root agents", () => {
+  for (const parent of [null,"parent-agent"]) {
+    const {view,cx,jobs}=setup();
+    state.terminals=[{address:"existing",parent,state:"live",status:"idle"}];
+    view.open({id:"live",kind:"agent",terminal:"existing",session:"codex:live",cwd:"/work"},cx);
+    assert.equal(jobs.length,0);
+    assert.deepEqual(state.calls,[["terminal.peek",{terminal:"existing"}]]);
+  }
+});
+
+test("an exited terminal does not prevent resuming its saved conversation", async () => {
+  const {view,cx,jobs}=setup();
+  state.terminals=[{address:"old",parent:null,state:"exited",status:"idle"}];
+  state.panes=[{pane:"old-pane",terminal:"old",tab:"old-tab"}];
+  const calls=[];view.cli=async args=>{calls.push(args);return "Resumed";};
+  view.open({id:"old",kind:"agent",terminal:"old",session:"codex:old",cwd:"/work"},cx);
+  await jobs.shift()(cx);
+  assert.deepEqual(calls,[["open","/work","--resume","codex:old"]]);
+});
+
+test("repeated clicks while a saved session is resuming launch only once", async () => {
+  const {view,cx,jobs}=setup();
+  const row={id:"old",kind:"agent",session:"codex:old",cwd:"/work",state:"stopped"};
+  let finish;
+  const calls=[];view.cli=args=>{calls.push(args);return new Promise(resolve=>{finish=resolve;});};
+  view.open(row,cx);
+  view.open(row,cx);
+  assert.equal(jobs.length,1);
+  const pending=jobs.shift()(cx);
+  view.open(row,cx);
+  assert.equal(jobs.length,0);
+  assert.deepEqual(calls,[["open","/work","--resume","codex:old"]]);
+  finish("Resumed");await pending;
+});
+
 test("removing a stopped conversation persists per worktree and does not stop or delete its transcript", () => {
   const row={kind:"agent",id:"saved",session:"codex:old",cwd:"/a/work",state:"stopped"};
   const tree={kind:"tree",id:"tree",cwd:row.cwd,tree:"work",task:"Demo",children:[row]};

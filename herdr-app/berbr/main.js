@@ -747,14 +747,17 @@ export default class Berbr extends View {
 
   open(row, cx, action = row?.id) {
     if (!row || this.busy) return;
+    const live = row.kind === "agent" ? this.liveAgent(row) : null;
     if (row.scope_space_ambiguous && (["task", "tree"].includes(row.kind) || (row.kind === "agent" &&
-        !agents().some(agent => [agent.address, agent.pane].includes(row.terminal))))) {
+        !live))) {
       this.error = spaceBindingBlocker; cx.notify(); return;
     }
     if (row.kind === "agent") {
-      const live = this.liveAgent(row);
       if (live) {
-        run(live.child ? "terminal.peek" : "agent.focus", {terminal:live.address});
+        if (live.focusPane) {
+          if (live.tab) run("tab.select", {id:live.tab});
+          run("pane.focus", {terminal:live.address});
+        } else run(live.child ? "terminal.peek" : "agent.focus", {terminal:live.address});
         if (props()?.overlay) closeOverlay(props().overlay);
       } else if (row.resume_blocked) {
         this.error = "A running agent may be using this conversation. Close it before resuming."; cx.notify();
@@ -907,10 +910,15 @@ export default class Berbr extends View {
     if (!row?.terminal) return null;
     const listed = agents().find(agent => [agent.address, agent.pane].includes(row.terminal));
     if (listed) return listed;
-    const child = terminals().find(term => term.address === row.terminal && term.parent && term.state === "live");
-    return child ? {address:child.address, pane:child.address, child:true,
-      status:child.status === "error" ? "blocked" : child.status, title:child.title || child.name || row.label,
-      program:child.program} : null;
+    // Agent reports may lag the pane/core inventory. Their absence is not proof
+    // that the conversation stopped; focus the existing terminal before resume.
+    const pane = panes().find(pane => [pane.terminal, pane.pane].includes(row.terminal));
+    const term = terminals().find(term => term.address === (pane?.terminal || row.terminal));
+    if (term ? term.state !== "live" : !pane?.terminal) return null;
+    return {address:term?.address ?? pane.terminal, pane:pane?.pane ?? term.address,
+      tab:pane?.tab, focusPane:Boolean(pane), child:!pane,
+      status:term?.status === "error" ? "blocked" : term?.status ?? pane?.status,
+      title:term?.title || term?.name || pane?.title || row.label, program:term?.program ?? pane?.program};
   }
 
   agentVisible(row, tree) {

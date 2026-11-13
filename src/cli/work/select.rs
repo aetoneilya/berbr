@@ -89,6 +89,11 @@ pub(crate) fn select(config: &Config, args: SelectArgs, ui: &mut dyn Ui) -> Resu
     } = args;
     let target = target.as_deref().map(|t| config.issue_key(t)).transpose()?;
     let table = table::build(config, load(config)?, false);
+    // Even without saved history, select must not interpret a failed inventory
+    // as permission to start another agent. Explicit --new is a separate action.
+    if !new_session {
+        live_agents_for_reuse()?;
+    }
     let key = target.clone().filter(|t| is_ticket_key(t));
     let work = match target {
         Some(target) => {
@@ -382,8 +387,7 @@ fn resume_with_role(
             "A running agent may be using this conversation. Close it before resuming.".into(),
         );
     }
-    if let Some(agent) = herdr::list_agents()
-        .unwrap_or_default()
+    if let Some(agent) = live_agents_for_reuse()?
         .into_iter()
         .find(|a| a.matches_session(&session.id, &table.sessions))
     {
@@ -436,6 +440,15 @@ fn resume_with_role(
         role,
         ui,
     )
+}
+
+fn live_agents_for_reuse() -> Result<Vec<herdr::Agent>, String> {
+    // Outside Herdr, launch only prints a command for the person to run.
+    if !herdr::available() {
+        return Ok(Vec::new());
+    }
+    herdr::list_agents()
+        .map_err(|error| format!("Cannot safely reopen work: live agents unavailable: {error}"))
 }
 
 /// The worktree directory, recreated at the same path from its branch if it was
