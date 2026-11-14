@@ -10,6 +10,19 @@ use crate::vault::task::{Task, same_name};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+/// Local metadata only: an explicit task selector, no network or worktree changes.
+pub(in crate::cli) fn cli_detach(config: &Config, key: &str, target: &str) -> Result<(), String> {
+    let key = config.issue_key(key)?;
+    if !super::common::is_ticket_key(&key) {
+        return Err(format!("\"{key}\" is not a ticket key"));
+    }
+    let _lock = crate::vault::lock().map_err(err)?;
+    let mut task = tool_task(config, Some(target))?;
+    task.detach_ticket(&key).map_err(err)?;
+    println!("{key} removed from \"{}\"", task.name);
+    Ok(())
+}
+
 pub(in crate::cli) fn cli_artifacts(
     config: &Config,
     target: Option<&str>,

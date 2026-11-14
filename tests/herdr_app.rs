@@ -3458,3 +3458,41 @@ fn closed_task_done_refreshes_labels_before_closing_the_first_pane() {
     );
     assert_eq!(fs::read_to_string(f.root.join("agent-reads")).unwrap(), "2");
 }
+
+#[test]
+fn detach_is_local_preserves_note_and_never_closes_the_ticket() {
+    let f = Fixture::new();
+    let path = f.root.join("vault/tasks/test-0.md");
+    let body = "Requirements DEMO-1\n\n## Agent notes\nKeep all history.\n";
+    fs::write(&path, format!("---\nid: test-0\ntitle: Example\ntickets: [DEMO-1, DEMO-2]\nworktrees: [/work/demo]\n---\n{body}")).unwrap();
+    let out = f
+        .command()
+        .args(["detach", "DEMO-1", "test-0"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let note = fs::read_to_string(&path).unwrap();
+    assert!(note.ends_with(body));
+    assert!(note.contains("worktrees: [/work/demo]"));
+    let meta: serde_yaml::Value = serde_yaml::from_str(note.split("---").nth(1).unwrap()).unwrap();
+    assert_eq!(meta["tickets"], serde_yaml::to_value(["DEMO-2"]).unwrap());
+    assert_eq!(
+        meta["excluded_tickets"],
+        serde_yaml::to_value(["DEMO-1"]).unwrap()
+    );
+    assert!(
+        !f.root.join("calls.jsonl").exists(),
+        "detach must not call Herdr or remote services"
+    );
+    let out = f
+        .command()
+        .args(["detach", "DEMO-2", "missing"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(fs::read_to_string(&path).unwrap(), note);
+}

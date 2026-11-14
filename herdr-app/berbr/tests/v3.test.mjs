@@ -48,7 +48,7 @@ test("v3 MR fields decide whose move; absent fields keep v2 section behavior", (
   }
   assert.equal(mrFlags(mr({ready:true})).worst, "ready to merge");
   assert.equal(mrFlags(mr({draft:true})).worst, "draft");
-  assert.equal(mrFlags(mr({ci:"pending"})).ci, "running");
+  assert.equal(mrFlags(mr({ci:"pending"})).ci, "pending");
   assert.equal(mrFlags(mr({ci:null})).ci, null);
   const legacy = {kind:"mr", state:"opened", body:"ci✗ conflict draft"};
   assert.equal(mrFlags(legacy).worst, "CI failed");

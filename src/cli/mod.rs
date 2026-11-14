@@ -99,6 +99,8 @@ enum CliCommands {
         /// The task; a picker when omitted
         task: Option<String>,
     },
+    /// Unlink a ticket from a task; never closes the ticket or removes worktrees
+    Detach { key: String, task: String },
     /// Go back to a task: its agent, or its CLI resuming the last session there
     Select(SelectArgs),
     /// (internal) Run in a new tab by start/add: create the worktree, then the agent
@@ -488,6 +490,7 @@ pub fn run() -> Result<(), String> {
         } => work::cli_artifacts(&config, task.as_deref(), list, directory.as_deref()),
         CliCommands::Prepare { spec } => work::cli_prepare(&spec),
         CliCommands::Attach { key, task } => work::cli_attach(&config, &key, task),
+        CliCommands::Detach { key, task } => work::cli_detach(&config, &key, &task),
         CliCommands::Review { name } => work::cli_review(&config, name),
         CliCommands::Open {
             path,
@@ -522,6 +525,7 @@ fn changes(command: &CliCommands) -> bool {
         CliCommands::Start(_)
         | CliCommands::Add(_)
         | CliCommands::Attach { .. }
+        | CliCommands::Detach { .. }
         | CliCommands::Select(_)
         | CliCommands::Prepare { .. }
         | CliCommands::Note { .. }

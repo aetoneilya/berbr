@@ -5,19 +5,29 @@ export function icon(name, size = 14) {
   return svg(`mods/berbr/icons/${name}.svg`).size(size).flex_none();
 }
 
+/** A theme color with an alpha suffix; non-hex theme values fall back unchanged. */
+export function tint(color, alpha, fallback = color) {
+  return typeof color === "string" && /^#[0-9a-f]{6}$/i.test(color) ? color + alpha : fallback;
+}
+
+/** A key (MR number, ticket key): plain text, so status is the only thing in a row that carries color. */
+export function tag(t, label) {
+  return div().flex_none().text_size(12).child(label);
+}
+
 export function pill(t, {label, tone = "dim", glyph, spin = false, tooltip = label}) {
   const color = t[tone] ?? t.dim;
-  const tinted = typeof color === "string" && /^#[0-9a-f]{6}$/i.test(color);
-  return h_flex().h(19).px(6).gap(4).flex_none().items_center().rounded(5).text_size(11)
-    .bg(tinted ? color + (tone === "dim" ? "12" : "24") : t.raised).text_color(color)
+  // Status is a colored glyph and word, with no container: several in one narrow row stay calm.
+  return h_flex().h(18).gap(4).flex_none().items_center().text_size(12)
+    .when(tone !== "dim", el => el.font_medium()).text_color(color)
     .tooltip(tooltip).accessibility_label(tooltip)
-    .when(Boolean(glyph), el => el.child(["check", "spinner"].includes(glyph)
+    .when(Boolean(glyph), el => el.child(["check", "spinner", "clock"].includes(glyph)
       ? icon(glyph, 11).when(spin, mark => mark.spin(900)) : div().flex_none().child(glyph)))
     .child(div().flex_none().text_color(color).child(label));
 }
 
 export function iconButton(t, id, name, label, action, { disabled = false, spinning = false, size = 26 } = {}) {
-  return h_flex().id(id).size(size).flex_none().items_center().justify_center().rounded(6)
+  return h_flex().id(id).size(size).flex_none().items_center().justify_center().rounded(7)
     .text_color(t.dim).cursor_pointer().tooltip(label).accessibility_label(label)
     .opacity(disabled && !spinning ? 0.4 : 1)
     .hover(el => el.bg(t.hover).text_color(t.foreground))
@@ -27,10 +37,10 @@ export function iconButton(t, id, name, label, action, { disabled = false, spinn
 
 export function button(t, id, label, action, variant = "ghost", disabled = false, spinning = false) {
   const primary = variant === "primary";
-  return keyboardControl(h_flex().id(id), action, disabled).relative().h(30).px(10).gap(6).items_center().justify_center().rounded(6)
+  return keyboardControl(h_flex().id(id), action, disabled).relative().h(30).px(12).gap(6).items_center().justify_center().rounded(8)
     .accessibility_label(label)
     .text_size(12).text_color(primary ? t.solid_foreground : t.muted)
-    .when(primary, el => el.bg(t.solid)).cursor_pointer().opacity(disabled && !spinning ? 0.4 : 1)
+    .when(primary, el => el.bg(t.solid).font_medium()).cursor_pointer().opacity(disabled && !spinning ? 0.4 : 1)
     .hover(el => primary ? el.opacity(disabled && !spinning ? 0.4 : 0.85) : el.bg(t.hover).text_color(t.foreground))
     .on_click((_event, cx) => { cx.stop_propagation(); if (!disabled) action(cx); })
     .child(div().when(spinning, el => el.invisible()).child(label))
@@ -55,29 +65,34 @@ export function chip(t, label) {
 }
 
 export function segmented(t, id, options, value, action, disabled = false) {
-  return h_flex().h(28).p(2).gap(2).items_center().bg(t.background).border_1().border_color(t.border).rounded(6)
-    .children(options.map(([key, label]) => keyboardControl(h_flex().id(`${id}-${key}`), cx => action(key, cx), disabled).h(22).px(10).items_center().rounded(4)
+  return h_flex().h(28).p(2).gap(2).items_center().bg(t.background).border_1().border_color(t.border).rounded(8)
+    .children(options.map(([key, label]) => keyboardControl(h_flex().id(`${id}-${key}`), cx => action(key, cx), disabled).h(22).px(10).items_center().rounded(6)
       .when(key === value, el => el.bg(t.raised)).text_size(12).text_color(key === value ? t.foreground : t.muted)
       .cursor_pointer().hover(el => el.text_color(t.foreground)).opacity(disabled ? 0.4 : 1)
       .on_click((_event, cx) => { if (!disabled) action(key, cx); }).child(label)));
 }
 
 export function sectionHeader(t, id, label, count, expanded = true, toggle = null, {selected = false} = {}) {
-  return h_flex().id(`section-${id}`).h(28).flex_none().px(8).gap(6).items_center().text_size(12)
-    .text_color(t.muted).font_medium().rounded(6).when(selected, el => el.bg(t.selected))
+  const urgent = id === "needs";
+  return h_flex().id(`section-${id}`).h(28).mt(6).flex_none().px(8).gap(6).items_center().text_size(11)
+    .text_color(t.dim).font_medium().rounded(8).when(selected, el => el.bg(t.selected))
     .when(Boolean(toggle), el => el.cursor_pointer().hover(s => s.bg(selected ? t.selected : t.hover).text_color(t.foreground))
       .on_click((_event, cx) => {cx.stop_propagation(); toggle(cx);})
-      .child(icon(expanded ? "chevron-down" : "chevron-right", 12).text_color(t.dim)))
-    .child(label).child(div().text_color(id === "needs" && !expanded ? t.blocked : t.dim).child(String(count)));
+      .child(icon(expanded ? "chevron-down" : "chevron-right", 11).text_color(t.dim)))
+    .child(div().text_color(urgent ? t.blocked : t.muted).child(label))
+    .child(div().text_color(urgent && !expanded ? t.blocked : t.dim).child(String(count)));
 }
 
 export function statusMark(t, status) {
   const mark = h_flex().w(16).h(16).flex_none().items_center().justify_center();
-  if (status === "working") return mark.child(icon("spinner", 12).text_color(t.working).spin(900));
+  if (status === "working") return mark.child(icon("spinner", 13).text_color(t.working).spin(900));
   if (status === "closed") return mark.child(icon("check", 12).text_color(t.dim));
-  if (["blocked", "done"].includes(status)) return mark.child(div().size(8).rounded(4).bg(t[status])
-    .when(status === "blocked", el => el.loop("opacity", {from:0.35, to:1, period:1200})));
-  return mark.child(div().size(8).rounded(4).border(1.5).border_color(["idea", "unknown"].includes(status) ? t.dim : t.muted));
+  // Attention states carry a soft halo, so they outweigh the quiet rings around them.
+  if (["blocked", "done"].includes(status)) return mark.child(h_flex().size(14).items_center().justify_center()
+    .rounded_full().bg(tint(t[status], "2e", t.raised))
+    .when(status === "blocked", el => el.loop("opacity", {from:0.45, to:1, period:1200}))
+    .child(div().size(7).rounded_full().bg(t[status])));
+  return mark.child(div().size(9).rounded_full().border(1.5).border_color(["idea", "unknown"].includes(status) ? t.dim : t.muted));
 }
 
 export function kbd(t, text) {

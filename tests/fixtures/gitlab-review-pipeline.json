@@ -1,0 +1,136 @@
+{
+  "evidence": "Synthetic regression fixture for an external review gate in a merged-results pipeline; source and pipeline heads intentionally differ.",
+  "mr": {
+    "sha": "source-head",
+    "head_pipeline": {
+      "id": 100,
+      "sha": "pipeline-head",
+      "status": "running"
+    }
+  },
+  "statuses": [
+    {
+      "id": 1,
+      "name": "Ticket",
+      "status": "success",
+      "allow_failure": false,
+      "pipeline_id": 100,
+      "sha": "pipeline-head"
+    },
+    {
+      "id": 2,
+      "name": "Light",
+      "status": "success",
+      "allow_failure": false,
+      "pipeline_id": 100,
+      "sha": "pipeline-head"
+    },
+    {
+      "id": 3,
+      "name": "Regression",
+      "status": "success",
+      "allow_failure": false,
+      "pipeline_id": 100,
+      "sha": "pipeline-head"
+    },
+    {
+      "id": 4,
+      "name": "Containers",
+      "status": "success",
+      "allow_failure": false,
+      "pipeline_id": 100,
+      "sha": "pipeline-head"
+    },
+    {
+      "id": 5,
+      "name": "Zeta Config",
+      "status": "manual",
+      "allow_failure": true,
+      "pipeline_id": 100,
+      "sha": "pipeline-head"
+    },
+    {
+      "id": 6,
+      "name": "Gradle Dependencies",
+      "status": "manual",
+      "allow_failure": true,
+      "pipeline_id": 100,
+      "sha": "pipeline-head"
+    },
+    {
+      "id": 7,
+      "name": "Backstage Configs",
+      "status": "manual",
+      "allow_failure": true,
+      "pipeline_id": 100,
+      "sha": "pipeline-head"
+    },
+    {
+      "id": 8,
+      "name": "ai-review",
+      "status": "manual",
+      "allow_failure": true,
+      "pipeline_id": 100,
+      "sha": "pipeline-head"
+    },
+    {
+      "id": 9,
+      "name": "codereview",
+      "status": "pending",
+      "allow_failure": false,
+      "pipeline_id": 100,
+      "sha": "pipeline-head"
+    }
+  ],
+  "jobs": [
+    {
+      "id": 8,
+      "name": "ai-review",
+      "status": "manual",
+      "allow_failure": true
+    },
+    {
+      "id": 7,
+      "name": "Backstage Configs",
+      "status": "manual",
+      "allow_failure": true
+    },
+    {
+      "id": 6,
+      "name": "Gradle Dependencies",
+      "status": "manual",
+      "allow_failure": true
+    },
+    {
+      "id": 5,
+      "name": "Zeta Config",
+      "status": "manual",
+      "allow_failure": true
+    },
+    {
+      "id": 4,
+      "name": "Containers",
+      "status": "success",
+      "allow_failure": false
+    },
+    {
+      "id": 3,
+      "name": "Regression",
+      "status": "success",
+      "allow_failure": false
+    },
+    {
+      "id": 2,
+      "name": "Light",
+      "status": "success",
+      "allow_failure": false
+    },
+    {
+      "id": 1,
+      "name": "Ticket",
+      "status": "success",
+      "allow_failure": false
+    }
+  ],
+  "bridges": []
+}

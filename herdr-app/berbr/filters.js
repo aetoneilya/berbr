@@ -18,7 +18,7 @@ export function boardFilters(view, t) {
     (view.filtersOpen ? view.filtersFocus : view.handle).focus(); cx.notify();
   };
   const trigger = keyboardControl(h_flex().id("filters"), toggle, view.busy)
-    .size(30).flex_none().items_center().justify_center().rounded(6).cursor_pointer()
+    .size(32).flex_none().items_center().justify_center().rounded(8).cursor_pointer()
     .bg(view.filtersOpen || active ? t.raised : t.surface).text_color(active ? t.foreground : t.dim)
     .hover(el => el.bg(t.hover).text_color(t.foreground))
     .tooltip(`Filters · ${view.view === "mrs" ? "MR" : "Tasks"} · ${summary}`)
@@ -27,7 +27,7 @@ export function boardFilters(view, t) {
     .child(icon("sliders", 16));
   const choose = action => cx => {action(cx); view.filtersFocus.focus(); cx.notify();};
   const option = (id, label, checked, action) => keyboardControl(h_flex().id(id), choose(action), view.busy)
-    .h(30).flex_none().px(7).gap(8).items_center().rounded(4).cursor_pointer()
+    .h(30).flex_none().px(7).gap(8).items_center().rounded(6).cursor_pointer()
     .hover(el => el.bg(t.hover)).on_click((_event, cx) => {cx.stop_propagation(); if (!view.busy) choose(action)(cx);})
     .accessibility_label(`${label}${checked ? ", selected" : ""}`)
     .child(div().size(14).flex_none().rounded(3).border_1().border_color(checked ? t.accent : t.border)
@@ -37,13 +37,13 @@ export function boardFilters(view, t) {
   const separator = () => div().mx(7).my(6).h(1).flex_none().bg(t.border);
   const expand = section => choose(() => {view.filtersSection = view.filtersSection === section ? null : section;});
   const disclosure = (id, label, value, section) => keyboardControl(h_flex().id(id), expand(section), view.busy)
-    .h(34).px(7).gap(8).items_center().rounded(4).cursor_pointer().hover(el => el.bg(t.hover))
+    .h(34).px(7).gap(8).items_center().rounded(6).cursor_pointer().hover(el => el.bg(t.hover))
     .on_click((_event, cx) => {cx.stop_propagation(); if (!view.busy) expand(section)(cx);})
     .child(div().flex_1().min_w(0).text_size(12).child(label))
     .child(div().max_w("55%").min_w(0).truncate().text_size(12).text_color(t.dim).tooltip(value).child(value))
     .child(icon(view.filtersSection === section ? "chevron-down" : "chevron-right", 11).text_color(t.dim));
   const menu = v_flex().id("board-filters").w(292).max_h(520).overflow_y_scrollbar().p(8).gap(2)
-    .rounded(10).bg(t.popover).border_1().border_color(t.border).text_color(t.foreground)
+    .rounded(12).shadow_lg().bg(t.popover).border_1().border_color(t.border).text_color(t.foreground)
     .track_focus(view.filtersFocus)
     .on_mouse_down_out((_event, cx) => {if (view.filtersOpen && !view.filtersTriggerHovered) {view.filtersOpen = false; cx.notify();}})
     .on_key_down((event, cx) => {if (event.key === "escape") {view.filtersOpen = false; view.handle.focus(); cx.stop_propagation(); cx.notify();}})

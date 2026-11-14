@@ -45,6 +45,8 @@ export function rowMenu(row, ctx = {}) {
       add("start", "Start work");
     if (row.task && !row.scope_space_ambiguous) add("rename", "Rename…");
     if (row.note) add("note", "Open note");
+    if (row.task) add("add-ticket", "Add ticket…");
+    if (row.task && row.artifacts) add("artifact-folder", "Open artifact folder");
     if (row.title || row.label || row.task) add("copy-title", "Copy title");
     if (ctx.hasService ?? walk(row.children).some(child => child.kind === "agent" && agentRole(child) === "helper"))
       add("service-sessions", "Service sessions…");
@@ -82,6 +84,8 @@ export function rowMenu(row, ctx = {}) {
       add("copy-link", "Copy link");
     }
     if (row.kind === "mr" && row.branch) add("copy-branch", "Copy branch");
+    if (row.kind === "ticket" && row.target && ctx.task?.task)
+      add("detach-ticket", "Remove from task", {separatorBefore:items.length > 0});
   }
   return items;
 }
@@ -259,7 +263,9 @@ export function isClosedTicket(row) {
 export function parseMrFlags(body = "") {
   const tokens = String(body ?? "").trim().toLowerCase().split(/\s+/);
   const ci = tokens.includes("ci✗") ? "failed"
-    : tokens.includes("ci✓") ? "passed" : tokens.includes("ci…") ? "running" : null;
+    : tokens.includes("ci✓") ? "passed" : tokens.includes("ci…") ? "running"
+    : tokens.includes("ci:review") ? "review" : tokens.includes("ci:manual") ? "manual"
+    : tokens.includes("ci:pending") ? "pending" : tokens.includes("ci:unknown") ? "unknown" : null;
   const conflict = tokens.includes("conflict");
   const draft = tokens.includes("draft");
   const age = tokens.find(token => /^\d+d$/.test(token));
@@ -274,8 +280,10 @@ export function mrFlags(mr) {
   const structured = mr && ["ci", "approvals", "unresolved", "draft", "merge_status", "conflict", "ready"]
     .some(key => mr[key] !== undefined && mr[key] !== null);
   if (!structured) return {...legacy, ready:false, needsYou:false};
-  const ci = mr.ci === undefined ? legacy.ci : mr.ci === "success" ? "passed" : ["running", "pending", "created", "preparing", "waiting_for_resource"].includes(mr.ci)
-    ? "running" : mr.ci ?? null;
+  const reviewGate = mr.ci_review?.context === "codereview"
+    && ["running", "pending"].includes(mr.ci) && mr.ci_review.status === mr.ci;
+  const ci = mr.ci_freshness === "Missing" ? "unknown" : reviewGate ? "review"
+    : mr.ci === undefined ? legacy.ci : mr.ci === "success" ? "passed" : mr.ci ?? null;
   const conflict = mr.conflict ?? legacy.conflict;
   const draft = mr.draft ?? legacy.draft;
   const unresolved = Math.max(0, Number(mr.unresolved) || 0);
@@ -293,12 +301,21 @@ export function mrPills(mr, {historical = false, state = mr?.state?.toLowerCase(
   const spec = (label, tone, glyph = null, spin = false) => ({label, tone, glyph, spin});
   if (["merged", "closed"].includes(state)) return [spec(state, "dim")];
   const ci = {failed:spec("CI failed", "blocked", "✕"),
-    running:spec("CI running", "working", "spinner", true), passed:spec("CI passed", "done", "check")}[flags.ci];
+    running:spec("CI running", "working", "spinner", true), passed:spec("CI passed", "done", "check"),
+    review:spec("CI review", "working", "clock"), manual:spec("CI manual action", "dim"),
+    blocked:spec("CI manual action", "dim"), pending:spec("CI pending", "dim"),
+    created:spec("CI queued", "dim"), preparing:spec("CI preparing", "dim"),
+    waiting_for_resource:spec("CI waiting for resource", "dim"),
+    unknown:spec("CI unknown", "dim")}[flags.ci] ?? (flags.ci ? spec(`CI ${flags.ci}`, "dim") : null);
   const worst = flags.worst && flags.worst !== "CI failed"
     ? flags.worst === "ready to merge" ? spec(flags.worst, "accent", "check")
       : spec(flags.worst, flags.worst === "draft" ? "dim" : "blocked") : null;
   // "ready to merge" already means CI passed: one pill, not two.
-  return [worst, flags.ready && flags.ci === "passed" ? null : ci].filter(Boolean).map(pill => historical ? {...pill, tone:"dim"} : pill);
+  return [worst, flags.ready && flags.ci === "passed" ? null : ci].filter(Boolean).map(pill => {
+    if (pill.label.startsWith("CI ") && mr?.ci_freshness === "Cached")
+      pill = {...pill, spin:false, glyph:pill.spin ? "clock" : pill.glyph};
+    return historical ? {...pill, tone:"dim"} : pill;
+  });
 }
 
 export function mrListPills(mr) {
@@ -448,7 +465,7 @@ export function cleanObsidian(body = "") {
     }).trim();
 }
 
-export function taskDetail(row, liveAgents = [], liveByTerminal = new Map(liveAgents.flatMap(agent => [[agent.address, agent], [agent.pane, agent]]))) {
+export function taskDetail(row, liveAgents = [], liveByTerminal = new Map(liveAgents.flatMap(agent => [[agent.address, agent], [agent.pane, agent]])), catalog = []) {
   const children = row?.children ?? [];
   const tickets = children.filter(item => item.kind === "ticket");
   const agentDetail = item => {
@@ -464,11 +481,21 @@ export function taskDetail(row, liveAgents = [], liveByTerminal = new Map(liveAg
     mr:tree.children?.find(item => item.kind === "mr") ?? null,
     agents:(tree.children ?? []).filter(item => item.kind === "agent").map(agentDetail),
   })).sort((a, b) => treeRank(a) - treeRank(b) || treeName(a).localeCompare(treeName(b)));
-  const mrKey = mr => mr.url || mr.id || mr.target || mr.label || mr;
+  const mrKey = mr => mr.url?.replace(/\/+$/, "") || mr.id || mr.target || mr.label || mr;
+  const associations = new Map();
+  const associate = (mr, keys = []) => {
+    const key = mrKey(mr);
+    if (!associations.has(key)) associations.set(key, new Set());
+    for (const ticket of [...(mr.tickets ?? []), ...keys])
+      if (!row?.excluded_tickets?.includes(ticket)) associations.get(key).add(ticket);
+  };
+  for (const mr of catalog) if (!row?.project || !mr.project || mr.project === row.project) associate(mr);
+  for (const tree of trees) if (tree.mr) associate(tree.mr);
   const attached = new Set(trees.filter(tree => tree.mr).map(tree => mrKey(tree.mr)));
   const loose = new Map();
   const addMr = (mr, ticket) => {
     const key = mrKey(mr);
+    associate(mr, ticket ? [ticket] : []);
     if (attached.has(key)) return;
     if (!loose.has(key)) loose.set(key, {row:mr, tickets:[]});
     const tags = loose.get(key).tickets;
@@ -480,6 +507,8 @@ export function taskDetail(row, liveAgents = [], liveByTerminal = new Map(liveAg
       if (mr.kind === "mr") addMr(mr, child.target);
     }
   }
+  for (const tree of trees) tree.tickets = tree.mr ? [...associations.get(mrKey(tree.mr))] : [];
+  for (const entry of loose.values()) entry.tickets = [...associations.get(mrKey(entry.row))];
   const paragraph = cleanObsidian(beforeMachineSection(row?.body)).split(/\n\s*\n/).map(plainParagraph).find(Boolean) ?? "";
   return {
     tickets:{open:tickets.filter(item => !isClosedTicket(item)), closed:tickets.filter(isClosedTicket)},
@@ -739,7 +768,7 @@ export class PanelModel {
     return this.signals.get(row);
   }
   detail(row) {
-    if (!this.details.has(row)) this.details.set(row, taskDetail(row, this.agents, this.live));
+    if (!this.details.has(row)) this.details.set(row, taskDetail(row, this.agents, this.live, this.data?.merge_requests));
     return this.details.get(row);
   }
   reason(row) {

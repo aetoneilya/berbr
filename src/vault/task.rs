@@ -264,6 +264,55 @@ impl Task {
         }
     }
 
+    /// Explicit reattachment overrides a previous exclusion. Discovery never does.
+    pub fn excluded_tickets(&self) -> Vec<String> {
+        self.note
+            .strings("excluded_tickets")
+            .iter()
+            .flat_map(|entry| ticket_keys(entry))
+            .filter(|key| !self.tickets.contains(key))
+            .collect()
+    }
+
+    /// Caller holds the vault lock. Reload before editing to preserve current human text.
+    pub fn detach_ticket(&mut self, key: &str) -> Result<(), NoteError> {
+        self.note.reload()?;
+        let entries: Vec<String> = self
+            .note
+            .strings("tickets")
+            .into_iter()
+            .flat_map(|entry| {
+                let keys = ticket_keys(&entry);
+                if keys.iter().any(|k| k == key) {
+                    keys.into_iter().filter(|k| k != key).collect()
+                } else {
+                    vec![entry]
+                }
+            })
+            .collect();
+        let mut excluded = self.note.strings("excluded_tickets");
+        if !excluded
+            .iter()
+            .any(|entry| ticket_keys(entry).iter().any(|k| k == key))
+        {
+            excluded.push(key.into());
+        }
+        self.note.set(
+            "tickets",
+            Value::Sequence(entries.iter().cloned().map(Value::String).collect()),
+        );
+        self.note.set(
+            "excluded_tickets",
+            Value::Sequence(excluded.into_iter().map(Value::String).collect()),
+        );
+        self.note.save()?;
+        self.tickets = entries
+            .iter()
+            .flat_map(|entry| ticket_keys(entry))
+            .collect();
+        Ok(())
+    }
+
     /// Writes a derived `state`, tickets found on the task's work and sessions
     /// the note does not list yet into its frontmatter; the note's own entries
     /// stay as written, found ones go after them. True when the note changed on
@@ -436,6 +485,30 @@ fn markdown_files(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detach_preserves_context_and_can_be_explicitly_reattached() {
+        let dir = crate::table::fixtures::temp_dir();
+        let path = dir.join("demo-1.md");
+        let body = "Human text DEMO-1.\n\n## Agent notes\nKeep this.\n";
+        std::fs::write(&path, format!("---\nid: demo-1\ntickets: ['[[DEMO-1|Title]]', DEMO-2]\nworktrees: [/work/branch]\n---\n{body}")).unwrap();
+        let mut task = Task::from_note(Note::read(&path).unwrap());
+        task.detach_ticket("DEMO-1").unwrap();
+        assert_eq!(task.tickets, ["DEMO-2"]);
+        assert_eq!(task.excluded_tickets(), ["DEMO-1"]);
+        assert!(std::fs::read_to_string(&path).unwrap().ends_with(body));
+        assert_eq!(task.note.strings("worktrees"), ["/work/branch"]);
+        task.detach_ticket("DEMO-1").unwrap();
+        assert_eq!(task.excluded_tickets(), ["DEMO-1"]);
+        task.note.set(
+            "tickets",
+            serde_yaml::to_value(["DEMO-2", "DEMO-1"]).unwrap(),
+        );
+        task.note.save().unwrap();
+        let reattached = Task::from_note(Note::read(&path).unwrap());
+        assert!(reattached.excluded_tickets().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn unchanged_preview_record_does_not_read_the_full_file() {

@@ -54,3 +54,49 @@ test("focused worktree uses the longest cwd ancestor with path boundaries", () =
   assert.equal(focusedTree(rows, "/home/demo/project-other"), null);
   assert.equal(focusedTree(rows, null), null);
 });
+
+test("CI separates proven review gates, queued work, manual action, and cached evidence", () => {
+  const gate = {context:"codereview", status:"running", pipeline_id:7, source_sha:"source", pipeline_sha:"merged"};
+  const labels = fields => mrPills({state:"opened", ...fields}).map(p => p.label);
+  assert.deepEqual(labels({ci:"running", ci_review:gate, ci_freshness:"Live"}), ["CI review"]);
+  assert.equal(mrPills({ci:"running", ci_review:gate})[0].spin, false);
+  for (const ci_freshness of ["Live", "Cached"]) {
+    const review = mrPills({ci:"running", ci_review:gate, ci_freshness})[0];
+    assert.equal(review.tone, "working");
+    assert.equal(review.glyph, "clock");
+    assert.equal(review.spin, false);
+  }
+  for (const [ci, label] of [["pending", "CI pending"], ["created", "CI queued"],
+    ["preparing", "CI preparing"], ["waiting_for_resource", "CI waiting for resource"],
+    ["manual", "CI manual action"], ["blocked", "CI manual action"]]) {
+    const pills = mrPills({ci, ci_freshness:"Live"});
+    assert.equal(pills[0].label, label);
+    assert.equal(pills[0].spin, false);
+  }
+  for (const fields of [{ci:"running", merge_status:"not_approved"},
+    {ci:"running", ci_review:{...gate, context:"ai-review"}},
+    {ci:"running", ci_review:{...gate, status:"pending"}}]) {
+    assert.deepEqual(labels(fields), ["CI running"]);
+    assert.equal(mrPills(fields)[0].spin, true);
+  }
+  assert.deepEqual(labels({ci:"running", ci_review:gate, ci_freshness:"Cached"}), ["CI review"]);
+  const cached = mrPills({ci:"running", ci_freshness:"Cached"})[0];
+  assert.equal(cached.label, "CI running");
+  assert.equal(cached.spin, false);
+  assert.deepEqual(labels({ci:"running", ci_review:gate, ci_freshness:"Missing"}), ["CI unknown"]);
+  assert.deepEqual(labels({body:"ci:review"}), ["CI review"]);
+  assert.deepEqual(labels({body:"ci:manual"}), ["CI manual action"]);
+  assert.deepEqual(labels({body:"ci:unknown"}), ["CI unknown"]);
+  assert.deepEqual(labels({body:"ci…"}), ["CI running"]);
+});
+
+test("terminal and unfamiliar CI states keep clean focused labels", () => {
+  for (const ci of ["canceled", "skipped", "future-server-status"]) {
+    for (const ci_freshness of [undefined, "Live", "Cached"]) {
+      const [pill] = mrPills({ci, ci_freshness});
+      assert.equal(pill.label, `CI ${ci}`);
+      assert.equal(pill.tone, "dim");
+      assert.equal(pill.spin, false);
+    }
+  }
+});

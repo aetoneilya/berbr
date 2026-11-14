@@ -225,11 +225,19 @@ pub fn review(mr: &Mr) -> Vec<Piece> {
 
 /// ` ci✓`, ` ci✗`, ` ci–` or ` ci…` by the pipeline's status; None without one.
 pub fn pipeline(review: &MrReview) -> Option<Piece> {
+    if review.pipeline_review.as_ref().is_some_and(|gate| {
+        gate.context == "codereview" && review.pipeline.as_deref() == Some(gate.status.as_str())
+    }) {
+        return Some(Piece::dim(" ci:review"));
+    }
     Some(match review.pipeline.as_deref()? {
         "success" => Piece::new(" ci✓", Tone::Green),
         "failed" => Piece::new(" ci✗", Tone::Red),
         "canceled" | "skipped" => Piece::dim(" ci–"),
-        _ => Piece::new(" ci…", Tone::Yellow),
+        "running" => Piece::new(" ci…", Tone::Yellow),
+        "pending" | "created" | "preparing" | "waiting_for_resource" => Piece::dim(" ci:pending"),
+        "manual" | "blocked" => Piece::dim(" ci:manual"),
+        _ => Piece::dim(" ci:unknown"),
     })
 }
 
@@ -352,6 +360,7 @@ mod tests {
             pipeline: Some("failed".to_string()),
             approved_by: vec!["a".to_string()],
             unresolved: 2,
+            ..Default::default()
         });
         assert_eq!(texts(&review(&open)), " ci✗ ✔1 2 threads");
         assert_eq!(review(&open)[0].tone, Tone::Red);
@@ -386,5 +395,28 @@ mod tests {
             "DEMO-1 InProgress a red summary"
         );
         assert_eq!(texts(&super::ticket("DEMO-2", None)), "DEMO-2");
+    }
+}
+
+#[cfg(test)]
+mod pipeline_display_tests {
+    use super::*;
+
+    #[test]
+    fn manual_pending_and_unknown_pipeline_statuses_are_not_running() {
+        for (status, label) in [
+            ("running", " ci…"),
+            ("manual", " ci:manual"),
+            ("pending", " ci:pending"),
+            ("waiting_for_resource", " ci:pending"),
+            ("new-server-status", " ci:unknown"),
+        ] {
+            let review = MrReview {
+                pipeline: Some(status.into()),
+                ..Default::default()
+            };
+            assert_eq!(pipeline(&review).unwrap().text, label);
+        }
+        assert!(pipeline(&MrReview::default()).is_none());
     }
 }
