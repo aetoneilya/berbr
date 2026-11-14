@@ -8,7 +8,7 @@ Keep each coding task together in Herdr: its agents, worktrees, notes and merge 
 
 ## What you see
 
-A panel on the right, initially 420 logical pixels wide. Search and a Filters button sit at the top. Filters selects Tasks or MR/PR, projects and completed work. New task is below the list; Refresh and Settings are in the footer. Tasks are grouped by attention and activity. Each task shows its name and status; expansion reveals its worktrees, agents, tickets and merge requests. Project labels keep actions bound to their source project. Empty configuration opens a Connect repository form instead of an error.
+A panel on the right, initially 420 logical pixels wide. Search and a Filters button sit at the top. Filters selects Tasks or MR/PR, projects and completed work. One footer below the list holds the project scope, Refresh, Settings and New task. Tasks are grouped by attention and activity. Each task shows its name and status; expansion reveals its worktrees, agents, tickets and merge requests. Project labels keep actions bound to their source project. Empty configuration opens a Connect repository form instead of an error.
 
 The surface, text, borders and status colors come from the current Herdr theme. Use 12–13 px text, compact filter controls, compact rows and wrapping action strips. Long labels truncate with tooltips; descriptions and errors wrap. Keep search and footer visible while the task list scrolls.
 

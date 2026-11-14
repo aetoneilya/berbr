@@ -143,7 +143,9 @@ impl GitLab {
                 joined(discussions, "a GitLab request"),
             )
         });
-        let pipeline = mr?
+        let mr = mr?;
+        let pipeline_review = self.pipeline_review(project, &iid, &mr).ok().flatten();
+        let pipeline = mr
             .pointer("/head_pipeline/status")
             .and_then(|v| v.as_str())
             .map(str::to_string);
@@ -167,10 +169,179 @@ impl GitLab {
             .count();
         Ok(MrReview {
             pipeline,
+            pipeline_review,
             approved_by,
             unresolved,
         })
     }
+
+    /// External review contexts participate in GitLab's aggregate pipeline status.
+    /// Inspect the entire head pipeline, including bridge jobs, before separating
+    /// that human gate from running CI. Any missing evidence keeps the raw status.
+    fn pipeline_review(
+        &self,
+        project: &str,
+        iid: &str,
+        mr: &serde_json::Value,
+    ) -> Result<Option<PipelineReview>, String> {
+        let Some(head) = pipeline_identity(mr) else {
+            return Ok(None);
+        };
+        if !matches!(head.status.as_str(), "running" | "pending") {
+            return Ok(None);
+        }
+        let id = head.pipeline_id.to_string();
+        let (statuses, jobs, bridges) = std::thread::scope(|scope| {
+            let jobs =
+                scope.spawn(|| self.pipeline_items(project, &["pipelines", &id, "jobs"], &[]));
+            let bridges =
+                scope.spawn(|| self.pipeline_items(project, &["pipelines", &id, "bridges"], &[]));
+            (
+                self.pipeline_items(
+                    project,
+                    &["repository", "commits", &head.pipeline_sha, "statuses"],
+                    &[("pipeline_id", &id)],
+                ),
+                joined(jobs, "GitLab pipeline jobs"),
+                joined(bridges, "GitLab pipeline bridges"),
+            )
+        });
+        if !only_review_pending(&head, &statuses?, &jobs?, &bridges?) {
+            return Ok(None);
+        }
+        // The source head and synthetic merged-results head are distinct. Compare
+        // each to itself after inspection, never require their SHAs to be equal.
+        let (response, _permit) =
+            self.get(self.project_url(project, &["merge_requests", iid])?, &[])?;
+        let current = response.json().map_err(|e| e.to_string())?;
+        Ok((pipeline_identity(&current).as_ref() == Some(&head)).then_some(head))
+    }
+
+    fn pipeline_items(
+        &self,
+        project: &str,
+        path: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<Vec<serde_json::Value>, String> {
+        pipeline_pages(|page| {
+            let page = page.to_string();
+            let mut query = query.to_vec();
+            query.extend([("per_page", "100"), ("page", page.as_str())]);
+            let (response, _permit) = self.get(self.project_url(project, path)?, &query)?;
+            let next = response
+                .headers()
+                .get("x-next-page")
+                .map(|v| {
+                    let value = v.to_str().map_err(|e| e.to_string())?;
+                    if value.is_empty() {
+                        Ok(None)
+                    } else {
+                        value.parse::<u32>().map(Some).map_err(|e| e.to_string())
+                    }
+                })
+                .transpose()?;
+            let items: Vec<serde_json::Value> = response.json().map_err(|e| e.to_string())?;
+            Ok((items, next))
+        })
+    }
+}
+
+/// Provenance for the exact external `codereview` context, not a job-name
+/// substring heuristic. Absent in old caches and when inspection is incomplete.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PipelineReview {
+    pub pipeline_id: u64,
+    pub pipeline_sha: String,
+    pub source_sha: String,
+    pub status: String,
+    pub context: String,
+}
+
+fn pipeline_identity(mr: &serde_json::Value) -> Option<PipelineReview> {
+    let p = mr.get("head_pipeline")?;
+    Some(PipelineReview {
+        pipeline_id: p.get("id")?.as_u64()?,
+        pipeline_sha: p.get("sha")?.as_str().filter(|s| !s.is_empty())?.into(),
+        source_sha: mr.get("sha")?.as_str().filter(|s| !s.is_empty())?.into(),
+        status: p.get("status")?.as_str()?.into(),
+        context: "codereview".into(),
+    })
+}
+
+fn only_review_pending(
+    head: &PipelineReview,
+    statuses: &[serde_json::Value],
+    jobs: &[serde_json::Value],
+    bridges: &[serde_json::Value],
+) -> bool {
+    let settled = |s: &serde_json::Value| {
+        matches!(s["status"].as_str(), Some("success" | "skipped"))
+            || (s["status"] == "manual" && s["allow_failure"] == true)
+    };
+    // Empty/incomplete job evidence is insufficient. Running AI review jobs are
+    // computation too; only a status absent from the jobs API is an external gate.
+    if jobs.is_empty()
+        || !jobs
+            .iter()
+            .chain(bridges)
+            .all(|job| job["id"].as_u64().is_some() && settled(job))
+    {
+        return false;
+    }
+    // A successful trigger can mean only that GitLab created the downstream
+    // pipeline. Require its own success; never infer completion from the bridge.
+    // Skipped/unplayed optional triggers may legitimately have no downstream.
+    if bridges.iter().any(|bridge| {
+        let downstream = &bridge["downstream_pipeline"];
+        (bridge["status"] == "success" || !downstream.is_null())
+            && (downstream["id"].as_u64().is_none() || downstream["status"] != "success")
+    }) {
+        return false;
+    }
+    let mut gate = false;
+    for status in statuses {
+        if status["pipeline_id"].as_u64() != Some(head.pipeline_id)
+            || status["sha"].as_str() != Some(head.pipeline_sha.as_str())
+        {
+            return false;
+        }
+        let external = status["id"].as_u64().is_some_and(|id| {
+            jobs.iter()
+                .chain(bridges)
+                .all(|job| job["id"].as_u64() != Some(id))
+        });
+        if external
+            && status["allow_failure"] == false
+            && status["name"] == "codereview"
+            && matches!(status["status"].as_str(), Some("pending" | "running"))
+        {
+            gate = true;
+        } else if !settled(status) {
+            return false;
+        }
+    }
+    gate && jobs.iter().any(|job| job["status"] == "success")
+}
+
+fn pipeline_pages(
+    mut fetch: impl FnMut(u32) -> Result<(Vec<serde_json::Value>, Option<Option<u32>>), String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut found = Vec::new();
+    let mut page = 1;
+    for _ in 0..100 {
+        let (items, next) = fetch(page)?;
+        let next = next.unwrap_or_else(|| (items.len() == 100).then_some(page + 1));
+        if next.is_some() && items.is_empty() {
+            return Err("incomplete GitLab pipeline page".into());
+        }
+        found.extend(items);
+        match next {
+            None => return Ok(found),
+            Some(n) if n == page + 1 => page = n,
+            _ => return Err("invalid GitLab pipeline pagination".into()),
+        }
+    }
+    Err("GitLab pipeline pagination limit exceeded".into())
 }
 
 fn discussion_pages(
@@ -213,6 +384,8 @@ fn merge_request_pages(
 pub struct MrReview {
     /// Head pipeline status: "running", "success", "failed", "pending"…
     pub pipeline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_review: Option<PipelineReview>,
     pub approved_by: Vec<String>,
     /// Resolvable discussions not resolved yet.
     pub unresolved: usize,
@@ -407,5 +580,179 @@ mod discussion_tests {
             .is_err()
         );
         assert!(discussion_pages(|_| Ok((vec![serde_json::json!({})], Some(1)))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod pipeline_review_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn fixture() -> Value {
+        serde_json::from_str(include_str!(
+            "../../tests/fixtures/gitlab-review-pipeline.json"
+        ))
+        .unwrap()
+    }
+
+    fn classified(f: &Value) -> bool {
+        let head = pipeline_identity(&f["mr"]).unwrap();
+        only_review_pending(
+            &head,
+            f["statuses"].as_array().unwrap(),
+            f["jobs"].as_array().unwrap(),
+            f["bridges"].as_array().unwrap(),
+        )
+    }
+
+    #[test]
+    fn external_review_gate_is_distinct_from_running_jobs_and_manual_actions() {
+        let f = fixture();
+        assert_ne!(f["mr"]["sha"], f["mr"]["head_pipeline"]["sha"]);
+        assert!(classified(&f));
+        let mut running_review = f.clone();
+        running_review["statuses"][8]["status"] = json!("running");
+        assert!(classified(&running_review));
+        for state in [
+            "running",
+            "pending",
+            "created",
+            "preparing",
+            "waiting_for_resource",
+            "manual",
+            "failed",
+            "canceled",
+            "unknown",
+        ] {
+            let mut changed = f.clone();
+            changed["jobs"][0]["status"] = json!(state);
+            changed["jobs"][0]["allow_failure"] = json!(false);
+            assert!(!classified(&changed), "job {state}");
+            let mut changed = f.clone();
+            changed["statuses"][0]["status"] = json!(state);
+            assert!(!classified(&changed), "status {state}");
+            let mut changed = f.clone();
+            changed["bridges"] =
+                json!([{"id":99,"name":"downstream", "status":state,"allow_failure":false}]);
+            assert!(!classified(&changed), "bridge {state}");
+        }
+        for name in ["ai-review", "review", "codereview-other"] {
+            let mut changed = f.clone();
+            changed["statuses"][8]["name"] = json!(name);
+            assert!(!classified(&changed), "not the external context: {name}");
+        }
+        // An actual running job called codereview is still running computation.
+        let mut changed = f.clone();
+        let gate_job = changed["statuses"][8].clone();
+        changed["jobs"].as_array_mut().unwrap().push(gate_job);
+        assert!(!classified(&changed));
+    }
+
+    #[test]
+    fn successful_bridge_requires_successful_downstream_evidence() {
+        for (downstream, expected) in [
+            (None, false),
+            (Some(Value::Null), false),
+            (Some(json!({"id":200})), false),
+            (Some(json!({"status":"success"})), false),
+            (Some(json!({"id":200,"status":"running"})), false),
+            (Some(json!({"id":200,"status":"pending"})), false),
+            (Some(json!({"id":200,"status":"failed"})), false),
+            (Some(json!({"id":200,"status":"canceled"})), false),
+            (Some(json!({"id":200,"status":"unknown"})), false),
+            (Some(json!({"id":200,"status":"manual"})), false),
+            (Some(json!({"id":200,"status":"skipped"})), false),
+            (Some(json!({"id":200,"status":"success"})), true),
+        ] {
+            let mut f = fixture();
+            let mut bridge = json!({"id":99,"status":"success","allow_failure":false});
+            if let Some(value) = downstream {
+                bridge["downstream_pipeline"] = value;
+            }
+            f["bridges"] = json!([bridge]);
+            assert_eq!(classified(&f), expected, "bridge {}", f["bridges"]);
+        }
+        for status in ["manual", "skipped"] {
+            let mut f = fixture();
+            f["bridges"] = json!([{"id":99,"status":status,"allow_failure":true}]);
+            assert!(classified(&f), "unplayed {status} trigger");
+            f["bridges"][0]["downstream_pipeline"] = json!({"id":200,"status":"running"});
+            assert!(
+                !classified(&f),
+                "existing active downstream behind {status} trigger"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_or_wrong_pipeline_evidence_cannot_claim_review_pending() {
+        let f = fixture();
+        for field in ["statuses", "jobs"] {
+            let mut changed = f.clone();
+            changed[field] = json!([]);
+            assert!(!classified(&changed));
+        }
+        for (field, value) in [
+            ("pipeline_id", json!(0)),
+            ("pipeline_id", Value::Null),
+            ("sha", json!("old-head")),
+            ("sha", Value::Null),
+            ("status", Value::Null),
+            ("id", Value::Null),
+        ] {
+            let mut changed = f.clone();
+            changed["statuses"][8][field] = value;
+            assert!(!classified(&changed), "invalid {field}");
+        }
+        let original = pipeline_identity(&f["mr"]).unwrap();
+        for path in [
+            "/sha",
+            "/head_pipeline/sha",
+            "/head_pipeline/id",
+            "/head_pipeline/status",
+        ] {
+            let mut changed = f["mr"].clone();
+            *changed.pointer_mut(path).unwrap() = json!("changed");
+            assert_ne!(pipeline_identity(&changed).as_ref(), Some(&original));
+        }
+    }
+
+    #[test]
+    fn pipeline_pagination_reads_every_page_and_fails_closed() {
+        let mut calls = Vec::new();
+        let items = pipeline_pages(|page| {
+            calls.push(page);
+            Ok((
+                vec![json!({"status":"success"}); if page == 1 { 100 } else { 1 }],
+                None,
+            ))
+        })
+        .unwrap();
+        assert_eq!(calls, [1, 2]);
+        assert_eq!(items.len(), 101);
+        assert!(
+            pipeline_pages(|page| if page == 1 {
+                Ok((vec![json!({})], Some(Some(2))))
+            } else {
+                Err("page failed".into())
+            })
+            .is_err()
+        );
+        assert!(pipeline_pages(|_| Ok((vec![], Some(Some(2))))).is_err());
+        assert!(pipeline_pages(|_| Ok((vec![json!({})], Some(Some(1))))).is_err());
+        assert!(pipeline_pages(|page| Ok((vec![json!({})], Some(Some(page + 1))))).is_err());
+    }
+
+    #[test]
+    fn legacy_cache_roundtrip_preserves_raw_pipeline_and_optional_provenance() {
+        let old = json!({"pipeline":"running","approved_by":[],"unresolved":0});
+        let mut review: MrReview = serde_json::from_value(old.clone()).unwrap();
+        assert!(review.pipeline_review.is_none());
+        assert_eq!(serde_json::to_value(&review).unwrap(), old);
+        review.pipeline_review = pipeline_identity(&fixture()["mr"]);
+        let decoded: MrReview =
+            serde_json::from_value(serde_json::to_value(&review).unwrap()).unwrap();
+        assert_eq!(decoded.pipeline.as_deref(), Some("running"));
+        assert_eq!(decoded.pipeline_review, review.pipeline_review);
     }
 }

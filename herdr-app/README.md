@@ -18,12 +18,18 @@ one or more projects, and whether completed work is shown. The selected project
 scope is saved. Project snapshots load independently, at most two at a time;
 failures retain cached rows and identify the affected project. Rows are labelled
 with their project, and actions keep the source project's context even when task
-IDs coincide. New task stays below the list; its form selects the creation project.
-Refresh and Settings are in the footer.
+IDs coincide. One footer below the list holds the project scope, Refresh, Settings and New task;
+the New task form selects the creation project. The footer keeps the project scope visible
+while the panel has keyboard focus.
 Tasks shows task status and agents needing
 attention. Click a task to select its Herdr space; the separate `⋯` button
-opens its note and related tickets, merge requests, worktrees and agents.
+opens task actions; the chevron expands related tickets, merge requests, worktrees and agents.
 Tasks without a live space open details with an explicit Start work action.
+Expanded task titles wrap to remain readable. Worktree names truncate beside fixed diff counts
+and the terminal button; the full name is available on hover. The MR number and CI status
+share one link below, beside linked tickets. Statuses use colored icons and text without
+containers. Uncommitted changes have a dot beside the worktree name; stopped agents
+show a label without a live status ring.
 
 MR shows a flat list of your GitLab merge requests and GitHub pull requests across the selected projects' configured
 repositories, including MRs without a task or local checkout. Each MR appears once,
@@ -38,13 +44,35 @@ MRs already present in the current snapshot, rather than loading a full history.
 The additive `merge_requests` snapshot field contains every fetched MR with its
 full title, repository, ticket keys and task associations, independently of tree
 presentation. Older backends fall back to the MRs present in the task tree.
-Unavailable CI is shown as unknown. Cached results and source warnings follow the
+Unavailable CI is shown as unknown. A verified external code-review gate appears as
+CI review instead of a running spinner. Cached CI never animates, and does not add a
+visible cached suffix. Cached results and source warnings follow the
 same refresh behavior as Tasks. `berbr.tasks` and `berbr.mrs` can also be bound as
 Herdr commands. GitHub PRs use the configured GitHub integration.
+Errors and warnings start as compact summaries. Expand a summary to read and
+select the full diagnostic in a bounded scroll area.
 
-Expanded tasks also show **Artifacts**, a shared tree of any files and folders.
+Expanded tasks group MR/CI metadata and agents under each worktree, with an always-visible
+terminal button. Shared columns and a hairline between worktree groups distinguish them without connecting
+lines or nested branch frames. All agents remain visible, with their questions directly below.
+The bottom action row contains Note, Artifacts, History and the task menu.
+Close task and Add ticket remain available in that menu. Tickets appear beside associated MRs,
+with their full title on hover and a link to the tracker. Unlinked open tickets are collapsed under “Tickets without MR” below the title;
+open tickets linked only to collapsed History remain in that list until History opens.
+Right-click a task ticket and choose “Remove from task” to unlink it locally without closing
+the issue or deleting worktrees. Discovery will not reattach it; Add ticket can restore it.
+History groups completed MRs/PRs and unlinked closed tickets without implying a chronological timeline.
+Artifacts and History expand below the action row, one at a time. Mouse clicks preserve the
+navigation position without a persistent selection highlight; keyboard selection stays visible.
+
+**Artifacts** is a shared tree of any files and folders.
 Folders load on expansion; only visible directories refresh every five seconds.
-The header can refresh them manually or open the root folder in Finder.
+Click Artifacts or press Enter on it to collapse the tree; the choice
+is remembered for each task. Switching to History temporarily hides Artifacts without
+changing that saved preference. Closing History leaves both sections closed until
+explicitly reopened; a new panel instance restores the saved Artifacts preference.
+Hidden trees do not poll. The expanded section retains folder and refresh controls, including when empty.
+Open artifact folder is also available in the task menu while the section is collapsed.
 Markdown uses Berbr's note viewer/editor, other files their default app, and
 scripts/executables the text editor. Symlinks are revealed rather than traversed.
 Artifacts live under Berbr's home, outside worktrees and task-note directories,

@@ -80,3 +80,24 @@ test("older tree-only snapshots retain stripped Jira keys from every parent tick
   assert.equal(list.length, 1);
   assert.match(list[0].searchText, /demo-123 demo-456/);
 });
+
+test("MR catalog keeps CI review gates and freshness visible without inventing approvals", () => {
+  const row = mr(9, {ci:"running", ci_freshness:"Live", ci_review:{context:"codereview", status:"running"}, approvals:0});
+  assert.deepEqual(mrListPills(row).map(p => p.label), ["CI review", "0 approvals"]);
+  row.ci_freshness = "Cached";
+  assert.deepEqual(mrListPills(row).map(p => p.label), ["CI review", "0 approvals"]);
+  row.ci_freshness = "Missing";
+  assert.equal(mrListPills(row)[0].label, "CI unknown");
+  assert.equal(mrListPills({...row, state:"merged"})[0].label, "merged");
+});
+
+test("MR catalog keeps fallback labels clean for live and cached data", () => {
+  for (const ci of ["canceled", "skipped", "future-server-status", null, undefined]) {
+    for (const ci_freshness of [undefined, "Live", "Cached"]) {
+      const [pill] = mrListPills(mr(1, {ci, ci_freshness}));
+      assert.equal(pill.label, `CI ${ci || "unknown"}`);
+      assert.equal(pill.tone, "dim");
+      assert.ok(!pill.spin);
+    }
+  }
+});

@@ -13,7 +13,9 @@ export function div() {
       if (key === "child") node.nodes.push(args[0]);
       else if (key === "children") node.nodes.push(...args[0]);
       else if (key === "content") { node.attributes.content = args; node.nodes.push(args[0]); }
-      else if (key === "when") { if (args[0]) args[1](proxy); }
+      else if (key === "when") {
+        if (args[0] && args[1](proxy) !== proxy) throw new Error("when(...) must return the element");
+      }
       else node.attributes[key] = args;
       if (["on_mouse_down", "on_mouse_up"].includes(key)) {
         node.handlers ??= {};

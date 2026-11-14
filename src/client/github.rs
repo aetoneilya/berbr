@@ -440,6 +440,7 @@ impl GitHub {
             return Ok((
                 MrReview {
                     pipeline,
+                    pipeline_review: None,
                     approved_by,
                     unresolved,
                 },

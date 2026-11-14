@@ -402,6 +402,7 @@ mod tests {
             pipeline: Some("failed".into()),
             approved_by: vec!["reviewer".into()],
             unresolved: 2,
+            ..Default::default()
         });
         table.mrs[1].review = Some(MrReview {
             pipeline: Some("success".into()),

@@ -322,6 +322,7 @@ fn task_row(
         .collect();
     // keys on its worktrees and MRs that no note lists are the task's too
     let mut found_tickets: Vec<String> = Vec::new();
+    let excluded = task.excluded_tickets();
     if !task.done {
         let keys = row_trees
             .iter()
@@ -329,7 +330,7 @@ fn task_row(
             .chain(row_mrs.iter().flat_map(|&i| &mrs[i].keys));
         for key in keys {
             let listed = task.tickets.contains(key) || owned.contains(key);
-            if !listed && !found_tickets.contains(key) {
+            if !listed && !excluded.contains(key) && !found_tickets.contains(key) {
                 found_tickets.push(key.clone());
             }
         }
@@ -892,6 +893,25 @@ mod tests {
         let table = assemble(inputs);
         assert_eq!(table.task_row("a2i").mrs, vec![0]);
         assert!(table.other_mrs.is_empty());
+    }
+
+    #[test]
+    fn detached_ticket_is_not_rediscovered_on_owned_work() {
+        let mut owner = task("a2i", &["DEMO-1"]);
+        owner.note.set(
+            "excluded_tickets",
+            serde_yaml::to_value(["DEMO-2"]).unwrap(),
+        );
+        let table = table(
+            vec![owner],
+            vec![],
+            vec![mr(10, "demo/DEMO-1-DEMO-2", "DEMO-2 change", "opened")],
+            vec![tree("a", "demo/DEMO-1-DEMO-2")],
+        );
+        let row = table.task_row("a2i");
+        assert_eq!(row.tickets().cloned().collect::<Vec<_>>(), ["DEMO-1"]);
+        assert_eq!(row.trees.len(), 1);
+        assert_eq!(row.mrs.len(), 1);
     }
 
     #[test]

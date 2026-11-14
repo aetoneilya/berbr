@@ -122,8 +122,9 @@ impl ClosingScope {
     fn new(task: &Task, trees: &[Tree], space: Option<&str>) -> Self {
         let owned = super::matching::task_trees(task, trees, space);
         let mut tickets = task.tickets.clone();
+        let excluded = task.excluded_tickets();
         for key in owned.iter().flat_map(|&i| &trees[i].keys) {
-            if !tickets.contains(key) {
+            if !tickets.contains(key) && !excluded.contains(key) {
                 tickets.push(key.clone());
             }
         }

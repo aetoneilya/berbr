@@ -305,6 +305,10 @@ fn row_with_history(
             value["body_truncated"] = json!(truncated);
             value["note"] = json!(r.task.note.path);
             value["tags"] = json!(r.task.tags);
+            let excluded = r.task.excluded_tickets();
+            if !excluded.is_empty() {
+                value["excluded_tickets"] = json!(excluded);
+            }
             value["space"] = json!(r.space);
         }
         Kind::Ticket(key) => ticket(table, &mut value, key),
@@ -336,14 +340,25 @@ fn row_with_history(
                 let unresolved = review.map_or(0, |r| r.unresolved);
                 let conflict =
                     m.mr.has_conflicts || m.mr.detailed_merge_status.as_deref() == Some("conflict");
+                let source = if m.mr.github {
+                    &table.github
+                } else {
+                    &table.gitlab
+                };
                 value["ci"] = json!(ci);
+                value["ci_freshness"] = json!(if review.is_none() {
+                    "Missing".into()
+                } else {
+                    format!("{:?}", source.fresh)
+                });
+                value["ci_review"] = json!(review.and_then(|r| r.pipeline_review.as_ref()));
                 value["approvals"] = json!(review.map_or(0, |r| r.approved_by.len()));
                 value["unresolved"] = json!(unresolved);
                 value["draft"] = json!(m.mr.draft);
                 value["merge_status"] = json!(m.mr.detailed_merge_status);
                 value["conflict"] = json!(conflict);
                 value["ready"] = json!(
-                    (!m.mr.github || table.github.fresh == table::Fresh::Live)
+                    (source.fresh == table::Fresh::Live)
                         && !m.mr.draft
                         && ci == Some("success")
                         && !conflict
@@ -726,6 +741,7 @@ mod tests {
                             pipeline: ci.map(str::to_string),
                             approved_by: vec!["reviewer-a".into(), "reviewer-b".into()],
                             unresolved,
+                            ..Default::default()
                         });
                         let table = table(vec![], vec![], vec![m], vec![]);
                         let value = row(&table, &node, None);
@@ -1003,6 +1019,7 @@ mod github_tests {
             pipeline: Some("success".into()),
             approved_by: vec!["reviewer".into()],
             unresolved: 0,
+            ..Default::default()
         });
         let mut table = table(vec![], vec![], vec![pr], vec![]);
         let node = Node {
@@ -1021,5 +1038,63 @@ mod github_tests {
         table.mrs[0].review = None;
         assert_eq!(row(&table, &node, None)["ready"], false);
         assert!(row(&table, &node, None)["ci"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod ci_provenance_tests {
+    use super::*;
+    use crate::client::gitlab::{MrReview, PipelineReview};
+    use crate::table::fixtures::{mr, table};
+
+    #[test]
+    fn snapshot_preserves_raw_ci_and_reports_gate_provenance_and_freshness() {
+        let mut change = mr(1, "work", "work", "opened");
+        let gate = PipelineReview {
+            pipeline_id: 7,
+            pipeline_sha: "merged".into(),
+            source_sha: "source".into(),
+            status: "running".into(),
+            context: "codereview".into(),
+        };
+        change.review = Some(MrReview {
+            pipeline: Some("running".into()),
+            pipeline_review: Some(gate.clone()),
+            ..Default::default()
+        });
+        let mut table = table(vec![], vec![], vec![change], vec![]);
+        let node = Node {
+            id: "mr:1".into(),
+            kind: Kind::Mr(0),
+            children: vec![],
+        };
+        for (freshness, label) in [
+            (table::Fresh::Live, "Live"),
+            (table::Fresh::Cached, "Cached"),
+        ] {
+            table.gitlab.fresh = freshness;
+            let value = row(&table, &node, None);
+            assert_eq!(value["ci"], "running");
+            assert_eq!(value["ci_review"], json!(gate));
+            assert_eq!(value["ci_freshness"], label);
+            assert_eq!(value["ready"], false);
+            assert!(value["body"].as_str().unwrap().contains("ci:review"));
+            assert_eq!(merge_request_rows(&table)[0]["ci_review"], json!(gate));
+        }
+        table.gitlab.fresh = table::Fresh::Live;
+        table.mrs[0].review = None;
+        let value = row(&table, &node, None);
+        assert_eq!(value["ci_freshness"], "Missing");
+        assert!(value["ci"].is_null());
+        assert!(value["ci_review"].is_null());
+
+        table.mrs[0].review = Some(MrReview {
+            pipeline: Some("success".into()),
+            ..Default::default()
+        });
+        table.mrs[0].mr.detailed_merge_status = Some("mergeable".into());
+        assert_eq!(row(&table, &node, None)["ready"], true);
+        table.gitlab.fresh = table::Fresh::Cached;
+        assert_eq!(row(&table, &node, None)["ready"], false);
     }
 }

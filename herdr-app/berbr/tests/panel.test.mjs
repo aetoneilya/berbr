@@ -16,12 +16,13 @@ const snapshot = JSON.parse(await readFile(new URL("../fixtures/sample-snapshot.
 const storage = new Map();
 globalThis.localStorage = {getItem:key => storage.get(key) ?? null, setItem:(key, value) => storage.set(key, value)};
 
-function setup({data = snapshot, props = {}, saved = null, collapsed = null, views = {}, scope = null, liveSpaces = [], focus = null, keepJobs = false} = {}) {
+function setup({data = snapshot, props = {}, saved = null, collapsed = null, artifactCollapsed = null, views = {}, scope = null, liveSpaces = [], focus = null, keepJobs = false} = {}) {
   storage.clear();
   if (scope !== null) storage.set("berbr.projects", JSON.stringify(scope));
   for (const [project, view] of Object.entries(views)) storage.set(`berbr.view.${project}`, view);
   if (saved) storage.set("berbr.expanded", JSON.stringify(saved));
   if (collapsed) storage.set("berbr.collapsed", JSON.stringify(collapsed));
+  if (artifactCollapsed) storage.set("berbr.artifacts.collapsed", JSON.stringify(artifactCollapsed));
   Object.assign(state, {focused:focus, props, spaces:liveSpaces, agents:[], panes:[], shared:new Map(), calls:[], overlays:[], notices:[], execs:[], execResult:null,
     existsCalls:[], existsError:null, reads:[], readResult:null, readError:null, watches:[], watchers:[], terminals:[], hcCalls:[], hcResult:null, hcError:null, hcHandler:null, execHandler:null, runHandler:null, files:null, writes:[], writeError:null, writeResult:null});
   const jobs = [], timers = [];
@@ -368,6 +369,114 @@ test("MR view works without storage and the search shortcut targets only the act
 const artifactTask = (root = "/artifacts/demo-1") => ({id:"task:demo-1", kind:"task", task:"demo-1", title:"Demo", artifacts:root, children:[]});
 const artifactEntry = (name, kind = "file", extra = {}) => ({name, kind, relative:name, path:`/artifacts/demo-1/${name}`, executable:false, ...extra});
 
+test("large errors and warnings stay compact and reveal bounded, selectable details on demand", () => {
+  const {view, cx} = setup();
+  view.error = "Command failed\n" + "<error> & diagnostic\n".repeat(100);
+  view.data = {...snapshot, warnings:["GitLab is offline\n" + "retry details\n".repeat(80), "Cached data"]};
+  let root = view.render(cx);
+  assert.ok(byId(root, "berbr-tasks"));
+  assert.match(text(byId(root, "banner-dismiss-error")), /Command failed/);
+  assert.doesNotMatch(text(byId(root, "banner-dismiss-error")), /diagnostic/);
+  assert.match(text(byId(root, "banner-warnings")), /2 warnings · GitLab is offline/);
+  assert.equal(byId(root, "warnings/details"), undefined);
+  click(byId(root, "dismiss-error/toggle"), cx);
+  root = view.render(cx);
+  const details = byId(root, "dismiss-error/details");
+  assert.equal(details.attributes.h[0], 120);
+  assert.ok(details.attributes.flex_none);
+  assert.ok(details.attributes.overflow_y_scrollbar);
+  assert.ok(nodes(details).some(node => node.attributes.selectable));
+  assert.match(text(details), /&lt;error&gt; &amp; diagnostic/);
+  assert.match(text(details), /Command failed<\/p><p>&lt;error&gt;/);
+  click(byId(root, "dismiss-error/toggle"), cx);
+  assert.equal(byId(view.render(cx), "dismiss-error/details"), undefined);
+  // Keyboard activation and new messages must not inherit an open wall of text.
+  byId(view.render(cx), "warnings/toggle").attributes.on_key_down[0]({key:"enter"}, cx);
+  assert.ok(byId(view.render(cx), "warnings/details"));
+  view.data = {...view.data, warnings:["New warning"]};
+  assert.equal(byId(view.render(cx), "warnings/details"), undefined);
+  view.error = "x".repeat(5000);
+  assert.ok(text(byId(view.render(cx), "banner-dismiss-error")).length < 250);
+  click(byId(view.render(cx), "dismiss-error"), cx);
+  assert.equal(view.error, null);
+  assert.equal(byId(view.render(cx), "banner-dismiss-error"), undefined);
+});
+
+test("Artifacts collapse independently, survive task switches and reloads, and stop hidden polling", async () => {
+  const task = artifactTask();
+  const {view, cx, jobs, timers, key} = setup({data:{rows:[task]}});
+  view.cli = async args => JSON.stringify({project:view.project, task:task.task, path:task.artifacts,
+    entries:args.includes("--directory") ? [artifactEntry("data/child.txt")] : [artifactEntry("data", "directory")]});
+  view.showDetails(task, cx); await jobs.shift()(cx);
+  click(byId(view.render(cx), `${task.id}/artifact/data`), cx); await jobs.shift()(cx);
+  const header = `${task.id}/artifacts/header`;
+  view.selected = header; key("enter");
+  assert.equal(view.selected, header);
+  assert.ok(byId(view.render(cx), header));
+  assert.equal(byId(view.render(cx), `${task.id}/artifact/data`), undefined);
+  assert.deepEqual(JSON.parse(storage.get("berbr.artifacts.collapsed")), [task.artifacts]);
+  const poll = timers.find(timer => timer.ms === 5000).fn;
+  poll(cx); assert.equal(jobs.length, 0);
+  view.setExpanded(null, cx); view.showDetails(task, cx);
+  assert.equal(jobs.length, 0);
+  click(byId(view.render(cx), header), cx); await jobs.shift()(cx);
+  assert.match(text(view.render(cx)), /data\/child.txt/);
+  view.switchView("mrs", cx); poll(cx); assert.equal(jobs.length, 0);
+  view.switchView("tasks", cx);
+  const section = view.sections().find(section => section.rows.some(row => row.id === task.id));
+  view.toggleSection(section.id, cx, false); poll(cx); assert.equal(jobs.length, 0);
+  view.toggleSection(section.id, cx, true);
+  view.inputs.search.set_value("no match"); view.inputs.search.emit("change", cx);
+  poll(cx); assert.equal(jobs.length, 0);
+  const restored = setup({data:{rows:[task]}, artifactCollapsed:[task.artifacts], saved:task.id});
+  restored.view.showDetails(task, restored.cx);
+  assert.equal(restored.jobs.length, 0);
+  assert.ok(byId(restored.view.render(restored.cx), header));
+  assert.equal(byId(restored.view.render(restored.cx), `${task.id}/artifact/data`), undefined);
+});
+
+test("empty artifact roots keep their folder and refresh controls available", async () => {
+  const task = artifactTask();
+  const {view, cx, jobs} = setup({data:{rows:[task]}});
+  view.cli = async () => JSON.stringify({project:view.project, task:task.task, path:task.artifacts, entries:[]});
+  view.showDetails(task, cx); await jobs.shift()(cx);
+  const root = view.render(cx), header = `${task.id}/artifacts/header`;
+  assert.match(text(byId(root, `${task.id}/artifact-tools/tools`)), /Empty folder/);
+  assert.equal(byId(root, `${task.id}/artifact-status/status/`), undefined);
+  assert.ok(byId(root, `${task.id}/artifact-tools/tools/refresh`));
+  click(byId(root, `${task.id}/artifact-tools/tools/folder`), cx); await jobs.shift()(cx);
+  assert.deepEqual(state.execs.at(-1), ["open", [task.artifacts]]);
+  click(byId(view.render(cx), header), cx);
+  assert.doesNotMatch(text(view.render(cx)), /Empty folder/);
+});
+
+test("collapsed artifacts open their folder from the task menu, with pinned context and preparation errors", async () => {
+  const task = {...artifactTask(), project:"other"};
+  const {view, cx, jobs} = setup({data:{rows:[task], projects:[{name:"other", cwd:"/other/repo"}]},
+    props:{form:"menu", row:task, overlay:"menu", project:"other", cwd:"/other/repo"},
+    artifactCollapsed:[task.artifacts], saved:task.id});
+  view.data = null; // Real menu overlays do not load a snapshot.
+  const calls = [];
+  view.cli = async (...args) => {calls.push(args);return task.artifacts;};
+  view.chooseMenu(cx, "artifact-folder");
+  assert.equal(view.busy, true);
+  await jobs.shift()(cx);
+  assert.deepEqual(calls[0][0], ["artifacts", task.task]);
+  assert.equal(calls[0][1].project, "other");
+  assert.equal(calls[0][1].context.cwd, "/other/repo");
+  assert.equal(calls[0][1].context.fallback, undefined);
+  assert.deepEqual(state.execs.at(-1), ["open", [task.artifacts]]);
+  assert.equal(view.artifactLists.size, 0);
+  assert.ok(view.artifactCollapsed.has(task.artifacts));
+  assert.equal(view.busy, false);
+  state.execs = [];
+  view.cli = async () => {throw new Error("Artifact folder is unavailable");};
+  view.chooseMenu(cx, "artifact-folder"); await jobs.shift()(cx);
+  assert.equal(view.error, "Artifact folder is unavailable");
+  assert.equal(view.busy, false);
+  assert.deepEqual(state.execs, []);
+});
+
 test("Artifacts lists arbitrary files and lazily expands folders with keyboard file opening", async () => {
   const task = artifactTask();
   const {view, cx, jobs, key} = setup({data:{rows:[task]}});
@@ -418,7 +527,7 @@ test("artifact opening previews Markdown, opens ordinary files, edits scripts an
     ["open", ["-t", entries[3].path]], ["open", ["-t", entries[4].path]],
     ["open", ["-R", entries[5].path]],
   ]);
-  click(byId(view.render(cx), `${task.id}/artifacts/header/folder`), cx);
+  click(byId(view.render(cx), `${task.id}/artifact-tools/tools/folder`), cx);
   await jobs.shift()(cx);
   assert.deepEqual(state.execs.at(-1), ["open", [task.artifacts]]);
 });
@@ -508,7 +617,7 @@ test("artifact requests pin project and cwd before deferred execution, including
   assert.match(text(view.render(cx)), /A.txt/);
   // A mismatched backend result must not replace the last successful list.
   state.execHandler = async () => ({code:0, stderr:"", stdout:JSON.stringify({project:"B", task:task.task, path:"/B/demo-1", entries:[artifactEntry("B.txt")]})});
-  click(byId(view.render(cx), `${task.id}/artifacts/header/refresh`), cx);
+  click(byId(view.render(cx), `${task.id}/artifact-tools/tools/refresh`), cx);
   await jobs.shift()(cx);
   assert.match(text(view.render(cx)), /another project or task/);
   assert.match(text(view.render(cx)), /A.txt/);
@@ -598,17 +707,18 @@ test("worktree click focuses a live shell tab and terminal, ignoring mod panes a
   assert.equal(jobs.length, 0);
 });
 
-test("pills tint theme hex colors, fall back to raised and expose accessible CI status", () => {
+test("pills are a colored glyph and word without a container and expose accessible CI status", () => {
   for (const tone of ["blocked", "working", "done", "dim", "accent"]) {
     const rendered = pill({...theme(), [tone]:"#123abc"}, {label:"Status", tone});
-    assert.equal(rendered.attributes.bg[0], "#123abc" + (tone === "dim" ? "12" : "24"));
+    assert.equal(rendered.attributes.bg, undefined);
+    assert.equal(Boolean(rendered.attributes.font_medium), tone !== "dim");
     assert.equal(rendered.attributes.text_color[0], "#123abc");
-    assert.equal(rendered.attributes.h[0], 19);
+    assert.equal(rendered.attributes.h[0], 18);
     assert.ok(rendered.attributes.flex_none);
   }
   const rendered = pill(theme(), {label:"CI running", tone:"working", glyph:"spinner", spin:true,
     tooltip:"CI running — open !123 in GitLab"});
-  assert.equal(rendered.attributes.bg[0], "raised");
+  assert.equal(rendered.attributes.text_color[0], "working");
   assert.equal(rendered.attributes.accessibility_label[0], "CI running — open !123 in GitLab");
   assert.equal(rendered.nodes[0].attributes.spin[0], 900);
   assert.ok(rendered.nodes[0].asset.path.endsWith("spinner.svg"));
@@ -723,28 +833,31 @@ test("task summary keeps one worst pill and the additional MR count while detail
     ["2 threads — open !123 in GitLab", "CI running — open !123 in GitLab"]);
 });
 
-test("worktree hover actions reserve width at the right edge and keep Review in the menu only", () => {
+test("worktree terminal remains visible at the right edge and keeps Review in the menu only", () => {
   const {view} = setup({data:{rows:[]}});
   const mr = {kind:"mr", label:"!123 Demo", state:"merged"};
   const row = {kind:"tree", id:"tree", tree:"Demo", task:"Demo", diff:{adds:8, dels:2}, children:[mr]};
   const item = {id:"detail-tree", type:"tree", row, mr};
   view.selected = null;
   const hidden = byId(view.detailRow(theme(), item), item.id);
-  const actions = hidden.nodes.at(-1);
-  assert.ok(actions.attributes.invisible);
+  const heading = byId(hidden, `${item.id}/heading`), actions = heading.nodes.at(-1);
+  assert.equal(actions.attributes.invisible, undefined);
   assert.deepEqual(actions.nodes.map(node => node.attributes.tooltip[0]), ["Open terminal in worktree"]);
-  assert.ok(hidden.nodes.indexOf(hidden.nodes.find(node => byId(node, `${item.id}/mr`))) < hidden.nodes.indexOf(actions));
+  assert.equal(heading.nodes.indexOf(actions), heading.nodes.length - 1);
+  assert.ok(byId(byId(hidden, `${item.id}/metadata`), `${item.id}/mr`));
   assert.equal(byId(hidden, `${item.id}/review`), undefined);
   view.hovered = item.id;
   const shown = byId(view.detailRow(theme(), item), item.id);
   assert.deepEqual(shown.nodes.map(node => node.attributes.id), hidden.nodes.map(node => node.attributes.id));
-  assert.deepEqual(shown.nodes.at(-1).nodes.map(node => node.attributes.size), actions.nodes.map(node => node.attributes.size));
-  assert.equal(shown.nodes.at(-1).attributes.invisible, undefined);
+  const shownActions = byId(shown, `${item.id}/heading`).nodes.at(-1);
+  assert.deepEqual(shownActions.nodes.map(node => node.attributes.size), actions.nodes.map(node => node.attributes.size));
+  assert.equal(shownActions.attributes.invisible, undefined);
   const task = {kind:"task", id:"task", task:"Demo"};
   view.hovered = null;
   const chevron = view.taskRow(theme(), task).nodes.at(-1);
   assert.equal(chevron.attributes.w[0], 22);
-  assert.ok(chevron.attributes.invisible);
+  assert.equal(chevron.attributes.opacity[0], 0);
+  assert.deepEqual(chevron.attributes.transition, ["opacity", 120]);
   view.hovered = task.id;
   assert.equal(view.taskRow(theme(), task).nodes.at(-1).attributes.w[0], 22);
 });
@@ -872,12 +985,14 @@ test("agent rows always show a status indicator on the right without default tex
       assert.equal(right.attributes.text_size[0], 11);
       assert.equal(right.attributes.text_color[0], tone ?? "dim");
       if (expected) assert.ok(text(right).includes(expected));
-      if (["idle", "unknown"].includes(status) || !status) {
+      // A saved conversation shows its word only; live idle agents keep a quiet ring.
+      if (!status) assert.equal(right.nodes.length, 1);
+      if (["idle", "unknown"].includes(status)) {
         const ring = right.nodes[0].nodes[0];
         assert.equal(ring.attributes.border[0], 1.5);
         assert.equal(ring.attributes.border_color[0], status === "idle" ? "muted" : "dim");
       }
-      if (["blocked", "done"].includes(status)) assert.equal(right.nodes[0].nodes[0].attributes.bg[0], status);
+      if (["blocked", "done"].includes(status)) assert.equal(right.nodes[0].nodes[0].nodes[0].attributes.bg[0], status);
       if (status !== "working") assert.ok(!text(right).includes("spinner.svg"));
       assert.ok(!text(line).includes("idle"));
       assert.ok(!text(line).includes("unknown"));
@@ -902,7 +1017,7 @@ test("task status columns keep rings for open tasks and ideas and meaningful act
       assert.equal(mark.nodes[0].attributes.border[0], 1.5);
       assert.equal(mark.nodes[0].attributes.border_color[0], stateName === "idea" ? "dim" : "muted");
     }
-    else if (["blocked", "done"].includes(expected)) assert.equal(mark.nodes[0].attributes.bg[0], expected);
+    else if (["blocked", "done"].includes(expected)) assert.equal(mark.nodes[0].nodes[0].attributes.bg[0], expected);
     else assert.ok(text(mark).includes(`${expected}.svg`));
   }
 });
@@ -930,19 +1045,22 @@ test("the existing 30 second refresh timer updates elapsed only for visible work
   assert.equal(refreshed, 4);
 });
 
-test("blocked reasons read once per address and seq, update both rows, and show done review", async () => {
+test("blocked reasons read once per address and seq, show once below the task, and show done review", async () => {
   const task = {id:"blocked", kind:"task", title:"Work", children:[{id:"agent", kind:"agent", terminal:"pane"}]};
   const {view, cx, jobs} = setup({data:{rows:[task]}});
   const agent = {address:"address", pane:"pane", status:"blocked", seq:1, title:"Agent"};
   state.agents = [agent];
-  assert.ok(text(byId(view.render(cx), "task-blocked")).includes("Waiting for you"));
+  // The collapsed task leaves the reason to the agent line right below it.
+  assert.ok(!text(byId(view.render(cx), "task-blocked")).includes("Waiting for you"));
+  assert.ok(text(view.render(cx)).includes("Waiting for you"));
   view.syncBlocked(view.liveState().rows, cx); view.render(cx);
   assert.equal(jobs.length, 1);
   assert.deepEqual(state.hcCalls, []);
   state.hcResult = {code:0, stdout:"$ npm test\nDo you want to proceed?\n1. Yes", stderr:""};
   await jobs.shift()(cx);
   assert.deepEqual(state.hcCalls, [["get", "address"], ["read", "address"]]);
-  assert.ok(text(byId(view.render(cx), "task-blocked")).includes("Asks permission · npm test"));
+  assert.ok(!text(byId(view.render(cx), "task-blocked")).includes("Asks permission"));
+  assert.ok(text(view.render(cx)).includes("Asks permission · npm test"));
   view.showDetails(task, cx);
   assert.ok(text(view.render(cx)).includes("Asks permission · npm test"));
   assert.equal(jobs.length, 0);
@@ -999,7 +1117,9 @@ test("close acceptance card is modal, shows the snapshot plan and disables block
   const {view, cx} = setup();
   const task = snapshot.rows[0];
   view.showDetails(task, cx);
-  click(byId(view.render(cx), `${task.id}/action/close`), cx);
+  click(byId(view.render(cx), `${task.id}/action/menu`), cx);
+  const menu = setup({props:state.overlays.at(-1).props});
+  menu.view.chooseMenu(menu.cx, "done");
   const spec = state.overlays.at(-1);
   assert.equal(spec.kind, "dialog");
   assert.equal(spec.modal, true);
@@ -1081,18 +1201,22 @@ test("navigation includes inner rows and disclosure contents, excludes ticket ch
   const {view, cx, key} = setup();
   const task = snapshot.rows[0];
   view.showDetails(task, cx);
-  assert.deepEqual(view.rows().slice(2, 10).map(row => row.type), ["tree", "tree", "tree", "tree", "tree", "disclosure", "action", "action"]);
+  assert.deepEqual(view.rows().slice(2, 11).map(row => row.type), ["disclosure", "tree", "tree", "tree", "tree", "tree", "action", "disclosure", "action"]);
+  key("down");
+  assert.equal(view.chosen().ticketsHeader, true);
   key("down");
   assert.equal(view.chosen().type, "tree");
   key("left");
   assert.equal(view.selected, task.id);
-  const history = view.rows().find(row => row.type === "disclosure");
+  const history = view.rows().find(row => row.label === "History");
   view.selected = history.id;
   key("enter");
-  assert.equal(view.rows().filter(row => row.historical).length, 4);
+  assert.equal(view.rows().filter(row => row.historical).length, 5);
+  key("j");
+  assert.equal(view.chosen().label, "Task actions");
   key("j");
   assert.equal(view.chosen().type, "mr");
-  key("k");
+  key("k"); key("k");
   assert.equal(view.selected, history.id);
   key("enter");
   assert.equal(view.rows().filter(row => row.historical).length, 0);
@@ -1103,7 +1227,7 @@ test("navigation includes inner rows and disclosure contents, excludes ticket ch
   key("n");
   assert.equal(state.overlays.length, 0);
   key("up");
-  assert.equal(view.chosen().type, "tree");
+  assert.equal(view.chosen().label, "Note");
   view.filter = "search";
   key("escape");
   assert.equal(view.filter, "");
@@ -1202,10 +1326,11 @@ test("every fixture task renders expanded with tickets and both disclosures open
   view.all = true;
   for (const task of snapshot.rows.filter(row => row.kind === "task")) {
     view.setExpanded(task.id, cx);
-    view.history.add(task.id); view.subtasks.add(task.id); view.closedTickets.add(task.id);
+    view.history.add(task.id); view.subtasks.add(task.id); view.ticketLists.add(task.id);
     const rendered = view.render(cx);
     assert.ok(byId(rendered, `task-${task.id}`));
-    assert.ok(byId(rendered, `${task.id}/add-ticket`));
+    assert.ok(byId(rendered, `${task.id}/action/menu`));
+    if (view.standaloneTickets(view.liveState().detail(task), false, true).length) assert.ok(byId(rendered, `${task.id}/add-ticket`));
     for (const item of view.rows().filter(row => row.kind === "detail")) assert.ok(byId(rendered, item.id), item.id);
   }
 });
@@ -1310,33 +1435,37 @@ test("Not in a task gives a second-line reason; Make task prefills both loose an
   assert.equal(reason.attributes.max_w, undefined);
 });
 
-test("expanded details align with the task title, clip exactly two lines and mute completed worktrees", () => {
+test("expanded details use panel width, clip the excerpt and mute completed worktrees", () => {
   const {view, cx} = setup();
   const task = snapshot.rows[0];
+  assert.ok(byId(view.taskRow(theme(), task), `task-title-${task.id}`).attributes.truncate);
   view.showDetails(task, cx);
   const block = view.taskBlock(theme(), task);
+  const taskTitle = byId(block, `task-title-${task.id}`);
+  assert.ok(taskTitle.attributes.whitespace_normal);
+  assert.equal(taskTitle.attributes.truncate, undefined);
   const body = block.nodes[1];
-  const titleEdge = 8 + 16 + 10;
+  const contentEdge = 10 + 6;
   const clip = nodes(body).find(node => node.attributes.max_h?.[0] === 32);
   assert.ok(clip);
   assert.equal(clip.attributes.line_height[0], 1.35);
   assert.equal(clip.attributes.text_size[0], 12);
   assert.equal(clip.attributes.pb, undefined);
-  assert.equal(body.attributes.pl[0] + clip.attributes.px[0], titleEdge);
-  assert.equal(body.attributes.pl[0] + body.nodes[1].attributes.px[0], titleEdge);
+  // The excerpt sits under the title: past the row's 12px icon and 6px gap.
+  assert.equal(body.attributes.px[0] + clip.attributes.pl[0], contentEdge + 12 + 6);
   for (const item of view.detailItems(task)) {
     const row = byId(block, item.id);
     if (!row) continue;
-    assert.equal(body.attributes.pl[0] + row.attributes.px[0], titleEdge);
+    if (!item.footer) assert.equal(body.attributes.px[0] + row.attributes.px[0], contentEdge);
     if (item.type === "tree") {
-      const title = row.nodes[1];
+      const title = byId(row, `${item.id}/name`);
       assert.equal(title.attributes.text_color[0], ["merged", "closed"].includes(item.mr?.state) ? "muted" : "foreground");
     }
   }
   const item = {id:"agent", type:"agent", action() {}, row:{label:"Agent"}};
   const agent = view.detailRow(theme(), item);
   assert.equal(agent.attributes.pl, undefined);
-  assert.equal(body.attributes.pl[0] + agent.nodes[0].attributes.px[0], titleEdge);
+  assert.equal(body.attributes.px[0] + agent.nodes[0].attributes.px[0], contentEdge);
 });
 
 
@@ -1356,8 +1485,8 @@ test("task-owned worktree clicks only select; terminal uses the explicit worktre
   assert.deepEqual(state.execs, []);
   const rendered = view.render(cx);
   const line = byId(rendered, item.id);
-  const ids = nodes(line).map(node => node.attributes?.id?.[0]);
-  assert.ok(ids.indexOf(`${item.id}/shell`) > ids.indexOf(`${item.id}/mr`));
+  assert.ok(byId(byId(line, `${item.id}/heading`), `${item.id}/shell`));
+  assert.ok(byId(byId(line, `${item.id}/metadata`), `${item.id}/mr`));
   const resume = byId(rendered, `${item.id}/shell`);
   assert.equal(resume.attributes.tooltip[0], "Open terminal in worktree");
   assert.equal(resume.attributes.size[0], 20);
@@ -1490,7 +1619,7 @@ test("MR and ticket links have explicit destinations, stop propagation and under
   view.showDetails(task, cx);
   const item = view.rows().find(row => row.type === "tree" && row.mr?.state === "opened");
   const link = byId(view.render(cx), `${item.id}/mr`);
-  assert.equal(link.attributes.tooltip[0], "Open !122 in GitLab");
+  assert.equal(link.attributes.tooltip[0], `${item.mr.label}\nOpen !122 in GitLab`);
   link.attributes.hover[0](link);
   assert.equal(link.attributes.text_color[0], "foreground");
   assert.deepEqual(link.attributes.underline, []);
@@ -1503,8 +1632,9 @@ test("MR and ticket links have explicit destinations, stop propagation and under
   assert.equal(view.selected, task.id);
   assert.equal(state.calls.length, 0);
   const ticket = task.children.find(row => row.target === "DEMO-45");
+  view.ticketLists.add(task.id);
   const chip = byId(view.render(cx), `${task.id}/${ticket.id}`);
-  assert.equal(chip.attributes.tooltip[0], "Open DEMO-45 in Jira");
+  assert.equal(chip.attributes.tooltip[0], "DEMO-45  Demo change\nOpen DEMO-45 in Jira");
   click(chip, cx);
   await jobs.shift()(cx);
   assert.deepEqual(state.execs.at(-1), ["open", [ticket.url]]);
@@ -1673,9 +1803,9 @@ test("worktree state is visible in task details, collapsed loose reasons and loo
     assert.ok(part, label);
     assert.equal(part.attributes.text_color[0], tone);
   }
-  assert.equal(line.nodes[1].attributes.min_w[0], 24);
-  assert.ok(line.nodes[1].attributes.flex_1);
-  assert.equal(line.nodes[2].attributes.max_w[0], "60%");
+  assert.equal(byId(line, `${item.id}/name`).attributes.min_w[0], 0);
+  assert.ok(nodes(line).find(node => node.nodes.includes(byId(line, `${item.id}/name`))).attributes.flex_1);
+  assert.equal(byId(line, `${item.id}/metadata`).attributes.max_w, undefined);
   const dot = nodes(line).find(node => node.attributes.tooltip?.[0] === "1 uncommitted file");
   assert.equal(dot.attributes.size[0], 6);
   assert.equal(dot.attributes.bg[0], "working");
@@ -2313,7 +2443,7 @@ test("collapsing a task's section hides its details and restores the persisted t
   const {view, cx} = sectionPanel();
   const task = view.sections().find(section => section.id === "progress").rows[0];
   view.showDetails(task, cx);
-  assert.ok(byId(view.render(cx), `${task.id}/action/close`));
+  assert.ok(byId(view.render(cx), `${task.id}/action/menu`));
   click(byId(view.render(cx), "section-progress"), cx);
   assert.equal(view.expanded, task.id);
   assert.equal(JSON.parse(storage.get("berbr.expanded")), task.id);
@@ -2321,7 +2451,7 @@ test("collapsing a task's section hides its details and restores the persisted t
   assert.equal(view.rows().some(row => row.id === task.id || row.parent?.id === task.id), false);
   assert.equal(byId(view.render(cx), `task-${task.id}`), undefined);
   click(byId(view.render(cx), "section-progress"), cx);
-  assert.ok(byId(view.render(cx), `${task.id}/action/close`));
+  assert.ok(byId(view.render(cx), `${task.id}/action/menu`));
   assert.equal(view.expanded, task.id);
 });
 
@@ -2353,7 +2483,7 @@ test("the 20px monitor button is the only Go to space control and stops propagat
   const task = {id:"space-task", kind:"task", task:"Demo", space:"live", title:"Demo", note:"/notes/demo.md"};
   const {view, cx, jobs} = setup({data:{rows:[task]}, liveSpaces:[{id:"live"}]});
   const actions = view.detailItems(task).filter(item => item.type === "action").map(item => item.label);
-  assert.deepEqual(actions, ["Note", "Close task"]);
+  assert.deepEqual(actions, ["Note", "Task actions"]);
   const control = byId(view.render(cx), `task-space-${task.id}`);
   assert.equal(control.attributes.size[0], 20);
   assert.equal(control.attributes.tooltip[0], "Go to space");
@@ -2415,7 +2545,7 @@ test("working task summaries contain only activity, elapsed and extra agent coun
     assert.equal(byId(rendered, `task-mr-${task.id}`), undefined);
     view.showDetails(task, cx);
     rendered = view.render(cx);
-    for (const signal of ["DEMO-12", "In review", "!42", "CI failed"])
+    for (const signal of ["Tickets without MR · 1", "!42", "CI failed"])
       assert.ok(text(rendered).includes(signal), signal);
   }
 });
@@ -2536,7 +2666,7 @@ test("v3 MR action reasons, ready state and diff render while v2 labels stay unc
     assert.ok(text(line).includes(expected));
     assert.ok(nodes(line).some(node => node.nodes.includes(expected) && node.attributes.text_color?.[0] === tone));
     assert.ok(text(line).includes("+214 −38"));
-    assert.ok(nodes(line).some(node => node.nodes.includes("+214") && node.attributes.text_color?.[0] === "done"));
+    assert.ok(nodes(line).some(node => node.nodes.includes("+214") && node.attributes.text_color?.[0] === "ansi2"));
     tree.diff = {adds:0, dels:0};
     assert.ok(!text(byId(view.render(cx), item.id)).includes("+0"));
   }
@@ -2547,7 +2677,7 @@ test("v3 MR action reasons, ready state and diff render while v2 labels stay unc
   assert.ok(text(byId(view.render(cx), "task-task")).includes("CI failed"));
 });
 
-test("nested agent groups retain 28/24px rows, quiet text and border guides; only blocked marks breathe", () => {
+test("nested agent groups share 28px rows and quiet text without border guides; only blocked marks breathe", () => {
   const agent = {id:"agent", kind:"agent", terminal:"a"};
   const task = {id:"task", kind:"task", children:[{id:"tree", kind:"tree", children:[agent]}, {...agent, id:"main", terminal:"b"}]};
   const {view, cx} = setup({data:{rows:[task]}});
@@ -2557,13 +2687,15 @@ test("nested agent groups retain 28/24px rows, quiet text and border guides; onl
   assert.equal(byId(rendered, items.find(item => item.type === "tree").id).attributes.h[0], 28);
   for (const item of items.filter(item => item.type === "agent")) {
     const line = byId(rendered, item.id);
-    assert.equal(line.attributes.h[0], 24);
+    assert.equal(line.attributes.h[0], 28);
     assert.equal(line.attributes.text_color[0], "muted");
-    assert.ok(nodes(rendered).some(node => node.nodes.includes(line) && node.attributes.border_l_1 && node.attributes.border_color[0] === "border"));
+    const wrapper = nodes(rendered).find(node => node.nodes.includes(line));
+    assert.ok(wrapper);
+    assert.equal(wrapper.attributes.border_l_1, undefined);
   }
   for (const node of nodes(rendered).filter(node => node.attributes.loop)) {
-    assert.equal(node.attributes.bg[0], "blocked");
-    assert.deepEqual(node.attributes.loop, ["opacity", {from:0.35, to:1, period:1200}]);
+    assert.equal(node.nodes[0].attributes.bg[0], "blocked");
+    assert.deepEqual(node.attributes.loop, ["opacity", {from:0.45, to:1, period:1200}]);
   }
   assert.ok(items.find(item => item.type === "main").groupStart);
 });
@@ -2740,17 +2872,20 @@ test("jumping to a subtask reveals its row inside the containing task without op
   assert.deepEqual(state.execs, []);
 });
 
-test("worktree metadata wraps without clipping while names truncate and action slots remain fixed", () => {
+test("worktree names truncate beside fixed diff counts while MR status wraps below", () => {
   const {view} = setup({data:{rows:[]}});
   for (const [state, fields, flag] of [["opened", {ci:"running"}, "CI running"],
     ["opened", {ready:true}, "ready to merge"], ["merged", {}, "merged"]]) {
     const mr = {kind:"mr", label:"!12345 Demo change", state, ...fields};
     const row = {kind:"tree", label:"demo-config-folder-with-a-long-name", task:"Demo", diff:{adds:468, dels:63}};
     const line = byId(view.detailRow(theme(), {id:"tree-priority", type:"tree", row, mr}), "tree-priority");
-    const name = line.nodes[1], right = line.nodes[2];
+    const heading = byId(line, "tree-priority/heading"), name = byId(line, "tree-priority/name"), right = byId(line, "tree-priority/metadata");
     const link = byId(line, "tree-priority/mr"), iid = link.nodes.find(node => text(node) === "!12345");
+    assert.equal(byId(line, "tree-priority/ci"), undefined);
     const flagText = link.nodes.find(node => nodes(node).some(child => child.attributes.accessibility_label?.[0]?.startsWith(flag)));
-    const diff = right.nodes.find(node => text(node) === "+468 −63");
+    const diff = byId(heading, "tree-priority/diff");
+    assert.equal(text(diff), "+468 −63");
+    assert.ok(!text(right).includes("+468"));
     assert.ok(iid.attributes.flex_none);
     assert.equal(iid.attributes.truncate, undefined);
     assert.ok(diff.attributes.flex_none);
@@ -2759,26 +2894,29 @@ test("worktree metadata wraps without clipping while names truncate and action s
     assert.equal(flagText.attributes.truncate, undefined);
     assert.equal(flagText.attributes.w, undefined);
     assert.equal(right.attributes.min_w[0], 0);
-    assert.equal(right.attributes.max_w[0], "60%");
-    assert.equal(right.attributes.flex_shrink[0], 1);
+    assert.equal(right.attributes.max_w, undefined);
+    assert.ok(line.attributes.flex_col);
+    assert.ok(line.nodes.indexOf(heading) < line.nodes.indexOf(right));
+    assert.ok(!text(heading).includes("!12345"));
+    assert.ok(!text(right).includes(row.label));
     assert.ok(right.attributes.flex_wrap);
     assert.equal(right.attributes.overflow_hidden, undefined);
     assert.equal(link.attributes.overflow_hidden, undefined);
     assert.ok(link.attributes.flex_wrap);
     assert.ok(flagText.attributes.flex_wrap);
-    assert.ok(diff.attributes.flex_wrap);
+    assert.equal(diff.attributes.flex_wrap, undefined);
     assert.ok(line.attributes.h_auto);
     assert.equal(line.attributes.min_h[0], 28);
     assert.ok(right.attributes.tooltip[0].includes(flag));
-    assert.ok(line.nodes.at(-1).attributes.flex_none);
+    assert.ok(heading.nodes.at(-1).attributes.flex_none);
     assert.ok(name.attributes.truncate);
-    assert.equal(name.attributes.min_w[0], 24);
-    assert.ok(name.attributes.flex_1);
+    assert.equal(name.attributes.min_w[0], 0);
+    assert.ok(heading.nodes.find(node => node.nodes.includes(name)).attributes.flex_1);
   }
+  // A worktree without an MR says nothing about it: the absence needs no row.
   const line = byId(view.detailRow(theme(), {id:"tree-no-mr", type:"tree", row:{kind:"tree", label:"Demo tree"}}), "tree-no-mr");
-  const noMr = line.nodes[2].nodes.find(node => text(node) === "no MR");
-  assert.ok(noMr.attributes.flex_none);
-  assert.equal(noMr.attributes.truncate, undefined);
+  assert.equal(byId(line, "tree-no-mr/metadata"), undefined);
+  assert.ok(!text(line).includes("no MR"));
 });
 
 test("Open MRs and History keep iid and state fixed while the separate title truncates", () => {
@@ -2790,6 +2928,7 @@ test("Open MRs and History keep iid and state fixed while the separate title tru
     const link = byId(rendered, "mr-fixed/mr");
     const iid = link.nodes.find(node => text(node) === "!12345");
     const title = link.nodes.find(node => text(node) === "Demo change with a long title");
+    assert.equal(byId(rendered, "mr-fixed/ci"), undefined);
     const status = link.nodes.find(node => nodes(node).some(child => child.attributes.accessibility_label?.[0]?.startsWith(flag)));
     for (const node of [iid, status]) {
       assert.ok(node.attributes.flex_none);
@@ -2818,16 +2957,17 @@ test("agent name and status truncate within their budgets with full tooltips", (
   }
 });
 
-test("uncommitted files use a 6px warning dot before the line diff, with singular and plural tooltips", () => {
+test("uncommitted files keep a 6px warning dot beside the worktree name, with singular and plural tooltips", () => {
   const {view} = setup({data:{rows:[]}});
   for (const count of [0, 1, 2]) for (const diff of [null, {adds:376, dels:38, files:4}]) {
     const mr = {kind:"mr", label:"!12345 Demo change", state:"merged"};
     const row = {kind:"tree", tree:"demo", body:`/home/dev/demo\n +${count} ↑3`, diff};
     const rendered = view.detailRow(theme(), {id:"dirty-tree", type:"tree", row, mr});
-    const right = byId(rendered, "dirty-tree").nodes[2];
+    const right = byId(rendered, "dirty-tree/metadata");
     const tooltip = `${count} uncommitted ${count === 1 ? "file" : "files"}`;
-    const dot = right.nodes.find(node => node.attributes.tooltip?.[0] === tooltip);
+    const dot = nodes(byId(rendered, "dirty-tree/heading")).find(node => node.attributes.tooltip?.[0] === tooltip);
     assert.equal(Boolean(dot), count > 0);
+    assert.ok(!nodes(right).some(node => node.attributes.tooltip?.[0] === tooltip));
     assert.ok(!nodes(right).some(node => node.nodes.includes(`+${count}`)));
     assert.ok(text(right).includes("↑3"));
     if (!count) continue;
@@ -2835,7 +2975,7 @@ test("uncommitted files use a 6px warning dot before the line diff, with singula
     assert.equal(dot.attributes.bg[0], "working");
     assert.equal(dot.attributes.accessibility_label[0], tooltip);
     assert.ok(dot.attributes.flex_none);
-    if (diff) assert.equal(text(right.nodes[right.nodes.indexOf(dot) + 1]), "+376 −38");
+    if (diff) assert.equal(text(byId(rendered, "dirty-tree/diff")), "+376 −38");
   }
 });
 
@@ -3164,14 +3304,13 @@ test("V01/V02/V03: long branches and questions have budgets and tooltips, and ac
   const branch = "feature/" + "Ж".repeat(150);
   const row = {kind:"tree", id:"tree", tree:"checkout", branch, body:"/home/dev/demo\n +12 ↑345 quiet 999d"};
   const line = byId(view.detailRow(theme(), {id:"loose-tree", type:"tree", row, loose:true}), "loose-tree");
-  const rail = line.nodes[2], label = nodes(rail).find(node => node.nodes.includes(branch));
-  assert.equal(line.nodes[1].attributes.min_w[0], 24);
-  assert.equal(rail.attributes.flex_shrink[0], 1);
-  assert.equal(rail.attributes.max_w[0], "60%");
+  const rail = byId(line, "loose-tree/metadata"), label = nodes(rail).find(node => node.nodes.includes(branch));
+  assert.equal(byId(line, "loose-tree/name").attributes.min_w[0], 0);
+  assert.equal(rail.attributes.max_w, undefined);
   assert.ok(rail.attributes.flex_wrap);
   assert.equal(rail.attributes.overflow_hidden, undefined);
   assert.ok(label.attributes.truncate); assert.equal(label.attributes.tooltip[0], branch);
-  assert.ok(line.nodes.at(-1).attributes.flex_none);
+  assert.ok(byId(line, "loose-tree/heading").nodes.at(-1).attributes.flex_none);
   const detail = "Проверьте разрешение на изменение длинного файла ".repeat(6);
   view.blockedReasons.set("a", {reason:{kind:"question", detail}});
   const agent = byId(view.detailRow(theme(), {id:"agent", type:"agent", row:{label:"Исполнитель"},
@@ -3273,17 +3412,16 @@ test("V11: text buttons center their label and overlay a spinner without changin
   assert.ok(busyAction.nodes[1].attributes.inset_0);
 });
 
-test("MR links keep an equal spinner slot while idle or busy", () => {
+test("MR links show a trailing spinner only while they open", () => {
   const {view} = setup();
   const mr = {kind:"mr", id:"mr", label:"!1", state:"opened"};
   const idle = view.externalLink(theme(), "link", mr).child("!1");
   view.busy = true; view.busyAction = "link";
   const busy = view.externalLink(theme(), "link", mr).child("!1");
-  assert.equal(idle.nodes.length, busy.nodes.length);
-  assert.equal(idle.nodes[0].attributes.size[0], 11);
+  assert.deepEqual(idle.nodes, ["!1"]);
+  assert.equal(busy.nodes.length, 2);
   assert.equal(busy.nodes[0].attributes.size[0], 11);
-  assert.ok(idle.nodes[0].attributes.invisible);
-  assert.equal(busy.nodes[0].attributes.invisible, undefined);
+  assert.ok(busy.nodes[0].attributes.spin);
 });
 
 test("M2: blocked prompt workers and queue are bounded, prioritize expanded work and reuse unchanged seq", async () => {
@@ -3336,15 +3474,14 @@ test("M4: note wikilinks use existence checks, unchanged folder refresh skips th
   state.watchers.shift().reject(new Error("Stopped")); await watch;
 });
 
-test("an MR link without a ticket starts with its number: the spinner slot trails the link", () => {
+test("an MR link without a ticket starts with its number and reserves no idle spinner slot", () => {
   const task = {kind:"task", id:"task", task:"Demo", children:[
     {kind:"mr", id:"mr", state:"opened", label:"!123 Demo", ci:"running", url:"https://example.invalid/mr/123"}]};
   const {view} = setup({data:{rows:[task]}});
   const link = byId(view.taskRow(theme(), task), "task-mr-task");
   assert.equal(text(link.nodes[0]).trim(), "!123");
-  const slot = link.nodes.at(-1);
-  assert.deepEqual(slot.attributes.size, [11]);
-  assert.ok(slot.attributes.invisible);
+  assert.ok(!nodes(link).some(node => node.attributes.invisible));
+  assert.ok(text(link.nodes.at(-1)).includes("CI running"));
 });
 
 test("a command from a removed worktree's terminal runs from the project instead", async () => {
@@ -3812,7 +3949,7 @@ test("Settings is a small footer button, replacing cache labels and accessible w
     const root = view.render(cx), footer = byId(root, "berbr-footer"), settings = byId(footer, "settings");
     assert.ok(settings);
     assert.equal(nodes(root).filter(node => node.attributes.id?.[0] === "settings").length, 1);
-    assert.equal(settings.attributes.size[0], 22);
+    assert.equal(settings.attributes.size[0], 26);
     assert.equal(settings.attributes.accessibility_label[0], "Settings");
     assert.doesNotMatch(text(footer), /Jira|GitLab|cache/i);
     settings.attributes.on_key_down[0]({key:"enter"}, cx);
@@ -3930,7 +4067,8 @@ test("every saved conversation stays under its worktree; clicking stopped resume
   const agents=view.detailItems(task).filter(item=>item.type==="agent");
   assert.deepEqual(agents.map(item=>item.row.session),["codex:older","codex:newest","codex:live"]);
   const rendered=view.render(cx), old=byId(rendered,agents[0].id);
-  assert.equal(old.attributes.opacity[0],0.55);
+  assert.equal(old.attributes.opacity[0],1);
+  assert.equal(old.attributes.text_color[0],"muted");
   const resume=nodes(old).find(node=>node.attributes.tooltip?.[0]==="Resume agent");
   const calls=[];view.cli=async args=>{calls.push(args);return "Resumed";};
   click(resume,cx);await jobs.shift()(cx);
@@ -4176,7 +4314,7 @@ test("GitHub PR and issue links use GitHub labels and preserve the PR number", (
   const {view} = setup();
   const pr = {kind:"mr",provider:"github",label:"#7 Demo",url:"https://github.com/demo/repo/pull/7",state:"open"};
   const issue = {kind:"ticket",provider:"github",target:"github.com/demo/repo#1",url:"https://github.com/demo/repo/issues/1"};
-  assert.equal(view.externalLink(theme,"pr-link",pr).attributes.tooltip[0],"Open #7 in GitHub");
+  assert.equal(view.externalLink(theme,"pr-link",pr).attributes.tooltip[0],"#7 Demo\nOpen #7 in GitHub");
   assert.equal(view.externalLink(theme,"issue-link",issue).attributes.tooltip[0],"Open github.com/demo/repo#1 in GitHub");
 });
 
@@ -4256,4 +4394,239 @@ test("setup replaces a previously selected project when its config was removed",
   assert.equal(view.error,null);
   assert.equal(view.project,null);
   assert.equal(view.data.setup_required,true);
+});
+
+
+test("resource controls precede content, History groups closed tickets, and toggles exclude hidden artifact polling", async () => {
+  const task = {...artifactTask(), note:"/note.md", children:[
+    {id:"tree", kind:"tree", tree:"feature", children:[]},
+    {id:"old-mr", kind:"mr", label:"!1 Previous change", state:"merged", url:"https://gitlab.example/mr/1"},
+    {id:"old-ticket", kind:"ticket", target:"DEMO-1", state:"closed", url:"https://jira.example/DEMO-1"},
+  ]};
+  const {view, cx, jobs, timers, key} = setup({data:{rows:[task]}});
+  view.cli = async () => JSON.stringify({project:view.project, task:task.task, path:task.artifacts, entries:[artifactEntry("report.md")]});
+  view.showDetails(task, cx); await jobs.shift()(cx);
+  const footerId = `${task.id}/resources`, historyId = `${task.id}/disclosure/history`, artifactsId = `${task.id}/artifacts/header`;
+  let root = view.render(cx);
+  assert.match(text(byId(root, footerId)), /Note.*Artifacts.*History.*⋯/);
+  assert.doesNotMatch(text(byId(root, footerId)), /Artifacts 0|History [0-9]/);
+  assert.ok(nodes(root).indexOf(byId(root, footerId)) < nodes(root).indexOf(byId(root, `${task.id}/artifact/report.md`)));
+  view.selected = historyId; key("enter");
+  root = view.render(cx);
+  assert.ok(view.history.has(task.id));
+  assert.ok(view.artifactHidden.has(task.artifacts));
+  assert.equal(view.artifactCollapsed.has(task.artifacts), false);
+  assert.equal(byId(root, `${task.id}/artifact/report.md`), undefined);
+  assert.match(text(root), /MRs · 1.*!1.*Tickets · 1.*DEMO-1/);
+  assert.equal(byId(root, `${task.id}/closed-tickets`), undefined);
+  const navigable = view.rows().filter(item => item.parent?.id === task.id);
+  for (const item of navigable) assert.ok(byId(root, item.id), item.id);
+  assert.ok(navigable.findIndex(item => item.id === historyId) < navigable.findIndex(item => item.row?.id === "old-ticket"));
+  const poll = timers.find(timer => timer.ms === 5000).fn;
+  poll(cx); assert.equal(jobs.length, 0);
+  click(byId(root, artifactsId), cx); await jobs.shift()(cx);
+  assert.equal(view.history.has(task.id), false);
+  assert.equal(view.rows().some(item => item.historical), false);
+  assert.ok(byId(view.render(cx), `${task.id}/artifact/report.md`));
+  click(byId(view.render(cx), artifactsId), cx);
+  assert.equal(view.rows().some(item => item.resource), false);
+  assert.ok(JSON.parse(storage.get("berbr.artifacts.collapsed")).includes(task.artifacts));
+});
+
+test("a historical MR jump closes Artifacts, reveals History and selects the MR", async () => {
+  const task = {...artifactTask(), children:[{id:"old-mr", kind:"mr", state:"merged", label:"!1 Old MR"}]};
+  const {view, cx, jobs, timers} = setup({data:{rows:[task]}});
+  view.cli = async () => JSON.stringify({project:view.project, task:task.task, path:task.artifacts, entries:[]});
+  state.shared.set("berbr.jumpTarget", {project:view.project, task:task.id, row:"old-mr", kind:"mr"});
+  view.receiveJump(cx);
+  assert.equal(view.chosen().row.id, "old-mr");
+  assert.ok(view.history.has(task.id));
+  assert.ok(view.artifactHidden.has(task.artifacts));
+  assert.equal(view.artifactCollapsed.has(task.artifacts), false);
+  while (jobs.length) await jobs.shift()(cx);
+  timers.find(timer => timer.ms === 5000).fn(cx);
+  assert.equal(jobs.length, 0);
+  assert.equal(view.detailItems(task).some(item => item.type === "artifact-tools"), false);
+});
+
+test("Add ticket remains available through the task menu without open ticket chips", () => {
+  const task = {id:"task", kind:"task", task:"demo", project:"demo", children:[
+    {id:"ticket", kind:"ticket", target:"DEMO-1", state:"closed"},
+    {id:"tree", kind:"tree", tree:"feature", cwd:"/work/feature", children:[]},
+  ]};
+  const panel = setup({data:{rows:[task]}});
+  panel.view.showDetails(task, panel.cx);
+  assert.equal(byId(panel.view.render(panel.cx), "task/add-ticket"), undefined);
+  click(byId(panel.view.render(panel.cx), "task/action/menu"), panel.cx);
+  const menu = setup({props:state.overlays.at(-1).props});
+  menu.view.chooseMenu(menu.cx, "add-ticket");
+  const form = state.overlays.at(-1).props;
+  assert.equal(form.form, "ticket");
+  assert.equal(form.project, "demo");
+  assert.deepEqual(form.tickets, ["DEMO-1"]);
+  assert.equal(form.trees[0].cwd, "/work/feature");
+});
+
+
+test("expanded blocked-agent cards render the question before task resources using native builder contracts", async () => {
+  const {view, cx, task, card} = await waitingPanel();
+  view.showDetails(task, cx);
+  const root = view.render(cx), prompt = byId(root, card.id), footer = byId(root, `${task.id}/resources`);
+  assert.match(text(prompt), /Which colour/);
+  assert.ok(nodes(root).indexOf(prompt) < nodes(root).indexOf(footer));
+  assert.equal(nodes(root).filter(node => node.attributes.id?.[0] === card.id).length, 1);
+});
+
+
+test("History and historical ticket jumps hide artifacts without saving a different collapse preference", async () => {
+  const first = {...artifactTask(), children:[{id:"old-ticket", kind:"ticket", target:"DEMO-1", state:"closed"}]};
+  const second = {...artifactTask("/artifacts/second"), id:"task:second", task:"second"};
+  const {view, cx, jobs, key} = setup({data:{rows:[first, second]}});
+  view.cli = async args => JSON.stringify({project:view.project, task:args[1], path:args[1] === first.task ? first.artifacts : second.artifacts, entries:[]});
+  view.showDetails(first, cx); await jobs.shift()(cx);
+  view.selected = `${first.id}/disclosure/history`; key("enter");
+  assert.equal(view.artifactCollapsed.has(first.artifacts), false);
+  view.showDetails(second, cx); await jobs.shift()(cx);
+  click(byId(view.render(cx), `${second.id}/artifacts/header`), cx);
+  assert.deepEqual(JSON.parse(storage.get("berbr.artifacts.collapsed")), [second.artifacts]);
+  state.shared.set("berbr.jumpTarget", {project:view.project, task:first.id, row:"old-ticket", kind:"ticket"});
+  view.receiveJump(cx);
+  assert.equal(view.chosen().row.id, "old-ticket");
+  assert.ok(view.history.has(first.id));
+  assert.equal(jobs.length, 0);
+  assert.deepEqual(JSON.parse(storage.get("berbr.artifacts.collapsed")), [second.artifacts]);
+  const restored = setup({data:{rows:[first]}, artifactCollapsed:[second.artifacts], saved:first.id});
+  assert.ok(restored.view.detailItems(first).some(item => item.type === "artifacts" && item.expanded));
+});
+
+test("unmatched waiting prompts precede resource controls in both navigation and render", async () => {
+  const {view, cx, task, card} = await waitingPanel();
+  task.children[0].children[0].role = "helper";
+  view.showDetails(task, cx);
+  assert.equal(view.detailItems(task).some(item => item.type === "agent"), false);
+  const root = view.render(cx), rows = view.rows();
+  const footer = rows.find(row => row.footer);
+  assert.ok(rows.findIndex(row => row.id === card.id) < rows.findIndex(row => row.id === footer.id));
+  assert.ok(nodes(root).indexOf(byId(root, card.id)) < nodes(root).indexOf(byId(root, footer.id)));
+});
+
+test("expanded resource selection stays visible and the task menu preserves its keyboard origin", async () => {
+  const task = {...artifactTask(), children:[{id:"tree", kind:"tree", tree:"feature", children:[]}]};
+  const {view, cx, jobs, key} = setup({data:{rows:[task]}});
+  view.cli = async () => JSON.stringify({project:view.project, task:task.task, path:task.artifacts, entries:[]});
+  view.showDetails(task, cx); await jobs.shift()(cx);
+  const header = `${task.id}/artifacts/header`, menu = `${task.id}/action/menu`;
+  view.selected = header;
+  assert.equal(byId(view.render(cx), header).attributes.bg[0], "selected");
+  view.selected = menu; key("enter");
+  assert.equal(state.overlays.at(-1).props.form, "menu");
+  assert.equal(view.selected, menu);
+  key("up"); assert.equal(view.selected, header);
+});
+
+test("linked tickets follow the single MR link, open their own URL, and unlinked tickets remain above branches", async () => {
+  const mr = {id:"mr", kind:"mr", label:"!42 Implement cache", state:"opened", ci:"running", url:"https://git/demo/-/merge_requests/42"};
+  const ticket = {id:"ticket", kind:"ticket", target:"DEMO-42", label:"DEMO-42 Keep the cache", state:"In review", url:"https://jira/browse/DEMO-42"};
+  const free = {...ticket, id:"free", target:"DEMO-43", label:"DEMO-43 Follow up"};
+  const task = {id:"task", kind:"task", task:"demo", children:[{id:"tree", kind:"tree", label:"branch", children:[mr]}, ticket, free]};
+  const {view, cx, jobs} = setup({data:{rows:[task], merge_requests:[{...mr, tickets:[ticket.target]}]}});
+  view.setExpanded(task.id, cx);
+  const root = view.render(cx), metadata = byId(root, "task/tree/tree/metadata");
+  assert.match(text(metadata), /!42.*CI running.*DEMO-42/);
+  assert.equal(byId(metadata, "task/tree/tree/ci"), undefined);
+  assert.equal(byId(root, "task/ticket"), undefined);
+  assert.equal(byId(root, "task/free"), undefined);
+  click(byId(root, "task/disclosure/tickets"), cx);
+  assert.ok(byId(view.render(cx), "task/free"));
+  const link = byId(metadata, "task/tree/tree/ticket/DEMO-42");
+  assert.match(link.attributes.tooltip[0], /Keep the cache\nOpen DEMO-42 in Jira/);
+  let stopped = false;
+  click(link, {...cx, stop_propagation() {stopped = true;}});
+  assert.ok(stopped);
+  await jobs.shift()(cx);
+  assert.deepEqual(state.execs.at(-1)[1], [ticket.url]);
+  assert.equal(view.expanded, task.id);
+  view.addTicket(task);
+  assert.deepEqual(state.overlays.at(-1).props.tickets, ["DEMO-42", "DEMO-43"]);
+});
+
+test("tickets linked only to history remain discoverable and jumps select their MR", () => {
+  const old = {id:"old", kind:"mr", label:"!1 Previous", state:"merged", url:"https://git/mr/1"};
+  const open = {id:"open", kind:"ticket", target:"DEMO-1", state:"Open", url:"https://jira/DEMO-1", children:[old]};
+  const closed = {id:"closed", kind:"ticket", target:"DEMO-2", state:"Closed", url:"https://jira/DEMO-2", children:[old]};
+  const task = {id:"task", kind:"task", children:[open, closed]};
+  const {view, cx} = setup({data:{rows:[task]}});
+  view.setExpanded(task.id, cx);
+  assert.match(text(byId(view.render(cx), "task/disclosure/tickets")), /Tickets without MR · 1/);
+  view.ticketLists.add(task.id);
+  assert.ok(byId(view.render(cx), "task/open"));
+  for (const ticket of [open, closed]) {
+    view.history.clear();
+    state.shared.set("berbr.jumpTarget", {project:view.project, task:task.id, row:ticket.id, kind:"ticket"});
+    view.receiveJump(cx);
+    assert.ok(view.history.has(task.id));
+    assert.equal(view.chosen().row.id, old.id);
+    const root = view.render(cx);
+    assert.ok(byId(root, `task/mr/old/ticket/${ticket.target}`));
+    assert.equal(byId(root, "task/open"), undefined);
+    assert.equal(view.rows().some(item => item.type === "ticket"), false);
+  }
+});
+
+test("mouse resource clicks release selection highlight immediately while keyboard selection stays visible", async () => {
+  const task = {...artifactTask(), children:[{kind:"mr", id:"old", state:"merged", label:"!1 Old"}]};
+  const {view, cx, jobs, key} = setup({data:{rows:[task]}});
+  view.cli = async () => JSON.stringify({project:view.project, task:task.task, path:task.artifacts, entries:[]});
+  view.showDetails(task, cx); await jobs.shift()(cx);
+  for (const id of [`${task.id}/artifacts/header`, `${task.id}/disclosure/history`]) {
+    // Start closed, then open and close using the same pointer handlers as the native UI.
+    view.history.clear(); view.artifactCollapsed.add(task.artifacts);
+    let control = byId(view.render(cx), id);
+    control.attributes.on_hover[0](true, cx); click(control, cx);
+    click(byId(view.render(cx), id), cx);
+    control = byId(view.render(cx), id);
+    control.attributes.on_hover[0](false, cx);
+    assert.equal(byId(view.render(cx), id).attributes.bg, undefined);
+    assert.equal(view.hovered, null);
+    assert.equal(view.selected, id, "preserve navigation origin without painting mouse selection");
+    key("enter");
+    assert.equal(byId(view.render(cx), id).attributes.bg[0], "selected");
+  }
+});
+
+test("unlinked ticket disclosure starts collapsed, supports keyboard toggle and jump reveals the ticket", () => {
+  const ticket = {kind:"ticket", id:"ticket", target:"DEMO-1", state:"Open", url:"https://jira/DEMO-1"};
+  const task = {kind:"task", id:"task", task:"demo", children:[ticket]};
+  const {view, cx, key} = setup({data:{rows:[task]}});
+  view.setExpanded(task.id, cx);
+  assert.equal(byId(view.render(cx), "task/ticket"), undefined);
+  view.selected = "task/disclosure/tickets"; key("enter");
+  assert.ok(byId(view.render(cx), "task/ticket"));
+  key("enter");
+  assert.equal(byId(view.render(cx), "task/ticket"), undefined);
+  state.shared.set("berbr.jumpTarget", {project:view.project, task:task.id, row:ticket.id, kind:"ticket"});
+  view.receiveJump(cx);
+  assert.ok(byId(view.render(cx), "task/ticket"));
+  assert.equal(view.selected, "task/disclosure/tickets");
+});
+
+test("ticket context menu detaches from the clicked task and project without deleting or closing tickets", async () => {
+  const ticket = {kind:"ticket", id:"ticket", target:"DEMO-1", state:"Open", url:"https://jira/DEMO-1"};
+  const task = {kind:"task", id:"task", task:"demo-task", project:"other-project", children:[ticket]};
+  const panel = setup({data:{rows:[task]}});
+  panel.view.setExpanded(task.id, panel.cx); panel.view.ticketLists.add(task.id);
+  const link = byId(panel.view.render(panel.cx), "task/ticket");
+  link.attributes.on_mouse_down[1]({}, panel.cx);
+  const menu = state.overlays.at(-1).props;
+  assert.equal(menu.project, task.project);
+  assert.equal(menu.taskRow.task, task.task);
+  const {view, cx, jobs} = setup({props:{...menu, form:"menu", overlay:"menu"}});
+  assert.ok(view.menuItems.some(item => item.id === "detach-ticket"));
+  const calls = [];
+  view.cli = async (args, project) => {calls.push({args, project}); return "removed";};
+  view.chooseMenu(cx, "detach-ticket");
+  await jobs.shift()(cx);
+  assert.deepEqual(calls, [{args:["detach", "DEMO-1", "demo-task"], project:"other-project"}]);
+  const loose = setup({props:{form:"menu", row:ticket}});
+  assert.equal(loose.view.menuItems.some(item => item.id === "detach-ticket"), false);
 });

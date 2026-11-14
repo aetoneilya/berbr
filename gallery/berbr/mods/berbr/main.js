@@ -6,12 +6,15 @@ import { forgeName, changeKind, changeNumber, githubIssue, walk, sectionLabels, 
   normalizeTicketState, ticketTitle,
   cleanCliText, isClosedTicket, newTaskArgs, freeTickets,
   agentActivity, formatElapsed, blockedPrompt, mrPills, mrListPills, focusedTask, focusedTree, treeFocusTarget, jumpItems, matchJump, closePlan, PanelModel, treeMarks, isMergedTree, mergedPlan, backendClosePlan } from "./model.js";
-import { icon, iconButton, button, chip, sectionHeader, statusMark, kbd, pill, keyboardControl } from "./ui.js";
+import { icon, iconButton, button, chip, sectionHeader, statusMark, kbd, pill, tag, tint, keyboardControl } from "./ui.js";
 import { formView, initNote, noteKey } from "./forms.js";
-import { initArtifacts, loadArtifacts, refreshArtifacts, artifactItems, renderArtifact } from "./artifacts.js";
+import { initArtifacts, loadArtifacts, refreshArtifacts, artifactItems, renderArtifact, setArtifactsExpanded, artifactsExpanded, openArtifactFolder } from "./artifacts.js";
 import { log, logRun, setDebug } from "./log.js";
 import {combineProjects, protectSpaceBindings, scopeSummary, ProjectLoader, spaceBindingBlocker} from "./scope.js";
 import {boardFilters} from "./filters.js";
+
+// Worktree groups and the resource strip are parted by a hairline with this much air on each side.
+const TASK_GROUP_GAP = 8;
 
 export default class Berbr extends View {
   init(_props, cx) {
@@ -41,16 +44,17 @@ export default class Berbr extends View {
     this.pendingProject = null;
     this.snapshots = new Map(); // the last one of every project shown, for instant switching
     this.data = null; this.error = null; this.busy = false; this.loading = false;
+    this.expandedBanners = new Map();
     this.filter = ""; this.all = false; this.selected = null; this.hovered = null;
     this.expanded = null; this.busyAction = null;
     this.blockedReasons = new Map(); this.panelModel = new PanelModel();
     this.promptQueue = []; this.promptWorkers = 0;
     this.jumpIndex = 0; this.jumpQuery = "";
     this.menuIndex = 0; this.pickerIndex = 0;
-    if (this.form === "menu") this.menuItems = rowMenu(p.row, {spaces:spaces(), mr:p.mr, live:p.live, tree:p.tree, hasService:p.hasService, hasHistory:p.hasHistory});
+    if (this.form === "menu") this.menuItems = rowMenu(p.row, {spaces:spaces(), mr:p.mr, live:p.live, tree:p.tree, hasService:p.hasService, hasHistory:p.hasHistory, task:p.taskRow});
     if (this.form === "done") this.closePlan = p.plan ?? closePlan(p.row, spaces());
     if (this.form === "remove-merged") this.bulkPlan = mergedPlan(p.trees);
-    this.history = new Set(); this.subtasks = new Set(); this.closedTickets = new Set();
+    this.history = new Set(); this.subtasks = new Set(); this.ticketLists = new Set();
     try {
       const saved = JSON.parse(localStorage.getItem("berbr.expanded"));
       if (typeof saved === "string") this.expanded = saved;
@@ -528,15 +532,18 @@ export default class Berbr extends View {
     });
   }
 
-  waitingCard(t, item) {
+  waitingCard(t, item, {nested = false} = {}) {
     const entry = this.blockedReasons.get(item.agent.address);
     if (!entry || (!entry.question && !entry.feedback)) return div();
     const disabled = this.busy || entry.busy || entry.loading;
     const selected = this.panelFocused() && this.selected === item.id;
     const small = (id, label, action) => button(t, `${item.id}/${id}`, label, action, "ghost", disabled)
       .h(24).px(6).min_w(0).max_w("100%").truncate();
-    return v_flex().id(item.id).mx(8).ml(28).mb(4).p(6).gap(4).min_w(0).rounded(6)
-      .border_1().border_color(selected ? t.accent : t.border)
+    // In task details, the question text shares the agent text column:
+    // 18 inset + 6 row padding + 14 icon + 6 gap - 6 card padding - 1 border.
+    return v_flex().id(item.id).mx(8).ml(nested ? 37 : 28).mb(4).px(8).py(6).gap(4).min_w(0).rounded(8)
+      .border_1().border_color(selected ? t.accent : tint(t.blocked, "40", t.border))
+      .bg(tint(t.blocked, "10", t.raised))
       .on_click((_event, cx) => {cx.stop_propagation(); this.selected = item.id; this.handle.focus(); cx.notify();})
       .child(div().text_size(12).text_color(t.foreground).line_height(1.35).max_h(49).overflow_hidden()
         .whitespace_normal().child(entry.question ?? ""))
@@ -609,8 +616,12 @@ export default class Berbr extends View {
         const details = row.id === this.expanded
           ? (row.kind === "task" ? this.detailItems(row) : this.looseItems(row)).filter(item => item.action) : [];
         if (!details.length) return [row, ...waiting];
-        return [row, ...details.flatMap(item => [item, ...waiting.filter(prompt => item.type === "agent" && item.live?.address === prompt.agent.address)]),
-          ...waiting.filter(prompt => !details.some(item => item.type === "agent" && item.live?.address === prompt.agent.address))];
+        const unmatched = waiting.filter(prompt => !details.some(item => item.type === "agent" && item.live?.address === prompt.agent.address));
+        const footer = details.findIndex(item => item.footer);
+        const split = footer < 0 ? details.length : footer;
+        const withPrompts = items => items.flatMap(item => [item,
+          ...waiting.filter(prompt => item.type === "agent" && item.live?.address === prompt.agent.address)]);
+        return [row, ...withPrompts(details.slice(0, split)), ...unmatched, ...withPrompts(details.slice(split))];
       }) : []),
     ]);
   }
@@ -664,16 +675,27 @@ export default class Berbr extends View {
     this.switchView("tasks", cx);
     this.clearSearch();
     if (parent.done) this.all = true;
-    this.setExpanded(parent.id, cx);
     for (const section of this.liveState().sections) if (section.rows.some(row => row.id === parent.id)) this.collapsed.delete(section.id);
-    if (parent.kind === "task" && target.kind === "mr" && this.liveState().detail(parent).history.some(item => item.row.id === target.row))
-      this.history.add(parent.id);
+    if (parent.kind === "task") {
+      const detail = this.liveState().detail(parent);
+      const ticket = target.kind === "ticket" ? flat.find(row => row.id === target.row) : null;
+      if (ticket && this.standaloneTickets(detail).includes(ticket)) this.ticketLists.add(parent.id);
+      const visibleTicket = ticket && [...detail.trees, ...detail.openMrs].some(item => item.tickets?.includes(ticket.target));
+      if ((target.kind === "mr" && detail.history.some(item => item.row.id === target.row)) ||
+          (ticket && !visibleTicket && (detail.tickets.closed.includes(ticket) ||
+            detail.history.some(item => item.tickets.includes(ticket.target))))) {
+        this.history.add(parent.id); setArtifactsExpanded(this, parent, false, cx, {remember:false});
+      }
+    }
+    this.setExpanded(parent.id, cx);
     const subtask = parent.kind === "task" && this.liveState().detail(parent).subtasks
       .find(row => walk([row]).some(child => child.id === target.row));
     if (subtask) this.subtasks.add(parent.id);
     const details = parent.kind === "task" ? this.detailItems(parent) : this.looseItems(parent);
     const item = details.find(item => item.row?.id === target.row)
       ?? details.find(item => item.type === "tree" && item.mr?.id === target.row)
+      ?? details.find(item => item.tickets?.includes(flat.find(row => row.id === target.row)?.target))
+      ?? (target.kind === "ticket" ? details.find(item => item.ticketsHeader) : null)
       ?? details.find(item => item.row?.id === subtask?.id);
     this.selected = target.row === parent.id ? parent.id : item?.id ?? parent.id;
     this.handle.focus(); cx.notify();
@@ -724,12 +746,13 @@ export default class Berbr extends View {
     this.perform(cx, ["open", path, ...(shell ? ["--shell"] : [])], {close, action, project:tree.project ?? this.project});
   }
 
-  openUrl(url, cx, action = url, {close = false, args = [url]} = {}) {
+  openUrl(url, cx, action = url, {close = false, args = [url], prepare = null} = {}) {
     if (!url || this.busy) return;
     this.busy = true; this.busyAction = action; this.error = null;
     cx.notify();
     cx.spawn(async cx => {
       try {
+        if (prepare) await prepare();
         const result = await exec("open", args);
         if (result.code !== 0) throw new Error(result.stderr.trim() || "Could not open link");
         if (close && props()?.overlay) closeOverlay(props().overlay);
@@ -747,14 +770,17 @@ export default class Berbr extends View {
 
   open(row, cx, action = row?.id) {
     if (!row || this.busy) return;
+    const live = row.kind === "agent" ? this.liveAgent(row) : null;
     if (row.scope_space_ambiguous && (["task", "tree"].includes(row.kind) || (row.kind === "agent" &&
-        !agents().some(agent => [agent.address, agent.pane].includes(row.terminal))))) {
+        !live))) {
       this.error = spaceBindingBlocker; cx.notify(); return;
     }
     if (row.kind === "agent") {
-      const live = this.liveAgent(row);
       if (live) {
-        run(live.child ? "terminal.peek" : "agent.focus", {terminal:live.address});
+        if (live.focusPane) {
+          if (live.tab) run("tab.select", {id:live.tab});
+          run("pane.focus", {terminal:live.address});
+        } else run(live.child ? "terminal.peek" : "agent.focus", {terminal:live.address});
         if (props()?.overlay) closeOverlay(props().overlay);
       } else if (row.resume_blocked) {
         this.error = "A running agent may be using this conversation. Close it before resuming."; cx.notify();
@@ -804,7 +830,7 @@ export default class Berbr extends View {
     return item;
   }
 
-  openRowMenu(item, cx) {
+  openRowMenu(item, cx, selection = null, taskContext = null) {
     if (this.busy) return;
     const row = this.menuTarget(item);
     const mr = item?.mr ?? row?.children?.find(child => child.kind === "mr");
@@ -812,12 +838,14 @@ export default class Berbr extends View {
     const tree = item?.tree;
     const hasService = row && ["task", "tree"].includes(row.kind) ? this.serviceEntries(row).length > 0 : false;
     const hasHistory = row?.kind === "tree" && this.historyEntries(row).length > 0;
-    if (!rowMenu(row, {spaces:spaces(), mr, live, tree, hasService, hasHistory}).length) return;
+    const taskRow = row?.kind === "ticket" ? (taskContext?.kind === "task" ? taskContext : null) ?? (item.parent?.kind === "task" ? item.parent : null)
+      ?? walk(this.data?.rows).find(task => task.kind === "task" && task.children?.includes(row)) : null;
+    if (!rowMenu(row, {spaces:spaces(), mr, live, tree, hasService, hasHistory, task:taskRow}).length) return;
     // Inline links may represent a row which also appears as a detail item.
-    this.selected = this.rows().find(candidate => candidate.id === item.id || candidate.row?.id === row.id)?.id ?? item.id;
+    this.selected = selection ?? this.rows().find(candidate => candidate.id === item.id || candidate.row?.id === row.id)?.id ?? item.id;
     this.contextRow = item;
     this.handle.focus(); cx.notify();
-    this.formOverlay("menu", {row, mr, live, tree, hasService, hasHistory, rows:this.data?.rows ?? []});
+    this.formOverlay("menu", {row, mr, live, tree, hasService, hasHistory, taskRow, project:taskRow?.project ?? row?.project ?? this.project, rows:this.data?.rows ?? []});
   }
 
   chooseMenu(cx, id = this.menuItems?.[this.menuIndex]?.id) {
@@ -846,6 +874,12 @@ export default class Berbr extends View {
       case "open-agent": case "open-shell": this.openLoose(row, id === "open-shell", cx, {close:true}); break;
       case "rename": form("rename", {row, prefill:{title:row.title ?? row.label ?? row.task}}); break;
       case "note": close(); this.openNote(row); break;
+      case "add-ticket": close(); this.addTicket(row); break;
+      case "detach-ticket":
+        if (row.target && p.taskRow?.task) this.perform(cx, ["detach", row.target, p.taskRow.task],
+          {close:true, project:p.taskRow.project ?? this.project});
+        break;
+      case "artifact-folder": openArtifactFolder(this, row, cx, id, {close:true}); break;
       case "done": form("done", {task:row.task, label:row.title ?? row.label, row}); break;
       case "remove-tree": close(); this.removeTree(row, p.mr, p.rows); break;
       case "stop-agent": form("stop-agent", {row, terminal}); break;
@@ -907,10 +941,15 @@ export default class Berbr extends View {
     if (!row?.terminal) return null;
     const listed = agents().find(agent => [agent.address, agent.pane].includes(row.terminal));
     if (listed) return listed;
-    const child = terminals().find(term => term.address === row.terminal && term.parent && term.state === "live");
-    return child ? {address:child.address, pane:child.address, child:true,
-      status:child.status === "error" ? "blocked" : child.status, title:child.title || child.name || row.label,
-      program:child.program} : null;
+    // Agent reports may lag the pane/core inventory. Their absence is not proof
+    // that the conversation stopped; focus the existing terminal before resume.
+    const pane = panes().find(pane => [pane.terminal, pane.pane].includes(row.terminal));
+    const term = terminals().find(term => term.address === (pane?.terminal || row.terminal));
+    if (term ? term.state !== "live" : !pane?.terminal) return null;
+    return {address:term?.address ?? pane.terminal, pane:pane?.pane ?? term.address,
+      tab:pane?.tab, focusPane:Boolean(pane), child:!pane,
+      status:term?.status === "error" ? "blocked" : term?.status ?? pane?.status,
+      title:term?.title || term?.name || pane?.title || row.label, program:term?.program ?? pane?.program};
   }
 
   agentVisible(row, tree) {
@@ -1151,7 +1190,7 @@ export default class Berbr extends View {
   setExpanded(id, cx) {
     this.expanded = id;
     const task = walk(this.data?.rows).find(row => row.id === id && row.kind === "task");
-    if (task?.artifacts) loadArtifacts(this, task, "", cx, true);
+    if (task?.artifacts && artifactsExpanded(this, task)) loadArtifacts(this, task, "", cx, true);
     try { localStorage.setItem("berbr.expanded", JSON.stringify(id)); } catch (_) { /* Storage is optional. */ }
     cx.notify();
   }
@@ -1243,6 +1282,7 @@ export default class Berbr extends View {
     if (this.form || !this.panelFocused() || this.busy || event.modifiers?.control || event.modifiers?.platform || event.modifiers?.alt) return;
     const arrow = ["up", "down"].includes(event.key);
     if (this.searchFocused && !arrow) return;
+    this.pointerSelected = null;
     const rows = this.rows();
     const index = rows.findIndex(row => row.id === this.selected);
     if (arrow || ["j", "k"].includes(event.key)) {
@@ -1268,7 +1308,7 @@ export default class Berbr extends View {
   input(key) {
     const t = theme();
     return (key === "description" ? Textarea.new(this.inputs[key]).h(96).py(8) : Input.new(this.inputs[key]).h(32))
-      .w_full().px(10).rounded(6)
+      .w_full().px(10).rounded(8)
       .border_1().border_color(t.border).bg(t.background).text_color(t.foreground).text_size(13)
       .when(this.form === "new", el => el.disabled(this.busy).tab_index(0).tab_stop(!this.busy));
   }
@@ -1286,35 +1326,41 @@ export default class Berbr extends View {
   taskRow(t, row) {
     const signal = this.signal(row);
     const selected = this.panelFocused() && row.id === this.selected;
-    const active = selected || signal.liveSpace?.active;
+    const expanded = row.id === this.expanded;
+    // An expanded task is already framed by its card; only keyboard selection fills its header.
+    const active = selected || (signal.liveSpace?.active && !expanded);
     const hints = h_flex().overflow_hidden().gap(6).items_center().min_w(0).text_size(11);
+    let hinted = 0;
+    const hint = element => { hinted++; hints.child(element); };
+    // The agent line right below a collapsed task already says who waits and why.
+    const echoed = signal.status === "blocked" && !expanded && this.waitingItems(row).length > 0;
     const showMr = signal.mrNeedsYou || signal.mrFlag === "ready to merge";
     if (signal.working && !showMr) {
       const activity = this.activity(signal.workingAgent, signal.workingTree?.tree ?? signal.workingTree?.label);
-      hints.child(h_flex().min_w(0).gap(4).items_center().text_color(t.muted)
+      hint(h_flex().min_w(0).gap(4).items_center().text_color(t.muted)
         .child(div().min_w(0).truncate().child(activity.text))
         .when(Boolean(activity.elapsed), el => el.child(div().flex_none().text_color(t.dim).child(activity.elapsed)))
         .when(signal.working > 1, el => el.child(div().flex_none().child(`+${signal.working - 1}`))));
-    } else if (["blocked", "done"].includes(signal.status) && signal.agents.some(agent => agent.status === signal.status)) hints.child(div().min_w(0).truncate()
+    } else if (!echoed && ["blocked", "done"].includes(signal.status) && signal.agents.some(agent => agent.status === signal.status)) hint(div().min_w(0).truncate()
       .text_color(t[signal.status]).child(this.attention(signal.agents.filter(agent => agent.status === signal.status)
         .reduce((latest, agent) => !latest || (agent.seq ?? 0) > (latest.seq ?? 0) ? agent : latest, null))));
-    if (!signal.working && !signal.mrNeedsYou && signal.ticket) hints.child(div().min_w(0).truncate().text_color(t.muted)
+    if (!signal.working && !signal.mrNeedsYou && signal.ticket) hint(div().min_w(0).truncate().text_color(t.muted)
       .child(`${signal.ticket.target}${normalizeTicketState(signal.ticket.state) === "In review" ? " in review" : ""}`));
     if ((!signal.working || showMr) && signal.mrs.length) {
       const mr = signal.mrs[0], spec = mrPills(mr)[0];
-      hints.child(this.externalLink(t, `task-mr-${row.id}`, mr, [
+      hint(this.externalLink(t, `task-mr-${row.id}`, mr, [
         div().flex_none().child(signal.mrKey),
         spec && pill(t, {...spec, tooltip:`${spec.label} — open ${signal.mrKey} in ${forgeName(signal.mrs?.[0])}`}),
         signal.mrs.length > 1 && div().flex_none().text_color(t.dim).child(`+${signal.mrs.length - 1}`),
       ]).min_w(0));
     }
     const hasSignal = Boolean(signal.attention || signal.ticket || signal.mrs.length);
-    if (!hasSignal && signal.trees.length) hints.child(div().text_color(t.dim)
+    if (!hasSignal && signal.trees.length) hint(div().text_color(t.dim)
       .child(`${signal.trees.length} ${signal.trees.length === 1 ? "worktree" : "worktrees"}`));
-    const expanded = row.id === this.expanded;
-    const secondLine = !expanded && (hasSignal || signal.trees.length > 0);
-    return h_flex().id(`task-${row.id}`).min_h(secondLine ? 44 : 32).px(8).py(6).gap(10)
-      .items_start().rounded(6).when(active, el => el.bg(t.selected)).cursor_pointer()
+    const revealed = expanded || this.hovered === row.id || selected;
+    const secondLine = !expanded && hinted > 0;
+    return h_flex().id(`task-${row.id}`).min_h(secondLine ? 46 : 32).px(8).py(7).gap(10)
+      .items_start().rounded(8).when(active, el => el.bg(t.selected)).cursor_pointer()
       .opacity(this.busy ? 0.4 : 1)
       .hover(el => el.bg(active ? t.selected : t.hover))
       .on_hover((hovered, cx) => this.hoverRow(row.id, hovered, cx))
@@ -1322,16 +1368,20 @@ export default class Berbr extends View {
       .on_mouse_down("right", (_event, cx) => {
         this.openRowMenu(row, cx); cx.stop_propagation();
       })
-      .child(div().pt(2).child(statusMark(t, signal.status)))
-      .child(v_flex().flex_1().min_w(0).gap(2)
-        .child(h_flex().gap(6).items_center().min_w(0)
+      .child(div().pt(1).child(statusMark(t, signal.status)))
+      .child(v_flex().flex_1().min_w(0).gap(3)
+        .child(h_flex().gap(6).items_center().when(expanded, el => el.items_start()).min_w(0)
           .when(this.scopeProjects?.length > 1 && Boolean(row.project), el => el.child(div().max_w("30%").min_w(0).truncate()
             .text_size(11).text_color(t.dim).tooltip(row.project).child(row.project)))
-          .child(div().flex_1().min_w(0).text_size(13).truncate().child(row.title ?? row.label ?? row.task ?? "Untitled task"))
-          .when(Boolean(signal.liveSpace), el => el.child(iconButton(t, `task-space-${row.id}`, "monitor", "Go to space",
-            () => run("space.select", {id:signal.liveSpace.id}), {size:20, disabled:this.busy}))))
+          .child(div().id(`task-title-${row.id}`).flex_1().min_w(0).text_size(13).font_medium()
+            .when(Boolean(row.done), el => el.text_color(t.muted))
+            .when(expanded, el => el.whitespace_normal()).when(!expanded, el => el.truncate())
+            .child(row.title ?? row.label ?? row.task ?? "Untitled task"))
+          .when(Boolean(signal.liveSpace), el => el.child(div().flex_none().opacity(revealed ? 1 : 0).transition("opacity", 120)
+            .child(iconButton(t, `task-space-${row.id}`, "monitor", "Go to space",
+              () => run("space.select", {id:signal.liveSpace.id}), {size:20, disabled:this.busy})))))
         .when(secondLine, el => el.child(hints)))
-      .child(div().w(22).flex_none().when(!(expanded || this.hovered === row.id || selected), el => el.invisible()).child(iconButton(t, `details-${row.id}`,
+      .child(div().w(22).flex_none().opacity(revealed ? 1 : 0).transition("opacity", 120).child(iconButton(t, `details-${row.id}`,
         expanded ? "chevron-down" : "chevron-right", expanded ? "Collapse task" : "Expand task",
         cx => this.taskClick(row, cx), {size:22, disabled:this.busy})));
   }
@@ -1343,40 +1393,61 @@ export default class Berbr extends View {
       items.push({id, kind:"detail", parent:task, type, ...values,
         action:action ? cx => action(cx, id) : null});
     };
+    const tickets = this.standaloneTickets(detail, false, this.history.has(task.id));
+    if (tickets.length) add("disclosure", "tickets", {
+      label:`Tickets without MR · ${tickets.length}`, ticketsHeader:true, expanded:this.ticketLists.has(task.id),
+    }, cx => {
+      if (this.ticketLists.has(task.id)) this.ticketLists.delete(task.id); else this.ticketLists.add(task.id);
+      cx.notify();
+    });
     for (const [index, tree] of detail.trees.entries()) {
       const groups = this.agentGroups(tree.agents, tree.row);
-      add("tree", tree.row.id, {...tree, groupStart:index > 0, hasAgents:groups.primary.length > 0}, (cx, id) => this.navigateTree(tree.row, cx, id));
+      add("tree", tree.row.id, {...tree, groupStart:index > 0 || tickets.length > 0, afterTickets:index === 0 && tickets.length > 0, hasAgents:groups.primary.length > 0}, (cx, id) => this.navigateTree(tree.row, cx, id));
       this.addTreeAgents(add, tree.row, tree.agents);
     }
     const mainAgents = this.agentGroups(detail.mainAgents).primary;
     if (mainAgents.length) {
-      add("main", "header", {label:"Main checkout", groupStart:detail.trees.length > 0, hasAgents:true});
+      add("main", "header", {label:"Main checkout", groupStart:detail.trees.length > 0 || tickets.length > 0, afterTickets:detail.trees.length === 0 && tickets.length > 0, hasAgents:true});
       for (const agent of mainAgents) add("agent", agent.row.id, {...agent, nested:true}, cx => this.open(agent.row, cx));
     }
     for (const mr of detail.openMrs) add("mr", mr.row.id, mr, (cx, id) => this.openUrl(mr.row.url, cx, id));
-    for (const [key, label, rows, expanded] of [
-      ["history", `History · ${detail.history.length} ${detail.history.every(m => forgeName(m.row ?? m) === "GitHub") ? "PRs" : detail.history.some(m => forgeName(m.row ?? m) === "GitHub") ? "PRs / MRs" : "MRs"}`, detail.history, this.history],
-      ["subtasks", `Subtasks · ${detail.subtasks.length}`, detail.subtasks, this.subtasks],
-    ]) {
-      if (!rows.length) continue;
-      add("disclosure", key, {label, expanded:expanded.has(task.id)}, cx => {
-        if (expanded.has(task.id)) expanded.delete(task.id); else expanded.add(task.id);
+    if (detail.subtasks.length) {
+      add("disclosure", "subtasks", {label:`Subtasks · ${detail.subtasks.length}`, expanded:this.subtasks.has(task.id)}, cx => {
+        if (this.subtasks.has(task.id)) this.subtasks.delete(task.id); else this.subtasks.add(task.id);
         cx.notify();
       });
-      if (expanded.has(task.id)) for (const entry of rows) {
-        const row = key === "history" ? entry.row : entry;
-        add(key === "history" ? "mr" : "subtask", row.id,
-          key === "history" ? {...entry, historical:true} : {row},
-          (cx, id) => key === "history" ? this.openUrl(row.url, cx, id) : this.openNote(row));
-      }
+      if (this.subtasks.has(task.id)) for (const row of detail.subtasks)
+        add("subtask", row.id, {row}, () => this.openNote(row));
     }
     if (!task.scope_space_ambiguous && !detail.trees.length && !taskSpace(task, this.liveState().spaces))
       add("action", "start", {label:"Start work", accent:true}, (cx, id) => this.open(task, cx, id));
-    if (task.note) add("action", "note", {label:"Note"}, () => this.openNote(task));
-    for (const {type, key, action, ...values} of artifactItems(this, task)) add(type, key, values, action);
-    if (!task.done && !task.scope_space_ambiguous) add("action", "close", {label:"Close task", close:true}, () => this.formOverlay("done", {
-      task:task.task, label:task.title ?? task.label, row:task, plan:this.liveState().plan(task),
-    }));
+    if (task.note) add("action", "note", {label:"Note", footer:true}, () => this.openNote(task));
+    const artifacts = artifactItems(this, task);
+    for (const {type, key, action, ...values} of artifacts.filter(item => item.footer)) add(type, key, values, action);
+    const closedTickets = this.standaloneTickets(detail, true);
+    if (detail.history.length || closedTickets.length) add("disclosure", "history", {
+      label:"History", footer:true, expanded:this.history.has(task.id),
+    }, cx => {
+      if (this.history.has(task.id)) this.history.delete(task.id);
+      else { this.history.add(task.id); setArtifactsExpanded(this, task, false, cx, {remember:false}); }
+      cx.notify();
+    });
+    add("action", "menu", {label:"Task actions", footer:true}, (cx, id) => this.openRowMenu(task, cx, id));
+    for (const {type, key, action, ...values} of artifacts.filter(item => !item.footer)) add(type, key, values, action);
+    if (this.history.has(task.id)) {
+      if (detail.history.length) {
+        const label = detail.history.every(m => forgeName(m.row) === "GitHub") ? "PRs"
+          : detail.history.some(m => forgeName(m.row) === "GitHub") ? "PRs / MRs" : "MRs";
+        add("resource-heading", "mrs", {label:`${label} · ${detail.history.length}`, resource:true});
+        for (const entry of detail.history) add("mr", entry.row.id, {...entry, historical:true, resource:true},
+          (cx, id) => this.openUrl(entry.row.url, cx, id));
+      }
+      if (closedTickets.length) {
+        add("resource-heading", "tickets", {label:`Tickets · ${closedTickets.length}`, resource:true});
+        for (const row of closedTickets) add("ticket", row.id, {row, historical:true, resource:true},
+          (cx, id) => this.openUrl(row.url, cx, id));
+      }
+    }
     return items;
   }
 
@@ -1433,21 +1504,21 @@ export default class Berbr extends View {
   }
 
   innerRow(t, item) {
-    const selected = this.panelFocused() && item.id === this.selected;
+    const selected = this.panelFocused() && item.id === this.selected && !((item.footer || item.ticketsHeader) && this.pointerSelected === item.id);
     const pending = this.busy && this.busyAction === item.id;
     const focus = focused();
     const here = item.type === "agent" ? Boolean(focus?.terminal &&
       [item.row?.terminal, item.live?.address, item.live?.pane].includes(focus.terminal))
       : item.type === "tree" && this.currentTree(focus?.cwd) === item.row;
-    return h_flex().relative().id(item.id).h(item.type === "agent" ? 24 : 28).flex_none().px(6).gap(6).items_center().rounded(6)
-      .min_w(0).text_size(12.5).text_color(t.foreground)
+    return h_flex().relative().id(item.id).h(28).flex_none().px(6).gap(6).items_center().rounded(7)
+      .min_w(0).text_size(12).text_color(t.foreground)
       .when(selected, el => el.bg(t.selected)).hover(el => el.bg(selected ? t.selected : t.hover))
-      .when(here, el => el.child(div().absolute().left(0).top(4).bottom(4).w(2).bg(t.accent)
+      .when(here, el => el.child(div().absolute().left(0).top(5).bottom(5).w(2).rounded(1).bg(t.accent)
         .tooltip("You are here").accessibility_label("You are here")))
       .opacity(this.busy && !pending && ![`${item.id}/shell`, `${item.id}/mr`, `${item.id}/ticket`].includes(this.busyAction) ? 0.4 : 1)
       .when(Boolean(item.action), el => el.cursor_pointer()
         .on_hover((hovered, cx) => this.hoverRow(item.id, hovered, cx))
-        .on_click((_event, cx) => { cx.stop_propagation(); this.taskClick(item, cx); }))
+        .on_click((_event, cx) => { cx.stop_propagation(); this.pointerSelected = item.footer || item.ticketsHeader ? item.id : null; this.taskClick(item, cx); }))
       .when(Boolean(this.menuTarget(item)), el => el.on_mouse_down("right", (_event, cx) => {
         this.openRowMenu(item, cx); cx.stop_propagation();
       }));
@@ -1455,32 +1526,30 @@ export default class Berbr extends View {
 
   treeActions(t, tree, mr, id) {
     const action = `${id}/shell`;
-    const shown = this.hovered === id || (this.panelFocused() && this.selected === id) || this.busyAction === action;
-    return [h_flex().flex_none().items_center().when(!shown, el => el.invisible())
+    return [h_flex().flex_none().items_center()
       .child(iconButton(t, action, "terminal", "Open terminal in worktree",
         cx => this.openLoose(tree, true, cx, {action}),
         {size:20, disabled:this.busy || !(tree.cwd || treeMarks(tree).path), spinning:this.busy && this.busyAction === action}))];
   }
 
-  externalLink(t, id, row, content = []) {
+  externalLink(t, id, row, content = [], task = null) {
     const mr = row.kind === "mr";
     const key = mr ? row.label?.match(/[!#]\d+/)?.[0] ?? "MR" : row.target ?? "ticket";
-    return h_flex().id(id).min_w(0).gap(4).items_center().text_color(t.muted).cursor_pointer()
-      .tooltip(`Open ${key} in ${forgeName(row)}`)
+    return h_flex().id(id).min_w(0).gap(8).items_center().text_color(t.muted).cursor_pointer()
+      .tooltip(row.label?.trim() ? `${row.label.trim()}\nOpen ${key} in ${forgeName(row)}` : `Open ${key} in ${forgeName(row)}`)
       .opacity(this.busy && this.busyAction !== id ? 0.4 : 1)
       .hover(el => el.text_color(t.foreground).underline())
       .when(this.panelFocused() && this.selected === row.id, el => el.bg(t.selected))
-      .on_mouse_down("right", (_event, cx) => {cx.stop_propagation(); this.openRowMenu(row, cx);})
+      .on_mouse_down("right", (_event, cx) => {cx.stop_propagation(); this.openRowMenu(row, cx, null, task);})
       .on_click((_event, cx) => {cx.stop_propagation(); this.openUrl(row.url, cx, id);})
-      // The spinner slot trails the content: reserved so nothing shifts, never a leading gap.
+      // The spinner trails the content only while the link opens, so resting links keep even gaps.
       .children(content.filter(Boolean))
-      .child(div().size(11).flex_none().when(!(this.busy && this.busyAction === id), el => el.invisible())
-        .child(icon("spinner", 11).text_color(t.dim).when(this.busy && this.busyAction === id, el => el.spin(900))));
+      .when(this.busy && this.busyAction === id, el => el.child(icon("spinner", 11).text_color(t.dim).spin(900)));
   }
 
   mrState(t, mr, historical = false, state = mr?.state?.toLowerCase()) {
     const key = mr?.label?.match(/[!#]\d+/)?.[0] ?? "MR";
-    return h_flex().flex_none().gap(4).items_center().text_color(historical || ["merged", "closed"].includes(state) ? t.dim : t.muted)
+    return h_flex().flex_none().gap(12).items_center().text_color(historical || ["merged", "closed"].includes(state) ? t.dim : t.muted)
       .children(mrPills(mr, {historical, state}).map(spec => pill(t, {...spec,
         tooltip:`${spec.label} — open ${key} in ${forgeName(mr)}`})));
   }
@@ -1498,9 +1567,9 @@ export default class Berbr extends View {
       : icon("terminal", 14).text_color(t.dim);
     const label = activity ? activity.elapsed : !item.live ? item.row.resume_blocked ? "unknown" : "stopped"
       : status === "blocked" ? this.attention(item.live) : status === "done" ? "finished" : "";
-    return line.text_size(12).text_color(item.live ? t.muted : t.dim).when(!item.live, el => el.opacity(0.55))
+    return line.text_size(12).text_color(t.muted)
       .child(mark.flex_none().tooltip(program?.name || "Terminal").accessibility_label(program?.name || "Terminal"))
-      .child(div().flex_1().min_w(0).truncate().tooltip(title).when(Boolean(activity), el => el.text_color(t.muted)).child(title))
+      .child(div().flex_1().min_w(0).truncate().tooltip(title).text_color(item.live ? t.muted : t.dim).child(title))
       .child(h_flex().min_w(0).max_w("50%").gap(4).items_center().text_size(11)
         .when(!item.live && !item.row.resume_blocked && Boolean(item.row.session && (item.row.cwd || item.tree?.cwd)), el => el.cursor_pointer()
           .tooltip("Resume agent").on_click((_event, cx) => {
@@ -1508,47 +1577,58 @@ export default class Berbr extends View {
           }))
         .when(Boolean(item.row.resume_blocked), el => el.tooltip("A running agent may be using this conversation"))
         .text_color(["blocked", "done"].includes(status) ? t[status] : t.dim)
-        .child(activity ? icon("spinner", 11).text_color(t.working).spin(900) : statusMark(t, status))
+        // A saved conversation has no live state to mark: its word alone says so.
+        .when(Boolean(activity), el => el.child(icon("spinner", 11).text_color(t.working).spin(900)))
+        .when(!activity && Boolean(item.live), el => el.child(statusMark(t, status)))
         .when(Boolean(label), el => el.child(div().min_w(0).truncate().tooltip(label).child(label))));
   }
 
   detailRow(t, item) {
+    if (item.type === "resource-heading") return div().id(item.id).h(24).px(6).pt(6)
+      .text_size(11).text_color(t.dim).child(item.label);
     const pending = this.busy && this.busyAction === item.id;
     const line = this.innerRow(t, item);
     const mark = name => pending ? icon("spinner", 11).text_color(t.dim).spin(900) : icon(name, 12).text_color(t.dim);
-    if (["artifacts", "artifact", "artifact-status"].includes(item.type)) {
+    if (["artifact-tools", "artifact", "artifact-status"].includes(item.type)) {
       renderArtifact(this, t, item, line);
     } else if (item.type === "tree") {
       if (!treeFocusTarget(item.row, agents(), panes())) line.tooltip("No live agent — open a terminal or start an agent from the menu");
-      line.h_auto().min_h(28).child(mark("git-branch").flex_none())
-        .child(div().flex_1().min_w(24).truncate()
-          .text_color(isMergedTree(item.row) || ["merged", "closed"].includes(item.mr?.state?.toLowerCase()) ? t.muted : t.foreground)
-          .tooltip(item.row.label ?? item.row.tree ?? "Untitled").child(item.row.label ?? item.row.tree ?? "Untitled"));
+      line.h_auto().min_h(28).flex_col().items_stretch().gap(2).py(3);
+      const changes = treeMarks(item.row).changes;
+      const heading = h_flex().id(`${item.id}/heading`).h(24).min_w(0).gap(6).items_center()
+        .child(mark("git-branch").flex_none())
+        .child(h_flex().flex_1().min_w(0).gap(6).items_center()
+          .child(div().id(`${item.id}/name`).min_w(0).truncate().text_size(13).font_medium()
+            .text_color(isMergedTree(item.row) || ["merged", "closed"].includes(item.mr?.state?.toLowerCase()) ? t.muted : t.foreground)
+            .tooltip(item.row.label ?? item.row.tree ?? "Untitled").child(item.row.label ?? item.row.tree ?? "Untitled"))
+          // Like an editor's modified mark: uncommitted work sits beside the name it belongs to.
+          .when(!item.loose && changes > 0, el => el.child(div().flex_none().size(6).rounded_full().bg(t.working)
+            .tooltip(`${changes} uncommitted ${changes === 1 ? "file" : "files"}`)
+            .accessibility_label(`${changes} uncommitted ${changes === 1 ? "file" : "files"}`))));
+      const diff = item.row.diff;
+      if (diff && (diff.adds > 0 || diff.dels > 0)) heading.child(h_flex().id(`${item.id}/diff`).flex_none().gap(4).text_size(11)
+        .tooltip("Worktree diff against the merge-base with the default branch. Includes uncommitted tracked changes; excludes untracked files.")
+        .child(div().flex_none().text_color(t.ansi2 ?? t.done ?? t.dim).child(`+${diff.adds}`))
+        .child(div().flex_none().text_color(t.ansi1 ?? t.blocked ?? t.dim).child(`−${diff.dels}`)));
+      heading.children(this.treeActions(t, item.row, item.mr, item.id));
       const summary = [item.row.branch, item.row.body, item.mr?.label, ...mrPills(item.mr).map(spec => spec.label),
         item.row.diff ? `+${item.row.diff.adds} −${item.row.diff.dels}` : ""].filter(Boolean).join(" · ");
-      // Keep metadata intact; narrow panels can grow the row instead of cutting off counts or MR status.
-      const right = h_flex().min_w(0).max_w("60%").flex_shrink(1).flex_wrap().gap(6).items_center().tooltip(summary);
+      // MR and CI stay below the branch; the branch name yields width to its diff and terminal action.
+      const right = h_flex().id(`${item.id}/metadata`).min_w(0).pl(18).flex_wrap().gap(12).items_center().tooltip(summary);
       if (item.loose && item.row.branch) right.child(div().flex_1().min_w(0).truncate()
         .text_size(11).text_color(t.dim).tooltip(item.row.branch).child(item.row.branch));
       const state = this.treeState(t, item.row, {compact:true, hideMerged:Boolean(item.mr && !item.loose), hideChanges:!item.loose});
       if (state) right.child(state);
+      // One link per target: the MR number and its CI state open the same page, so they are one control.
       if (item.mr && !item.loose) right.child(this.externalLink(t, `${item.id}/mr`, item.mr, [
-        div().flex_none().text_size(12).child(item.mr.label?.match(/[!#]\d+/)?.[0] ?? "MR"),
+        tag(t, item.mr.label?.match(/[!#]\d+/)?.[0] ?? "MR"),
         this.mrState(t, item.mr, false, isMergedTree(item.row) ? "merged"
           : item.row.mr_state ?? item.mr.state?.toLowerCase()).max_w("100%").flex_wrap(),
-      ]).flex_none().max_w("100%").flex_wrap());
-      else if (!item.loose) right.child(div().flex_none().text_size(11).text_color(t.dim).child("no MR"));
-      const changes = treeMarks(item.row).changes;
-      if (!item.loose && changes) right.child(div().flex_none().size(6).rounded(3).bg(t.working)
-        .tooltip(`${changes} uncommitted ${changes === 1 ? "file" : "files"}`)
-        .accessibility_label(`${changes} uncommitted ${changes === 1 ? "file" : "files"}`));
-      const diff = item.row.diff;
-      if (diff && (diff.adds > 0 || diff.dels > 0)) right.child(h_flex().flex_none().max_w("100%").flex_wrap().gap(4).text_size(11)
-        .child(div().flex_none().text_color(t.done ?? t.dim).child(`+${diff.adds}`))
-        .child(div().flex_none().text_color(t.blocked ?? t.dim).child(`−${diff.dels}`)));
-      line.child(right).children(this.treeActions(t, item.row, item.mr, item.id, {loose:item.loose, ticket:item.ticket}));
+      ]).flex_none().max_w("100%").flex_wrap()).children(this.mrTicketLinks(t, item));
+      line.child(heading);
+      if ((item.mr && !item.loose) || (item.loose && item.row.branch) || state) line.child(right);
     } else if (item.type === "ticket") {
-      line.child(this.externalLink(t, `${item.id}/ticket`, item.row, [div().child(item.row.target ?? "Ticket")])
+      line.child(this.externalLink(t, `${item.id}/ticket`, item.row, [div().child(item.row.target ?? "Ticket")], item.parent)
         .flex_none().tooltip(`Open in ${forgeName(item.row)}`))
         .child(chip(t, normalizeTicketState(item.row.state)))
         .child(div().flex_1().min_w(0).truncate().child(ticketTitle(item.row)));
@@ -1562,9 +1642,8 @@ export default class Berbr extends View {
           div().flex_none().child(iid),
           div().flex_1().min_w(0).truncate().child(title),
           this.mrState(t, item.row, item.historical),
-        ]).flex_1().text_color(item.historical ? t.dim : t.foreground))
-        .when(Boolean(item.tickets.length), el => el.child(div().max_w("35%").min_w(0).truncate()
-          .text_size(11).text_color(t.dim).child(item.tickets.join(" · "))));
+        ]).flex_1().text_color(item.historical ? t.dim : t.foreground));
+      line.h_auto().min_h(28).py(3).flex_wrap().children(this.mrTicketLinks(t, item));
     } else if (item.type === "subtask") {
       line.child(pending ? mark("file-text") : statusMark(t, this.signal(item.row).status))
         .child(div().flex_1().min_w(0).truncate().child(item.row.title ?? item.row.label ?? "Untitled task"));
@@ -1575,34 +1654,66 @@ export default class Berbr extends View {
       line.child(icon("folder", 12).text_color(t.dim))
         .child(div().text_size(12).text_color(t.muted).child(item.label));
     }
-    if (item.nested) return div().pl(12).border_l_1().border_color(t.border).ml(12).child(line);
-    return div().when(Boolean(item.groupStart), el => el.mt(4))
-      .when(Boolean(item.hasAgents), el => el.relative().child(div().absolute().left(12).bottom(0).h(8).w(1).bg(t.border)))
-      .child(line);
+    // The agent icon aligns with the branch name and MR metadata. Spacing,
+    // rather than connecting rules, separates worktree groups.
+    if (item.nested) return div().ml(18).child(line);
+    // The hairline starts at the text column, as in a grouped list, so icons keep one clean edge.
+    return div().when(Boolean(item.groupStart), el => el.mt(item.afterTickets ? 4 : TASK_GROUP_GAP)
+      .when(!item.afterTickets, el => el.child(div().ml(24).mb(TASK_GROUP_GAP).h(1).flex_none().bg(t.border)))).child(line);
   }
 
-  ticketsLine(t, task, detail) {
-    const line = h_flex().min_h(26).gap(8).items_center().flex_wrap().min_w(0);
-    const ticket = (row, closed = false) => this.externalLink(t, `${task.id}/${row.id}`, row, [
-      div().text_size(12).child(row.target ?? row.label ?? "Ticket"),
-      div().min_w(0).truncate().text_size(11).text_color(!closed && normalizeTicketState(row.state) === "In review" ? t.accent : t.dim)
-        .child(normalizeTicketState(row.state)),
-    ]).h(26).max_w("100%").text_color(closed ? t.dim : t.muted);
-    line.children(detail.tickets.open.map(row => ticket(row)));
-    if (!detail.tickets.open.length && !detail.tickets.closed.length)
-      line.child(div().text_size(12).text_color(t.dim).child("No ticket"));
-    if (detail.tickets.closed.length) {
-      line.child(button(t, `${task.id}/closed-tickets`, `+${detail.tickets.closed.length} closed`, cx => {
-        if (this.closedTickets.has(task.id)) this.closedTickets.delete(task.id); else this.closedTickets.add(task.id);
-        cx.notify();
-      }, "ghost", this.busy).h(26).px(0).text_color(t.dim));
-      if (this.closedTickets.has(task.id)) line.children(detail.tickets.closed.map(row => ticket(row, true)));
-    }
-    return line.child(iconButton(t, `${task.id}/add-ticket`, "plus", "Add ticket", () => this.formOverlay("ticket", {
+  addTicket(task) {
+    const detail = this.liveState().detail(task);
+    this.formOverlay("ticket", {
       task:task.task, title:task.title ?? task.label, project:task.project ?? this.project, row:task,
       tickets:[...detail.tickets.open, ...detail.tickets.closed].map(ticket => ticket.target),
       trees:detail.trees.map(tree => tree.row),
-    }), {size:20, disabled:this.busy}));
+    });
+  }
+
+  standaloneTickets(detail, closed = false, historyVisible = false) {
+    // An open ticket remains visible above the branches if its only MR is in collapsed History.
+    const linked = new Set([...detail.trees, ...detail.openMrs, ...(closed || historyVisible ? detail.history : [])]
+      .flatMap(item => item.tickets ?? []));
+    return detail.tickets[closed ? "closed" : "open"].filter(row => !linked.has(row.target));
+  }
+
+  mrTicketLinks(t, item) {
+    const rows = item.parent?.children?.filter(row => row.kind === "ticket") ?? [];
+    return (item.tickets ?? []).map(key => {
+      const row = rows.find(row => row.target === key);
+      return row?.url ? this.externalLink(t, `${item.id}/ticket/${key}`, row, [tag(t, key)], item.parent).flex_none()
+        : tag(t, key).text_color(t.dim);
+    });
+  }
+
+  ticketsLine(t, task, detail) {
+    return h_flex().min_h(26).gap(8).items_center().flex_wrap().min_w(0)
+      .children(this.standaloneTickets(detail, false, this.history.has(task.id)).map(row => this.externalLink(t, `${task.id}/${row.id}`, row, [
+        div().text_size(12).child(row.target ?? row.label ?? "Ticket"),
+        div().min_w(0).truncate().text_size(11).text_color(normalizeTicketState(row.state) === "In review" ? t.accent : t.dim)
+          .child(normalizeTicketState(row.state)),
+      ], task).h(26).max_w("100%").text_color(t.muted)))
+      .child(iconButton(t, `${task.id}/add-ticket`, "plus", "Add ticket", () => this.addTicket(task), {size:20, disabled:this.busy}));
+  }
+
+  taskResources(t, task, items) {
+    return h_flex().id(`${task.id}/resources`).min_w(0).min_h(28).mt(TASK_GROUP_GAP).pt(6).gap(2).items_center().flex_wrap()
+      .border_t_1().border_color(t.border)
+      .children(items.filter(item => item.footer).map(item => {
+        const menu = item.label === "Task actions", note = item.type === "action" && !menu;
+        const label = menu ? "⋯" : item.type === "artifacts" ? "Artifacts" : item.label;
+        const glyph = menu ? null : note ? "file-text" : item.type === "artifacts" ? "folder" : "clock";
+        const control = this.innerRow(t, item).h(28).px(8).gap(6).text_size(12).text_color(t.muted).flex_none()
+          .accessibility_label(menu ? "Task actions" : note ? "Open note" : `${label}, ${item.expanded ? "expanded" : "collapsed"}`)
+          .tooltip(menu ? "Task actions" : note ? "Open note" : `${item.expanded ? "Collapse" : "Expand"} ${label.toLowerCase()}`)
+          .when(item.expanded, el => el.bg(this.panelFocused() && this.selected === item.id && this.pointerSelected !== item.id ? t.selected : t.raised).text_color(t.foreground))
+          .when(Boolean(glyph), el => el.child(icon(glyph, 12).text_color(t.dim)))
+          .child(label)
+          .when(note, el => el.child(div().text_color(t.dim).child("↗")))
+          .when(!note && !menu, el => el.child(icon(item.expanded ? "chevron-down" : "chevron-right", 11).text_color(t.dim)));
+        return menu ? h_flex().flex_1().justify_end().child(control) : control;
+      }));
   }
 
   taskBlock(t, task) {
@@ -1625,20 +1736,32 @@ export default class Berbr extends View {
     }
     const detail = this.liveState().detail(task);
     const items = this.detailItems(task, detail);
-    const body = v_flex().pl(28).pr(8).pb(4).min_w(0);
-    if (detail.excerpt) body.child(div().pb(4).child(div().px(6).max_h(32).overflow_hidden().line_height(1.35)
+    const body = v_flex().px(10).pb(8).min_w(0);
+    if (detail.excerpt) body.child(div().pb(6).child(div().pl(24).pr(6).max_h(32).overflow_hidden().line_height(1.35)
       .whitespace_normal().text_size(12).text_color(t.muted)
-      .tooltip("Task preview · open Note for the full text").child(detail.excerpt)));
-    body.child(div().px(6).child(this.ticketsLine(t, task, detail)))
-      .children(items.filter(item => item.type !== "action").map(item => v_flex().child(this.detailRow(t, item))
+      .tooltip("Task preview · open Note for the full text")
+      .child(this.clampExcerpt(detail.excerpt))));
+    body.children(items.filter(item => item.type !== "action" && !item.footer && !item.resource).map(item => v_flex().child(this.detailRow(t, item))
+        .when(item.ticketsHeader && item.expanded, el => el.child(div().px(6).pb(4).child(this.ticketsLine(t, task, detail))))
         .when(item.type === "agent" && item.live?.status === "blocked", el => {
           const prompt = waiting.find(prompt => prompt.agent.address === item.live.address);
-          if (prompt) el.child(div().ml(12).border_l_1().border_color(t.border).child(this.waitingCard(t, prompt)));
+          if (prompt) el.child(this.waitingCard(t, prompt, {nested:true}));
+          return el;
         })));
-    body.child(this.actionRows(t, items));
+    if (items.some(item => item.type === "action" && !item.footer))
+      body.child(this.actionRows(t, items.filter(item => !item.footer)));
     body.children(waiting.filter(prompt => !items.some(item => item.type === "agent" && item.live?.address === prompt.agent.address))
       .map(prompt => this.waitingCard(t, prompt)));
-    return this.expandedBlock(t, this.taskRow(t, task), body);
+    body.child(this.taskResources(t, task, items));
+    body.children(items.filter(item => item.resource).map(item => this.detailRow(t, item)));
+    return this.expandedBlock(t, this.taskRow(t, task), body, this.signal(task).liveSpace?.active);
+  }
+
+  /** Two lines of the excerpt for the panel's width: an explicit ellipsis instead of a clipped third line. */
+  clampExcerpt(text) {
+    // 68px of card and column insets; about 6.9px per 12px character, Cyrillic included.
+    const limit = Math.max(40, 2 * Math.floor(((this.panelWidth ?? 420) - 68) / 6.9) - 6);
+    return text.length > limit ? `${text.slice(0, limit - 1).trimEnd()}…` : text;
   }
 
   actionRows(t, items) {
@@ -1657,8 +1780,9 @@ export default class Berbr extends View {
     return actions;
   }
 
-  expandedBlock(t, header, body) {
-    return v_flex().my(4).flex_none().min_w(0).rounded(8).border_1().border_color(t.border).bg(t.background)
+  expandedBlock(t, header, body, active = false) {
+    return v_flex().my(6).flex_none().min_w(0).rounded(10).border_1()
+      .border_color(active ? tint(t.accent, "66", t.border) : t.border).bg(t.background)
       .child(header).child(body);
   }
 
@@ -1666,7 +1790,7 @@ export default class Berbr extends View {
     const tree = row.kind === "tree" ? row : row.children?.find(child => child.kind === "tree");
     const state = tree && this.treeState(t, tree);
     return v_flex().flex_1().min_w(0).gap(2)
-      .child(div().min_w(0).truncate().text_size(12.5).child(row.label ?? row.target ?? "Untitled"))
+      .child(div().min_w(0).truncate().text_size(13).child(row.label ?? row.target ?? "Untitled"))
       .child(h_flex().min_w(0).gap(4).items_center().text_size(11).text_color(t.dim).tooltip(reason)
         .child(div().min_w(0).truncate().child(reason))
         .when(Boolean(state), el => el.child("·").child(state)));
@@ -1678,7 +1802,7 @@ export default class Berbr extends View {
     const detail = section === "todo" ? (forgeName(row) === "GitHub" ? "GitHub issue" : "Assigned in Jira") : this.liveState().reason(row);
     const reason = this.scopeProjects?.length > 1 && row.project ? `${row.project} · ${detail}` : detail;
     const kindIcon = { ticket:"file-text", tree:"git-branch", mr:"git-compare" }[row.kind] ?? "file-text";
-    const line = h_flex().id(`loose-${row.id}`).h(44).flex_none().px(8).gap(8).items_center().rounded(6)
+    const line = h_flex().id(`loose-${row.id}`).h(44).flex_none().px(8).gap(10).items_center().rounded(8)
       .when(selected, el => el.bg(t.selected)).hover(el => el.bg(selected ? t.selected : t.hover)).cursor_pointer()
       .opacity(this.busy ? 0.4 : 1)
       .on_hover((hovered, cx) => this.hoverRow(row.id, hovered, cx))
@@ -1718,7 +1842,7 @@ export default class Berbr extends View {
     const context = [this.scopeProjects?.length > 1 ? row.project : null, row.repository,
       ...row.tasks.map(task => task.title ?? task.label ?? task.task)];
     if (!row.tasks.length && row.task) context.push(row.task);
-    return v_flex().id(row.id).flex_none().min_w(0).px(8).py(8).gap(5).rounded(6)
+    return v_flex().id(row.id).flex_none().min_w(0).px(8).py(8).gap(5).rounded(8)
       .when(selected, el => el.bg(t.selected)).hover(el => el.bg(selected ? t.selected : t.hover))
       .cursor_pointer().opacity(this.busy ? 0.4 : 1)
       .tooltip([row.label, row.branch, row.url].filter(Boolean).join("\n"))
@@ -1727,20 +1851,40 @@ export default class Berbr extends View {
       .on_mouse_down("right", (_event, cx) => {cx.stop_propagation(); this.openRowMenu(row, cx);})
       .child(h_flex().min_w(0).gap(6).items_center()
         .child(icon(pending ? "spinner" : "git-compare", 13).text_color(t.dim).when(pending, el => el.spin(900)))
-        .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(row.completed ? t.dim : t.foreground)
+        .child(div().flex_1().min_w(0).truncate().text_size(13).font_medium().text_color(row.completed ? t.dim : t.foreground)
           .child(row.label ?? row.title ?? "MR")))
       .when(context.some(Boolean), el => el.child(div().min_w(0).truncate().text_size(11).text_color(t.dim)
         .tooltip(context.filter(Boolean).join(" · ")).child(context.filter(Boolean).join(" · "))))
-      .child(h_flex().min_w(0).gap(4).flex_wrap().children(mrListPills(row).map(spec => pill(t, spec))));
+      .child(h_flex().min_w(0).gap(12).flex_wrap().children(mrListPills(row).map(spec => pill(t, spec))));
   }
 
-  banner(t, id, message, dismiss) {
-    const text = String(message).replace(/&/g, "&amp;").replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;").replace(/\n/g, "<br>");
-    return h_flex().mx(10).px(10).py(8).gap(6).items_start().rounded(6).bg(t.raised)
+  banner(t, id, message, dismiss, prefix = "") {
+    message = String(message);
+    const expanded = this.expandedBanners.get(id) === message;
+    const firstLine = message.split(/\r?\n/).find(line => line.trim())?.trim() ?? "Unknown error";
+    const summary = prefix + (firstLine.length > 160 ? firstLine.slice(0, 157) + "…" : firstLine);
+    const toggle = cx => {
+      if (expanded) this.expandedBanners.delete(id); else this.expandedBanners.set(id, message);
+      cx.notify();
+    };
+    const text = "<p>" + message.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/\r?\n/g, "</p><p>") + "</p>";
+    return v_flex().id(`banner-${id}`).flex_none().min_w(0).mx(10).mb(4).px(8).rounded(8).bg(tint(t.blocked, "12", t.raised))
       .border_l(2).border_color(t.blocked)
-      .child(TextView.html(`banner-${id}`, text).flex_1().min_w(0).text_size(12).text_color(t.muted).selectable())
-      .when(Boolean(dismiss), el => el.child(iconButton(t, id, "x", "Dismiss error", dismiss, {size:22})));
+      .child(h_flex().h(32).flex_none().min_w(0).gap(6).items_center()
+        .child(keyboardControl(h_flex().id(`${id}/toggle`), toggle).flex_1().min_w(0).gap(6).items_center().cursor_pointer()
+          .tooltip(expanded ? "Hide details" : "Show details").accessibility_label(summary)
+          .on_click((_event, cx) => {
+            cx.stop_propagation();
+            toggle(cx);
+          })
+          .child(icon(expanded ? "chevron-down" : "chevron-right", 12).text_color(t.dim))
+          .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).child(summary)))
+        .when(Boolean(dismiss), el => el.child(iconButton(t, id, "x", "Dismiss error", cx => {
+          this.expandedBanners.delete(id); dismiss(cx);
+        }, {size:22}))))
+      .when(expanded, el => el.child(div().id(`${id}/details`).h(120).flex_none().min_h(0).overflow_y_scrollbar().pb(8)
+        .child(TextView.html(`banner-text-${id}`, text).min_w(0).text_size(12).text_color(t.muted).selectable())));
   }
 
   render(cx) {
@@ -1802,12 +1946,15 @@ export default class Berbr extends View {
       }
     }
     return v_flex().id("berbr").track_focus(this.handle).on_key_down((event, cx) => this.key(event, cx))
+      .on_size_change((size, cx) => {
+        if (Math.abs((this.panelWidth ?? 0) - size.width) >= 8) { this.panelWidth = size.width; cx.notify(); }
+      })
       .size_full().min_h(0).min_w(0).bg(t.surface).text_color(t.foreground)
-      .child(h_flex().id("berbr-search-toolbar").flex_none().px(10).pt(8).pb(4).gap(6).items_center()
-        .child(h_flex().h(30).flex_1().min_w(0).px(8).gap(6).items_center()
-        .rounded(6).bg(t.background).border_1().border_color(this.searchFocused ? t.accent : t.border)
+      .child(h_flex().id("berbr-search-toolbar").flex_none().px(10).pt(10).pb(4).gap(6).items_center()
+        .child(h_flex().h(32).flex_1().min_w(0).px(10).gap(8).items_center()
+        .rounded(8).bg(t.raised).border_1().border_color(this.searchFocused ? t.accent : t.raised)
         .child(icon("search").text_color(t.dim))
-        .child(Input.new(this.searchInput()).flex_1().min_w(0).h(28).border_0().bg(t.background)
+        .child(Input.new(this.searchInput()).flex_1().min_w(0).h(30).border_0().bg(t.raised)
           .text_color(t.foreground).text_size(13))
         .when(!this.filter, el => el.child(kbd(t, "/")))
         .when(Boolean(this.filter), el => el.child(iconButton(t, "clear-search", "x", "Clear filter", cx => {
@@ -1815,28 +1962,23 @@ export default class Berbr extends View {
         }, {size:22}))))
         .child(boardFilters(this, t)))
       .when(Boolean(this.error), el => el.child(this.banner(t, "dismiss-error", this.error, cx => {this.error = null; cx.notify();})))
-      .when(Boolean(this.data?.warnings?.length), el => el.child(this.banner(t, "warnings", this.data.warnings.join("\n"))))
+      .when(Boolean(this.data?.warnings?.length), el => el.child(this.banner(t, "warnings", this.data.warnings.join("\n"), null,
+        `${this.data.warnings.length} ${this.data.warnings.length === 1 ? "warning" : "warnings"} · `)))
       .child(list)
-      .child(h_flex().id("berbr-project-bar").h(36).flex_none().px(10).gap(6).items_center().border_t_1().border_color(t.border)
-        .child(div().id("project-scope").min_w(0).truncate().text_size(11).text_color(t.dim)
+      .child(h_flex().id("berbr-footer").h(44).flex_none().pl(14).pr(10).gap(4).items_center().border_t_1().border_color(t.border)
+        .child(div().id("project-scope").flex_1().min_w(0).truncate().text_size(11).text_color(t.dim)
           .tooltip((this.scopeProjects ?? [this.project]).filter(Boolean).join(", "))
           .child(scopeSummary(this.scopeProjects, this.data?.projects ?? [], this.project)))
-        .child(div().flex_1())
+        .child(keyboardControl(iconButton(t, "refresh", "refresh", "Refresh (r)", cx => this.refresh(cx, false, true),
+          {disabled, spinning:this.loading, size:26}), cx => this.refresh(cx, false, true), disabled))
+        .child(keyboardControl(iconButton(t, "settings", "settings", "Settings", () => this.formOverlay("settings"), {disabled, size:26}),
+          () => this.formOverlay("settings"), disabled))
         .child(keyboardControl(h_flex().id("new"), () => this.formOverlay("new"), disabled)
-          .h(26).px(6).gap(4).items_center().rounded(4).cursor_pointer().opacity(disabled ? 0.4 : 1)
-          .text_size(11).text_color(t.muted).tooltip("New task (n)").hover(el => el.bg(t.hover).text_color(t.foreground))
+          .h(28).ml(4).pl(8).pr(10).gap(5).flex_none().items_center().rounded(8).cursor_pointer().opacity(disabled ? 0.4 : 1)
+          .bg(t.raised).border_1().border_color(t.border)
+          .text_size(12).font_medium().text_color(t.foreground).tooltip("New task (n)").accessibility_label("New task")
+          .hover(el => el.bg(t.hover))
           .on_click((_event, cx) => {cx.stop_propagation(); if (!disabled) this.formOverlay("new");})
-          .child(icon("plus", 12)).child("New task")))
-      .child(h_flex().id("berbr-footer").h(30).flex_none().px(12).gap(8).items_center().border_t_1().border_color(t.border)
-        .child(keyboardControl(h_flex().id("refresh"), cx => this.refresh(cx, false, true), disabled)
-          .h(24).gap(5).items_center().text_size(11).text_color(t.dim).cursor_pointer()
-          .opacity(disabled && !this.loading ? 0.4 : 1).tooltip("Refresh (r)").hover(el => el.text_color(t.foreground))
-          .on_click((_event, cx) => {cx.stop_propagation(); if (!disabled) this.refresh(cx, false, true);})
-          .child(icon(this.loading ? "spinner" : "refresh", 12).when(this.loading, el => el.spin(900)))
-          .child("Refresh"))
-        .child(div().flex_1())
-        .when(panelFocused, el => el.child(kbd(t, mrView ? "↑↓ move · ⏎ open · d completed" : "⌘K jump · ↑↓ move · → expand · ⏎ open").min_w(0).truncate()))
-        .child(keyboardControl(iconButton(t, "settings", "settings", "Settings", () => this.formOverlay("settings"), {disabled, size:22}),
-          () => this.formOverlay("settings"), disabled)));
+          .child(icon("plus", 12).text_color(t.muted)).child("New task")));
   }
 }

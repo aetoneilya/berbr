@@ -11,8 +11,8 @@ const section = (sections, id) => sections.find(item => item.id === id);
 test("task menu offers a live space instead of starting work and hides unavailable actions", () => {
   const task = {kind:"task", task:"demo", title:"Demo", note:"/home/dev/demo.md", children:[]};
   const ids = ctx => rowMenu(task, ctx).map(item => item.id);
-  assert.deepEqual(ids({spaces:[{id:"space", name:"Demo"}]}), ["space", "rename", "note", "copy-title", "done"]);
-  assert.deepEqual(ids({spaces:[]}), ["start", "rename", "note", "copy-title", "done"]);
+  assert.deepEqual(ids({spaces:[{id:"space", name:"Demo"}]}), ["space", "rename", "note", "add-ticket", "copy-title", "done"]);
+  assert.deepEqual(ids({spaces:[]}), ["start", "rename", "note", "add-ticket", "copy-title", "done"]);
   assert.ok(!rowMenu({...task, children:[{kind:"tree"}]}).some(item => item.id === "start"));
   assert.ok(!rowMenu({...task, done:true}).some(item => ["start", "done"].includes(item.id)));
   assert.deepEqual(rowMenu({kind:"task", title:"Untitled"}).map(item => item.id), ["copy-title"]);
@@ -842,4 +842,37 @@ test("helper attention and jump entries stay out of the main task UI regardless 
   assert.equal(agentRole(old),"unknown");
   assert.equal(treeFocusTarget(tree,agents,[{terminal:"helper",cwd:"/work",focused:true}]).terminal,"primary");
   assert.equal(treeFocusTarget({...tree,children:[helper]},[agents[1]],[{terminal:"helper",cwd:"/work"}]),null);
+});
+
+
+test("ambiguous space binding does not hide project-scoped ticket attachment", () => {
+  const items = rowMenu({kind:"task", task:"task", project:"demo", scope_space_ambiguous:true});
+  assert.ok(items.some(item => item.id === "add-ticket"));
+  assert.ok(!items.some(item => item.id === "done"));
+});
+
+test("task MR ticket associations combine catalog and legacy nesting without crossing projects or mutating snapshots", () => {
+  const mr = {id:"mr", kind:"mr", state:"opened", url:"https://git/demo/-/merge_requests/1/"};
+  const task = {kind:"task", id:"task", project:"demo", children:[
+    {kind:"tree", id:"tree", children:[mr]},
+    {kind:"ticket", target:"DEMO-1", children:[mr]},
+    {kind:"ticket", target:"DEMO-2"},
+    {kind:"ticket", target:"FREE"},
+  ]};
+  const catalog = [{...mr, id:"catalog", url:mr.url.slice(0,-1), project:"demo", tickets:["DEMO-2", "DEMO-1"]},
+    {...mr, project:"other", tickets:["FOREIGN"]}];
+  const before = structuredClone({task, catalog});
+  const model = new PanelModel().update({rows:[task], merge_requests:catalog}, [], []);
+  assert.deepEqual(model.detail(task).trees[0].tickets, ["DEMO-2", "DEMO-1"]);
+  assert.deepEqual(taskDetail(task).trees[0].tickets, ["DEMO-1"]);
+  assert.deepEqual(model.detail(task).tickets.open.map(row => row.target), ["DEMO-1", "DEMO-2", "FREE"]);
+  assert.deepEqual({task, catalog}, before);
+  model.update({rows:[task], merge_requests:[{...mr, tickets:["DEMO-3"]}]}, [], []);
+  assert.deepEqual(model.detail(task).trees[0].tickets, ["DEMO-3", "DEMO-1"]);
+});
+
+test("detached ticket associations stay hidden even when the MR catalog still contains the key", () => {
+  const mr = {kind:"mr", id:"mr", state:"opened", tickets:["DEMO-1", "DEMO-2"]};
+  const task = {kind:"task", excluded_tickets:["DEMO-1"], children:[{kind:"tree", children:[mr]}]};
+  assert.deepEqual(taskDetail(task).trees[0].tickets, ["DEMO-2"]);
 });
