@@ -236,17 +236,18 @@ export default class Berbr extends View {
         result = await exec("zsh", command, retried.to ? {cwd:retried.to} : {});
       }
     } catch (error) {
-      await logRun(args, {cwd, ms:Date.now() - started, error:String(error?.message ?? error), retried});
+      logRun(args, {cwd, ms:Date.now() - started, error:String(error?.message ?? error), retried});
       throw error;
     }
-    const logged = logRun(args, {cwd, ms:Date.now() - started, code:result.code, retried});
+    // Logging is best effort. Its shared queue may still be waiting on another
+    // view's write; it must never keep a finished command (and its UI) pending.
+    logRun(args, {cwd, ms:Date.now() - started, code:result.code, retried});
     if (result.code !== 0) {
       const fallback = result.code < 0
         ? `berbr ended without an exit status (code ${result.code}); no diagnostic output was captured`
         : `berbr exited ${result.code}`;
       const message = cleanCliText(result.stderr) || cleanCliText(result.stdout) || fallback;
-      await logged;
-      await log(`berbr ${args[0]}: ${message}`);
+      log(`berbr ${args[0]}: ${message}`);
       throw new Error(message);
     }
     return result.stdout;

@@ -3534,16 +3534,18 @@ test("a failed berbr run from the panel lands in the mod log with its stderr", a
 });
 
 test("a snapshot terminated without output has a useful error in the completed log", async () => {
-  const {logPath} = await import("../log.js");
+  const {logPath, log} = await import("../log.js");
   state.fsFiles = new Map();
   const {view} = setup({props:{opening:{cwd:"/home/dev/demo"}}});
   state.execHandler = async () => ({code:-1, stdout:"", stderr:""});
   await assert.rejects(view.cli(["app-snapshot"]), /without an exit status.*-1.*no diagnostic output/);
+  await log("Flush diagnostics");
   const text = state.fsFiles.get(logPath());
   assert.match(text, /app-snapshot.*exited -1/);
   assert.match(text, /berbr app-snapshot: .*no diagnostic output/);
   state.execHandler = async () => { throw new Error("could not start process"); };
   await assert.rejects(view.cli(["app-snapshot"]), /could not start process/);
+  await log("Flush diagnostics");
   assert.match(state.fsFiles.get(logPath()), /could not run: could not start process/);
 });
 
@@ -3842,6 +3844,53 @@ test("New task Enter submits once, blocks controls while busy, and displays CLI 
   assert.equal(view.busy, false);
   assert.match(text(byId(view.render(cx), "new-status")), /Cannot create: branch already exists/);
   assert.ok(!state.calls.some(call => call[0] === "closeOverlay"));
+});
+
+test("New Jira task reports CLI failures even while the shared log writer is stalled", async () => {
+  const {log} = await import("../log.js");
+  for (const outcome of ["exit", "spawn", "success"]) {
+    const {view, cx, jobs} = setup({props:{form:"new", project:"demo", overlay:"new", projects:["demo"]}});
+    view.source = "jira"; view.values.title = "DEMO-12";
+    view.values.description = "Keep this context for retry";
+    const message = outcome === "exit" ? "DEMO-12: Jira request timed out" : "Could not start process";
+    state.execHandler = async () => {
+      if (outcome === "spawn") throw new Error(message);
+      return {code:outcome === "exit" ? 1 : 0, stdout:"", stderr:message};
+    };
+    let release, entered;
+    const blocked = new Promise(resolve => { release = resolve; });
+    const writing = new Promise(resolve => { entered = resolve; });
+    state.mkdirHandler = () => { entered(); return blocked; };
+    const previousLog = log("Earlier operation still writing");
+    await writing;
+    let operation, timer;
+    try {
+      view.submitNew(cx);
+      assert.equal(view.busy, true);
+      operation = jobs.shift()(cx);
+      await Promise.race([operation, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Task UI is waiting for diagnostic logging")), 100);
+      })]);
+      assert.equal(view.busy, false);
+      assert.equal(view.busyAction, null);
+      assert.equal(state.execs.length, 1);
+      if (outcome === "success") {
+        assert.ok(state.calls.some(call => call[0] === "closeOverlay"));
+      } else {
+        assert.equal(view.error, message);
+        assert.ok(text(byId(view.render(cx), "new-status")).includes(message));
+        assert.equal(byId(view.render(cx), "create").attributes.tab_stop[0], true);
+        assert.equal(view.values.title, "DEMO-12");
+        assert.equal(view.values.description, "Keep this context for retry");
+        assert.ok(!state.calls.some(call => call[0] === "closeOverlay"));
+      }
+    } finally {
+      clearTimeout(timer);
+      state.mkdirHandler = null; release();
+      await previousLog; await operation;
+      await log("Log writer recovered");
+    }
+  }
 });
 
 test("New task cmd-enter bubbles from keyboard controls to submit instead of activating them", () => {

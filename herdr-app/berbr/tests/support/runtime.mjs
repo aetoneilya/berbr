@@ -113,6 +113,6 @@ export const readFile = async path => {
   return text;
 };
 export const writeFile = async (path, text) => { (state.fsFiles ??= new Map()).set(path, String(text)); };
-export const mkdir = async () => {};
+export const mkdir = async (...args) => state.mkdirHandler?.(...args);
 export const layout = () => state.layout ?? {children:[]};
 export const window = () => state.window ?? null;

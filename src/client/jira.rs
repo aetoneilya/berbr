@@ -31,6 +31,18 @@ pub enum JiraError {
 pub(crate) type Result<T> = std::result::Result<T, JiraError>;
 
 impl JiraError {
+    fn retryable_read(&self) -> bool {
+        match self {
+            Self::RequestExecutionError(error) => {
+                error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
+            }
+            Self::RequestResultError(status, _) => {
+                matches!(status.as_u16(), 408 | 500 | 502 | 503 | 504)
+            }
+            _ => false,
+        }
+    }
+
     /// Jira refused the query itself (400), e.g. a `key in (…)` with an unknown key.
     pub fn bad_request(&self) -> bool {
         matches!(self, JiraError::RequestResultError(status, _) if *status == StatusCode::BAD_REQUEST)
@@ -45,6 +57,27 @@ impl JiraError {
 /// How much of an error response goes into the message: Jira answers with whole
 /// HTML pages.
 const ERROR_BODY_CHARS: usize = 300;
+
+/// Only retry the read of an existing ticket, never task creation or Jira writes.
+/// Each read has at most three 5-second attempts, with 250/500 ms backoff.
+fn retry_issue_read<T>(
+    mut request: impl FnMut() -> Result<T>,
+    mut wait: impl FnMut(Duration),
+) -> Result<T> {
+    for attempt in 0..3 {
+        match request() {
+            Err(error) if attempt < 2 && error.retryable_read() => {
+                let delay = Duration::from_millis(250 << attempt);
+                crate::log::debug(|| {
+                    format!("retry Jira ticket read {}/2 after {delay:?}", attempt + 1)
+                });
+                wait(delay);
+            }
+            result => return result,
+        }
+    }
+    unreachable!()
+}
 
 /// The response when it is a success, otherwise its status and body as an error.
 fn checked(response: Response) -> Result<Response> {
@@ -150,7 +183,7 @@ impl JiraClient {
 
     pub fn get_issue_by_key(&self, key: &str) -> Result<JiraIssue> {
         let url = format!("{}/rest/api/2/issue/{}", self.base_url, key);
-        self.get_json(&url, &[])
+        retry_issue_read(|| self.get_json(&url, &[]), std::thread::sleep)
     }
 
     /// Search returning only the fields `JiraIssue` needs, up to `max` issues.
@@ -372,5 +405,120 @@ mod pagination_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use crate::client::test_http::serve;
+    use serde_json::json;
+
+    fn issue() -> serde_json::Value {
+        json!({"key":"DEMO-12", "fields":{"summary":"Example", "created":"2026-11-01T00:00:00Z"}})
+    }
+
+    #[test]
+    fn ticket_read_recovers_after_two_transient_failures() {
+        let (base, server) = serve(vec![
+            (503, "", json!({})),
+            (502, "", json!({})),
+            (200, "", issue()),
+        ]);
+        assert_eq!(
+            JiraClient::fixture(base)
+                .get_issue_by_key("DEMO-12")
+                .unwrap()
+                .key,
+            "DEMO-12"
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.starts_with("GET /rest/api/2/issue/DEMO-12 "))
+        );
+    }
+
+    #[test]
+    fn exhausted_ticket_read_returns_the_last_error() {
+        let (base, server) = serve(vec![
+            (503, "", json!({})),
+            (502, "", json!({})),
+            (504, "", json!({"message":"last failure"})),
+        ]);
+        let error = JiraClient::fixture(base)
+            .get_issue_by_key("DEMO-12")
+            .unwrap_err();
+        assert!(
+            matches!(error, JiraError::RequestResultError(StatusCode::GATEWAY_TIMEOUT, ref body) if body.contains("last failure"))
+        );
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn permanent_errors_and_success_do_not_retry() {
+        for status in [200, 400, 401, 403, 404] {
+            let (base, server) = serve(vec![(status, "", issue())]);
+            let result = JiraClient::fixture(base).get_issue_by_key("DEMO-12");
+            assert_eq!(result.is_ok(), status == 200);
+            assert_eq!(server.join().unwrap().len(), 1);
+            if status != 200 {
+                assert!(
+                    matches!(result.unwrap_err(), JiraError::RequestResultError(code, _) if code.as_u16() == status)
+                );
+            }
+        }
+        // A valid HTTP response with an incompatible schema is not a network failure.
+        let (base, server) = serve(vec![(200, "", json!({}))]);
+        let error = JiraClient::fixture(base)
+            .get_issue_by_key("DEMO-12")
+            .unwrap_err();
+        assert!(matches!(error, JiraError::RequestExecutionError(ref e) if e.is_decode()));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn timeouts_get_exactly_two_backoffs() {
+        // Keep a socket open without answering; use a short real HTTP timeout.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(30))
+            .build()
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+        let result = retry_issue_read(
+            || {
+                attempts += 1;
+                client.get(&url).send().map_err(JiraError::from)
+            },
+            |delay| delays.push(delay),
+        );
+        assert!(matches!(result, Err(JiraError::RequestExecutionError(ref e)) if e.is_timeout()));
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            delays,
+            [Duration::from_millis(250), Duration::from_millis(500)]
+        );
+    }
+
+    #[test]
+    fn jira_writes_are_not_retried() {
+        let (base, server) = serve(vec![(503, "", json!({}))]);
+        let result = JiraClient::fixture(base).transition("DEMO-12", "1");
+        assert!(matches!(
+            result,
+            Err(JiraError::RequestResultError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                _
+            ))
+        ));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST "));
     }
 }
