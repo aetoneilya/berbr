@@ -1974,12 +1974,12 @@ export default class Berbr extends View {
           {disabled, spinning:this.loading, size:26}), cx => this.refresh(cx, false, true), disabled))
         .child(keyboardControl(iconButton(t, "settings", "settings", "Settings", () => this.formOverlay("settings"), {disabled, size:26}),
           () => this.formOverlay("settings"), disabled))
-        .child(keyboardControl(h_flex().id("new"), () => this.formOverlay("new"), disabled)
-          .h(28).ml(4).pl(8).pr(10).gap(5).flex_none().items_center().rounded(8).cursor_pointer().opacity(disabled ? 0.4 : 1)
+        .child(keyboardControl(h_flex().id("new"), () => this.formOverlay("new"), this.busy)
+          .h(28).ml(4).pl(8).pr(10).gap(5).flex_none().items_center().rounded(8).cursor_pointer().opacity(this.busy ? 0.4 : 1)
           .bg(t.raised).border_1().border_color(t.border)
           .text_size(12).font_medium().text_color(t.foreground).tooltip("New task (n)").accessibility_label("New task")
           .hover(el => el.bg(t.hover))
-          .on_click((_event, cx) => {cx.stop_propagation(); if (!disabled) this.formOverlay("new");})
+          .on_click((_event, cx) => {cx.stop_propagation(); if (!this.busy) this.formOverlay("new");})
           .child(icon("plus", 12).text_color(t.muted)).child("New task")));
   }
 }

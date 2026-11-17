@@ -3991,6 +3991,28 @@ const namingSettings = (fields = {}) => ({scope:"global", agent:"claude", genera
   model_choices:{claude:[{id:"", label:"CLI default"}, {id:"haiku", label:"Haiku"}, {id:"sonnet", label:"Sonnet"}],
     codex:[{id:"", label:"CLI default"}, {id:"codex-fixture", label:"Codex fixture"}]}, ...fields});
 
+test("New task stays available during snapshot loading but blocks while an operation is busy", () => {
+  for (const loading of [false, true]) for (const busy of [false, true]) {
+    const {view, cx, key} = setup({data:scopedSnapshot("demo"), props:{project:"demo"}});
+    view.loading = loading;
+    view.busy = busy;
+    const control = byId(view.render(cx), "new");
+    assert.equal(control.attributes.tab_stop[0], !busy);
+    assert.equal(control.attributes.opacity[0], busy ? 0.4 : 1);
+    for (const activate of [() => click(control, cx),
+      () => control.attributes.on_key_down[0]({key:"enter"}, cx),
+      () => control.attributes.on_key_down[0]({key:"space"}, cx), () => key("n")]) {
+      state.overlays.length = 0;
+      activate();
+      assert.equal(state.overlays.length, busy ? 0 : 1);
+      if (!busy) {
+        assert.equal(state.overlays[0].props.form, "new");
+        assert.equal(state.overlays[0].props.project, "demo");
+      }
+    }
+  }
+});
+
 test("Settings is a small footer button, replacing cache labels and accessible with the keyboard", () => {
   for (const focused of [true, false]) {
     const {view, cx} = setup();
